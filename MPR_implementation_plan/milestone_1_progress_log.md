@@ -175,7 +175,7 @@ Discussion decisions:
 scope = metadata-only KV write observation
 store original key/value in sidecar = no
 failure policy = fail-fast
-negative slot id behavior = assertion failure
+slot id behavior = PAD_SLOT_ID(-1) is padding; slot ids < -1 fail fast
 block_size source = attn_layer.impl.block_size
 missing block_size behavior = fail-fast
 smoke debug recommendation = VLLM_MPR_MAX_LAYERS=10
@@ -201,6 +201,28 @@ _maybe_observe_mpr_kv_write first checks attn_layer.impl.block_size.
 If absent and the KV cache is FlashAttention-shaped, it infers:
   block_size = kv_cache.shape[2]
 Otherwise it still fails fast with the KV cache shape in the error message.
+```
+
+Second target-server Step 1.2 validation failed with:
+
+```text
+AssertionError: MPR observed negative slot id ... min_slot=-1.
+```
+
+Root cause:
+
+```text
+vLLM defines PAD_SLOT_ID = -1.
+The slot mapping kernel pads unused CUDA graph slots with PAD_SLOT_ID.
+These padded slots are not KV writes.
+```
+
+Fix:
+
+```text
+observe_kv_write now filters PAD_SLOT_ID before block/offset summaries.
+slot ids < PAD_SLOT_ID still fail fast.
+debug JSONL records num_pad_slots in addition to num_slots/num_valid_slots.
 ```
 
 Implementation added:
@@ -232,6 +254,7 @@ block_size
 unique_block_ids
 min_block_offset
 max_block_offset
+num_pad_slots
 ```
 
 The slot mapping contract assumed for Milestone 1 remains:
@@ -242,9 +265,9 @@ physical_block_id = slot_id // block_size
 block_offset = slot_id % block_size
 ```
 
-This is valid for the current single-GPU/no-CP/no-DCP scope. If any negative
-slot id is observed, Step 1.2 intentionally raises an assertion instead of
-filtering it out.
+This is valid for the current single-GPU/no-CP/no-DCP scope. `PAD_SLOT_ID=-1`
+is filtered out as CUDA graph padding; any slot id less than `PAD_SLOT_ID`
+still raises an assertion.
 
 Debug limiting behavior added:
 
@@ -295,7 +318,8 @@ Expected outcome:
 generation completes
 observe_kv_write events exist
 num_valid_slots > 0 for decode writes
+num_pad_slots may be > 0 because CUDA graph padding uses PAD_SLOT_ID=-1
 unique_block_ids is non-empty for decode writes
 0 <= min_block_offset <= max_block_offset < block_size
-no negative-slot assertion
+no invalid negative-slot assertion
 ```

@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.mixed_precision_recovery.config import MPRConfig
 from vllm.v1.mixed_precision_recovery.debug import MPRDebugWriter
 
@@ -78,23 +79,33 @@ class RecoverySidecar:
             unique_block_ids: list[int] = []
             min_block_offset = None
             max_block_offset = None
+            num_pad_slots = 0
         else:
-            has_negative_slot = bool((flat_slots < 0).any().item())
-            if has_negative_slot:
+            has_invalid_negative_slot = bool((flat_slots < PAD_SLOT_ID).any().item())
+            if has_invalid_negative_slot:
                 min_slot = int(flat_slots.min().item())
                 raise AssertionError(
-                    f"MPR observed negative slot id for {layer_name}: "
+                    f"MPR observed invalid negative slot id for {layer_name}: "
                     f"min_slot={min_slot}."
                 )
 
-            block_ids = flat_slots // block_size
-            block_offsets = flat_slots % block_size
-            unique_block_ids = [
-                int(block_id)
-                for block_id in sorted(block_ids.unique().detach().cpu().tolist())
-            ]
-            min_block_offset = int(block_offsets.min().item())
-            max_block_offset = int(block_offsets.max().item())
+            # vLLM pads unused CUDA graph slots with PAD_SLOT_ID. These are not
+            # KV writes and should not participate in block/offset summaries.
+            valid_slots = flat_slots[flat_slots != PAD_SLOT_ID]
+            num_pad_slots = num_slots - int(valid_slots.numel())
+            if valid_slots.numel() == 0:
+                unique_block_ids = []
+                min_block_offset = None
+                max_block_offset = None
+            else:
+                block_ids = valid_slots // block_size
+                block_offsets = valid_slots % block_size
+                unique_block_ids = [
+                    int(block_id)
+                    for block_id in sorted(block_ids.unique().detach().cpu().tolist())
+                ]
+                min_block_offset = int(block_offsets.min().item())
+                max_block_offset = int(block_offsets.max().item())
 
         self._record(
             "observe_kv_write",
@@ -104,7 +115,8 @@ class RecoverySidecar:
             value_shape=self._shape_of(value),
             slot_mapping_shape=self._shape_of(slot_mapping),
             num_slots=num_slots,
-            num_valid_slots=num_slots,
+            num_valid_slots=num_slots - num_pad_slots,
+            num_pad_slots=num_pad_slots,
             block_size=block_size,
             unique_block_ids=unique_block_ids,
             min_block_offset=min_block_offset,
