@@ -28,6 +28,7 @@ class RecoverySidecar:
 
     config: MPRConfig = field(default_factory=MPRConfig.from_env)
     counters: Counter[str] = field(default_factory=Counter)
+    # Debug-only layer bookkeeping for VLLM_MPR_MAX_LAYERS dump limiting.
     _layer_indices: dict[str, int] = field(default_factory=dict)
     _kv_write_counts: Counter[str] = field(default_factory=Counter)
     _debug_writer: MPRDebugWriter = field(init=False)
