@@ -28,6 +28,8 @@ class RecoverySidecar:
 
     config: MPRConfig = field(default_factory=MPRConfig.from_env)
     counters: Counter[str] = field(default_factory=Counter)
+    _layer_indices: dict[str, int] = field(default_factory=dict)
+    _kv_write_counts: Counter[str] = field(default_factory=Counter)
     _debug_writer: MPRDebugWriter = field(init=False)
 
     def __post_init__(self) -> None:
@@ -55,10 +57,57 @@ class RecoverySidecar:
     ) -> None:
         if not self.config.enabled:
             return
+        should_record, layer_event_idx = self._should_record_layer_event(
+            layer_name,
+            self._kv_write_counts,
+        )
+        if not should_record:
+            return
+        if block_size is None or block_size <= 0:
+            raise ValueError(
+                f"MPR requires a positive block_size for {layer_name}, "
+                f"got {block_size}."
+            )
+        if slot_mapping is None:
+            raise ValueError(f"MPR requires slot_mapping for {layer_name}.")
+
+        flat_slots = slot_mapping.detach().reshape(-1)
+        num_slots = int(flat_slots.numel())
+        if num_slots == 0:
+            unique_block_ids: list[int] = []
+            min_block_offset = None
+            max_block_offset = None
+        else:
+            has_negative_slot = bool((flat_slots < 0).any().item())
+            if has_negative_slot:
+                min_slot = int(flat_slots.min().item())
+                raise AssertionError(
+                    f"MPR observed negative slot id for {layer_name}: "
+                    f"min_slot={min_slot}."
+                )
+
+            block_ids = flat_slots // block_size
+            block_offsets = flat_slots % block_size
+            unique_block_ids = [
+                int(block_id)
+                for block_id in sorted(block_ids.unique().detach().cpu().tolist())
+            ]
+            min_block_offset = int(block_offsets.min().item())
+            max_block_offset = int(block_offsets.max().item())
+
         self._record(
             "observe_kv_write",
             layer_name=layer_name,
+            layer_event_idx=layer_event_idx,
+            key_shape=self._shape_of(key),
+            value_shape=self._shape_of(value),
+            slot_mapping_shape=self._shape_of(slot_mapping),
+            num_slots=num_slots,
+            num_valid_slots=num_slots,
             block_size=block_size,
+            unique_block_ids=unique_block_ids,
+            min_block_offset=min_block_offset,
+            max_block_offset=max_block_offset,
         )
 
     def observe_query(
@@ -92,6 +141,40 @@ class RecoverySidecar:
 
     def close(self) -> None:
         self._debug_writer.close()
+
+    def _should_record_layer_event(
+        self,
+        layer_name: str,
+        event_counts: Counter[str],
+    ) -> tuple[bool, int | None]:
+        if layer_name not in self._layer_indices:
+            if (
+                self.config.max_layers is not None
+                and len(self._layer_indices) >= self.config.max_layers
+            ):
+                self.counters["skipped_layer_limit"] += 1
+                return False, None
+            self._layer_indices[layer_name] = len(self._layer_indices)
+
+        event_counts[layer_name] += 1
+        layer_event_idx = event_counts[layer_name]
+        if (
+            self.config.max_steps is not None
+            and layer_event_idx > self.config.max_steps
+        ):
+            self.counters["skipped_step_limit"] += 1
+            return False, layer_event_idx
+        if (layer_event_idx - 1) % self.config.dump_every != 0:
+            self.counters["skipped_dump_every"] += 1
+            return False, layer_event_idx
+        return True, layer_event_idx
+
+    @staticmethod
+    def _shape_of(value: Any) -> list[int] | None:
+        shape = getattr(value, "shape", None)
+        if shape is None:
+            return None
+        return [int(dim) for dim in shape]
 
     def _record(self, event: str, **fields: Any) -> None:
         self.counters[event] += 1

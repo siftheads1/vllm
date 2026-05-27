@@ -154,31 +154,126 @@ The Windows Python import smoke test could not be used because its local torch
 version does not provide `torch.library.infer_schema`, which this vLLM tree
 expects.
 
-## Next Step
-
-Finish Step 1.1 validation in the target vLLM environment.
-
-Initial goal:
+Target server validation completed by user:
 
 ```text
-VLLM_MPR_ENABLE unset or 0 -> no behavior change
-VLLM_MPR_ENABLE=1 -> sidecar module initializes and debug counters/logs work
+MPR off import smoke: passed
+MPR on import smoke: passed
+VLLM_MPR_ENABLE=1 produced True {'init': 1}
+debug JSONL init event: passed
+baseline generation with MPR off: passed
+baseline generation with MPR on: passed
 ```
+
+Step 1.1 is complete.
+
+### Step 1.2 KV Write Observation Hook
+
+Discussion decisions:
+
+```text
+scope = metadata-only KV write observation
+store original key/value in sidecar = no
+failure policy = fail-fast
+negative slot id behavior = assertion failure
+block_size source = attn_layer.impl.block_size
+missing block_size behavior = fail-fast
+smoke debug recommendation = VLLM_MPR_MAX_LAYERS=10
+```
+
+Implementation added:
+
+```text
+vllm/model_executor/layers/attention/attention.py
+  unified_kv_cache_update(...)
+  _maybe_observe_mpr_kv_write(...)
+
+vllm/v1/mixed_precision_recovery/sidecar.py
+  RecoverySidecar.observe_kv_write(...)
+```
+
+The hook runs only when `VLLM_MPR_ENABLE=1`. With MPR disabled, the new
+attention-path code returns before importing the sidecar.
+
+The sidecar now records JSONL summaries for KV writes:
+
+```text
+event
+layer_name
+layer_event_idx
+key_shape
+value_shape
+slot_mapping_shape
+num_slots
+num_valid_slots
+block_size
+unique_block_ids
+min_block_offset
+max_block_offset
+```
+
+The slot mapping contract assumed for Milestone 1 remains:
+
+```text
+slot_id = physical_block_id * block_size + block_offset
+physical_block_id = slot_id // block_size
+block_offset = slot_id % block_size
+```
+
+This is valid for the current single-GPU/no-CP/no-DCP scope. If any negative
+slot id is observed, Step 1.2 intentionally raises an assertion instead of
+filtering it out.
+
+Debug limiting behavior added:
+
+```text
+VLLM_MPR_MAX_LAYERS limits the first N unique layer names recorded
+VLLM_MPR_MAX_STEPS limits per-layer KV write records
+VLLM_MPR_DUMP_EVERY records every Nth per-layer KV write
+```
+
+Validation completed in the Windows workspace:
+
+```text
+python -m py_compile vllm/model_executor/layers/attention/attention.py \
+  vllm/v1/mixed_precision_recovery/*.py
+```
+
+Full runtime validation is still pending in the target GPU environment.
+
+## Next Step
+
+Run Step 1.2 validation in the target vLLM environment.
 
 Recommended first validation:
 
 ```bash
 cd /workspace/vllm
-/opt/miniforge3/bin/conda run -n vllm \
-  python scripts/mpr_baseline_qwen3_8b.py \
+rm -rf /tmp/vllm_mpr_debug
+
+VLLM_MPR_ENABLE=1 \
+VLLM_MPR_DEBUG_DIR=/tmp/vllm_mpr_debug \
+VLLM_MPR_MAX_LAYERS=10 \
+VLLM_MPR_MAX_STEPS=20 \
+VLLM_MPR_DUMP_EVERY=1 \
+python scripts/mpr_baseline_qwen3_8b.py \
   --prompt "Say hello." \
   --max-tokens 8
 ```
 
-Then repeat with:
+Expected debug check:
 
 ```bash
-VLLM_MPR_ENABLE=1
+cat /tmp/vllm_mpr_debug/*.jsonl | grep observe_kv_write | head
 ```
 
-and confirm that only sidecar initialization/debug output changes.
+Expected outcome:
+
+```text
+generation completes
+observe_kv_write events exist
+num_valid_slots > 0 for decode writes
+unique_block_ids is non-empty for decode writes
+0 <= min_block_offset <= max_block_offset < block_size
+no negative-slot assertion
+```
