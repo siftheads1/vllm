@@ -691,6 +691,7 @@ def get_attention_context(
 def _maybe_observe_mpr_kv_write(
     layer_name: str,
     attn_layer: "Attention | MLAAttention",
+    kv_cache: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     layer_slot_mapping: torch.Tensor,
@@ -700,10 +701,14 @@ def _maybe_observe_mpr_kv_write(
 
     block_size = getattr(attn_layer.impl, "block_size", None)
     if block_size is None:
-        raise ValueError(
-            f"MPR requires attention impl {attn_layer.impl.__class__.__name__} "
-            "to expose block_size."
-        )
+        if kv_cache.ndim >= 3 and kv_cache.shape[0] == 2:
+            block_size = int(kv_cache.shape[2])
+        else:
+            raise ValueError(
+                "MPR could not infer block_size for "
+                f"{attn_layer.impl.__class__.__name__}; "
+                f"kv_cache_shape={tuple(kv_cache.shape)}."
+            )
 
     from vllm.v1.mixed_precision_recovery import get_mpr_sidecar
 
@@ -741,6 +746,7 @@ def unified_kv_cache_update(
         _maybe_observe_mpr_kv_write(
             layer_name,
             attn_layer,
+            kv_cache,
             key,
             value,
             layer_slot_mapping,

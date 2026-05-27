@@ -181,6 +181,28 @@ missing block_size behavior = fail-fast
 smoke debug recommendation = VLLM_MPR_MAX_LAYERS=10
 ```
 
+First target-server Step 1.2 validation failed during engine initialization:
+
+```text
+ValueError: MPR requires attention impl FlashAttentionImpl to expose block_size.
+```
+
+Root cause:
+
+```text
+FlashAttentionImpl does not expose block_size as an instance attribute.
+FlashAttention KV cache layout carries it as [2, num_blocks, block_size, ...].
+```
+
+Fix:
+
+```text
+_maybe_observe_mpr_kv_write first checks attn_layer.impl.block_size.
+If absent and the KV cache is FlashAttention-shaped, it infers:
+  block_size = kv_cache.shape[2]
+Otherwise it still fails fast with the KV cache shape in the error message.
+```
+
 Implementation added:
 
 ```text
