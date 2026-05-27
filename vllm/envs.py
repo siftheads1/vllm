@@ -276,6 +276,13 @@ if TYPE_CHECKING:
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
+    VLLM_MPR_ENABLE: bool = False
+    VLLM_MPR_DEBUG_DIR: str | None = None
+    VLLM_MPR_TOPK: int = 8
+    VLLM_MPR_MAX_LAYERS: int = -1
+    VLLM_MPR_MAX_STEPS: int = -1
+    VLLM_MPR_DUMP_EVERY: int = 1
+    VLLM_MPR_WINDOW_SIZE: int = 64
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
 
 
@@ -1952,6 +1959,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
     ),
+    # Enable the experimental Mixed-Precision Recovery sidecar.
+    "VLLM_MPR_ENABLE": lambda: bool(int(os.getenv("VLLM_MPR_ENABLE", "0"))),
+    # Optional directory for MPR JSONL debug artifacts.
+    "VLLM_MPR_DEBUG_DIR": lambda: os.getenv("VLLM_MPR_DEBUG_DIR", None),
+    # Number of candidate KV blocks to report in MPR debug output.
+    "VLLM_MPR_TOPK": lambda: int(os.getenv("VLLM_MPR_TOPK", "8")),
+    # MPR debug limits. A negative value means unlimited.
+    "VLLM_MPR_MAX_LAYERS": lambda: int(os.getenv("VLLM_MPR_MAX_LAYERS", "-1")),
+    "VLLM_MPR_MAX_STEPS": lambda: int(os.getenv("VLLM_MPR_MAX_STEPS", "-1")),
+    "VLLM_MPR_DUMP_EVERY": lambda: int(os.getenv("VLLM_MPR_DUMP_EVERY", "1")),
+    # Rolling decode query window size for MPR score-only instrumentation.
+    "VLLM_MPR_WINDOW_SIZE": lambda: int(os.getenv("VLLM_MPR_WINDOW_SIZE", "64")),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
     # overlap the base layer compute with the LoRA fast path).
@@ -2107,6 +2126,13 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_CUDA_COMPATIBILITY",
         "VLLM_CUDA_COMPATIBILITY_PATH",
         "VLLM_SKIP_MODEL_NAME_VALIDATION",
+        "VLLM_MPR_ENABLE",
+        "VLLM_MPR_DEBUG_DIR",
+        "VLLM_MPR_TOPK",
+        "VLLM_MPR_MAX_LAYERS",
+        "VLLM_MPR_MAX_STEPS",
+        "VLLM_MPR_DUMP_EVERY",
+        "VLLM_MPR_WINDOW_SIZE",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",

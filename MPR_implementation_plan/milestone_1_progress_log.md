@@ -1,6 +1,6 @@
 # Milestone 1 Progress Log
 
-Last updated: 2026-05-25
+Last updated: 2026-05-27
 
 ## Current State
 
@@ -105,27 +105,64 @@ sequential data by reusing these ...
 
 Step 1.0 is complete.
 
+### Step 1.1 Sidecar Scaffold
+
+Initial scaffold added:
+
+```text
+/workspace/vllm/vllm/v1/mixed_precision_recovery/__init__.py
+/workspace/vllm/vllm/v1/mixed_precision_recovery/config.py
+/workspace/vllm/vllm/v1/mixed_precision_recovery/sidecar.py
+/workspace/vllm/vllm/v1/mixed_precision_recovery/debug.py
+```
+
+Also registered the initial MPR environment variables in `vllm/envs.py` so
+vLLM environment validation recognizes them:
+
+```text
+VLLM_MPR_ENABLE
+VLLM_MPR_DEBUG_DIR
+VLLM_MPR_TOPK
+VLLM_MPR_MAX_LAYERS
+VLLM_MPR_MAX_STEPS
+VLLM_MPR_DUMP_EVERY
+VLLM_MPR_WINDOW_SIZE
+```
+
+Current behavior:
+
+```text
+VLLM_MPR_ENABLE unset or 0 -> sidecar is disabled and observer methods return early
+VLLM_MPR_ENABLE=1 -> sidecar initializes counters and optional JSONL debug writer
+```
+
+Validation completed in the Windows workspace:
+
+```text
+python -m py_compile vllm/v1/mixed_precision_recovery/*.py vllm/envs.py
+```
+
+Validation still pending in the target `/workspace/vllm` conda environment:
+
+```text
+import smoke test with torch 2.11.0+cu130
+baseline generation with VLLM_MPR_ENABLE unset
+baseline generation with VLLM_MPR_ENABLE=1
+```
+
+The Windows Python import smoke test could not be used because its local torch
+version does not provide `torch.library.infer_schema`, which this vLLM tree
+expects.
+
 ## Next Step
 
-Start Step 1.1: disabled-by-default MPR sidecar scaffold.
+Finish Step 1.1 validation in the target vLLM environment.
 
 Initial goal:
 
 ```text
 VLLM_MPR_ENABLE unset or 0 -> no behavior change
 VLLM_MPR_ENABLE=1 -> sidecar module initializes and debug counters/logs work
-```
-
-No attention hook should be added yet in Step 1.1 unless needed for a minimal
-initialization smoke test.
-
-Likely files to add under `/workspace/vllm`:
-
-```text
-vllm/v1/mixed_precision_recovery/__init__.py
-vllm/v1/mixed_precision_recovery/config.py
-vllm/v1/mixed_precision_recovery/sidecar.py
-vllm/v1/mixed_precision_recovery/debug.py
 ```
 
 Recommended first validation:
