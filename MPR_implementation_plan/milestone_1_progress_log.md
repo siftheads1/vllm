@@ -1,6 +1,6 @@
 # Milestone 1 Progress Log
 
-Last updated: 2026-05-27
+Last updated: 2026-05-28
 
 ## Current State
 
@@ -342,15 +342,162 @@ packing/scoring and future ArkVale-kernel adapter work more natural, but it is
 not required for the first Step 1.3 prototype.
 ```
 
+### Step 1.3 Digest Cache v0 Implementation
+
+Discussion decisions before implementation:
+
+```text
+digest generation logic = separate helper function, not inline in sidecar
+raw KV backup in sidecar = no
+digest source = vLLM FlashAttention KV cache key plane, kv_cache[0]
+full block detection = track observed block offsets per layer/block
+digest storage = layer-local Python dict keyed by physical_block_id
+debug JSONL = metadata only, not full digest tensor values
+```
+
+Implementation added:
+
+```text
+vllm/v1/mixed_precision_recovery/digest.py
+  KeyBlockDigest
+  summarize_key_block(...)
+
+vllm/v1/mixed_precision_recovery/sidecar.py
+  BlockDigest
+  _block_offsets
+  _digest_cache
+  _observe_block_offsets(...)
+
+vllm/model_executor/layers/attention/attention.py
+  passes kv_cache into observe_kv_write(...)
+
+tests/v1/mixed_precision_recovery/test_digest.py
+  digest formula test
+  sidecar full-block digest creation test
+```
+
+Digest helper contract:
+
+```text
+input:
+  key_block: [block_size, num_kv_heads, head_dim]
+
+output:
+  digest_min: [num_kv_heads, head_dim]
+  digest_max: [num_kv_heads, head_dim]
+  valid_token_count = block_size
+```
+
+The helper uses the ArkVale-style formula:
+
+```text
+raw_max = key_block.max(dim=0)
+raw_min = key_block.min(dim=0)
+center = (raw_max + raw_min) / 2
+dist = mean(abs(center - key_block), dim=block_tokens)
+digest_min = center - dist
+digest_max = center + dist
+```
+
+Sidecar behavior:
+
+```text
+slot_mapping PAD_SLOT_ID(-1) entries are still filtered out
+slot ids < PAD_SLOT_ID still fail fast
+physical_block_id = slot_id // block_size
+block_offset = slot_id % block_size
+```
+
+For every valid write, the sidecar records the observed offsets for:
+
+```text
+(layer_name, physical_block_id)
+```
+
+Once the observed offsets cover the full range:
+
+```text
+0 ... block_size - 1
+```
+
+the sidecar reads:
+
+```text
+key_block = kv_cache[0, physical_block_id]
+```
+
+and stores:
+
+```text
+_digest_cache[layer_name][physical_block_id] = BlockDigest(...)
+```
+
+Current v0 limitation:
+
+```text
+physical KV block lifecycle/reuse cleanup is not implemented yet
+the first full transition for a layer/block creates one digest entry
+future multi-request/prefix-cache/block-reuse support must invalidate or
+refresh digest state when vLLM reuses a physical block for different tokens
+```
+
+Debug JSONL additions:
+
+```text
+kv_cache_shape
+digest_created_block_ids
+num_digest_blocks_for_layer
+total_digest_blocks
+```
+
+When a block digest is created, the debug writer also emits:
+
+```text
+event = digest_created
+layer_name
+physical_block_id
+digest_min_shape
+digest_max_shape
+valid_token_count
+block_size
+num_digest_blocks_for_layer
+total_digest_blocks
+```
+
+The `VLLM_MPR_MAX_LAYERS`, `VLLM_MPR_MAX_STEPS`, and
+`VLLM_MPR_DUMP_EVERY` settings are treated as JSONL/debug limiting controls.
+They do not stop sidecar block-offset tracking or digest-cache updates for
+layers that are actually observed by the hook.
+
+Validation completed in the Windows workspace:
+
+```text
+python -m py_compile vllm/v1/mixed_precision_recovery/__init__.py \
+  vllm/v1/mixed_precision_recovery/config.py \
+  vllm/v1/mixed_precision_recovery/debug.py \
+  vllm/v1/mixed_precision_recovery/digest.py \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  vllm/model_executor/layers/attention/attention.py \
+  tests/v1/mixed_precision_recovery/test_digest.py
+```
+
+Local pytest validation was not possible in the Windows workspace because this
+Python environment does not have `pytest` installed. A direct import smoke also
+cannot be used here because the local torch version lacks
+`torch.library.infer_schema`, which this vLLM tree expects. Run the pytest and
+GPU smoke in the target `/workspace/vllm` environment.
+
 ## Next Step
 
-Discuss and implement Step 1.3: ArkVale-style digest cache v0.
+Validate Step 1.3 on the target GPU server.
 
-Recommended first validation:
+Recommended validation:
 
 ```bash
 cd /workspace/vllm
 rm -rf /tmp/vllm_mpr_debug
+
+python -m pytest tests/v1/mixed_precision_recovery/test_digest.py -q
 
 VLLM_MPR_ENABLE=1 \
 VLLM_MPR_DEBUG_DIR=/tmp/vllm_mpr_debug \
@@ -366,6 +513,7 @@ Expected debug check:
 
 ```bash
 cat /tmp/vllm_mpr_debug/*.jsonl | grep observe_kv_write | head
+cat /tmp/vllm_mpr_debug/*.jsonl | grep digest_created | head
 ```
 
 Expected outcome:
@@ -373,6 +521,8 @@ Expected outcome:
 ```text
 generation completes
 observe_kv_write events exist
+digest_created events appear after at least one full physical block is observed
+digest_min_shape and digest_max_shape are [num_kv_heads, head_dim]
 num_valid_slots > 0 for decode writes
 num_pad_slots may be > 0 because CUDA graph padding uses PAD_SLOT_ID=-1
 unique_block_ids is non-empty for decode writes

@@ -724,6 +724,7 @@ def _maybe_observe_mpr_kv_write(
         layer_name=layer_name,
         key=key,
         value=value,
+        kv_cache=kv_cache,
         slot_mapping=layer_slot_mapping,
         block_size=block_size,
     )

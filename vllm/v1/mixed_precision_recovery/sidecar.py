@@ -14,17 +14,30 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.mixed_precision_recovery.config import MPRConfig
 from vllm.v1.mixed_precision_recovery.debug import MPRDebugWriter
+from vllm.v1.mixed_precision_recovery.digest import (
+    KeyBlockDigest,
+    summarize_key_block,
+)
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class BlockDigest:
+    digest_min: Any
+    digest_max: Any
+    valid_token_count: int
+    block_size: int
+    layer_event_idx: int
 
 
 @dataclass
 class RecoverySidecar:
     """Score-only sidecar state for Milestone 1.
 
-    Step 1.1 intentionally does not observe tensors yet. The methods are no-op
-    placeholders that let later attention hooks increment counters behind one
-    fast ``enabled`` guard.
+    The Step 1.3 prototype tracks written block offsets and summarizes full
+    FlashAttention key-cache blocks into ArkVale-style digests. Debug dump
+    limits affect JSONL records only; they do not gate sidecar state updates.
     """
 
     config: MPRConfig = field(default_factory=MPRConfig.from_env)
@@ -32,6 +45,8 @@ class RecoverySidecar:
     # Debug-only layer bookkeeping for VLLM_MPR_MAX_LAYERS dump limiting.
     _layer_indices: dict[str, int] = field(default_factory=dict)
     _kv_write_counts: Counter[str] = field(default_factory=Counter)
+    _block_offsets: dict[str, dict[int, set[int]]] = field(default_factory=dict)
+    _digest_cache: dict[str, dict[int, BlockDigest]] = field(default_factory=dict)
     _debug_writer: MPRDebugWriter = field(init=False)
 
     def __post_init__(self) -> None:
@@ -54,6 +69,7 @@ class RecoverySidecar:
         layer_name: str,
         key: Any = None,
         value: Any = None,
+        kv_cache: Any = None,
         slot_mapping: Any = None,
         block_size: int | None = None,
     ) -> None:
@@ -63,8 +79,6 @@ class RecoverySidecar:
             layer_name,
             self._kv_write_counts,
         )
-        if not should_record:
-            return
         if block_size is None or block_size <= 0:
             raise ValueError(
                 f"MPR requires a positive block_size for {layer_name}, "
@@ -80,6 +94,7 @@ class RecoverySidecar:
             min_block_offset = None
             max_block_offset = None
             num_pad_slots = 0
+            digest_created_block_ids: list[int] = []
         else:
             has_invalid_negative_slot = bool((flat_slots < PAD_SLOT_ID).any().item())
             if has_invalid_negative_slot:
@@ -97,6 +112,7 @@ class RecoverySidecar:
                 unique_block_ids = []
                 min_block_offset = None
                 max_block_offset = None
+                digest_created_block_ids = []
             else:
                 block_ids = valid_slots // block_size
                 block_offsets = valid_slots % block_size
@@ -106,22 +122,37 @@ class RecoverySidecar:
                 ]
                 min_block_offset = int(block_offsets.min().item())
                 max_block_offset = int(block_offsets.max().item())
+                digest_created_block_ids = self._observe_block_offsets(
+                    layer_name=layer_name,
+                    block_ids=block_ids,
+                    block_offsets=block_offsets,
+                    block_size=block_size,
+                    kv_cache=kv_cache,
+                    layer_event_idx=layer_event_idx,
+                )
 
-        self._record(
-            "observe_kv_write",
-            layer_name=layer_name,
-            layer_event_idx=layer_event_idx,
-            key_shape=self._shape_of(key),
-            value_shape=self._shape_of(value),
-            slot_mapping_shape=self._shape_of(slot_mapping),
-            num_slots=num_slots,
-            num_valid_slots=num_slots - num_pad_slots,
-            num_pad_slots=num_pad_slots,
-            block_size=block_size,
-            unique_block_ids=unique_block_ids,
-            min_block_offset=min_block_offset,
-            max_block_offset=max_block_offset,
-        )
+        if should_record:
+            self._record(
+                "observe_kv_write",
+                layer_name=layer_name,
+                layer_event_idx=layer_event_idx,
+                key_shape=self._shape_of(key),
+                value_shape=self._shape_of(value),
+                kv_cache_shape=self._shape_of(kv_cache),
+                slot_mapping_shape=self._shape_of(slot_mapping),
+                num_slots=num_slots,
+                num_valid_slots=num_slots - num_pad_slots,
+                num_pad_slots=num_pad_slots,
+                block_size=block_size,
+                unique_block_ids=unique_block_ids,
+                min_block_offset=min_block_offset,
+                max_block_offset=max_block_offset,
+                digest_created_block_ids=digest_created_block_ids,
+                num_digest_blocks_for_layer=len(
+                    self._digest_cache.get(layer_name, {})
+                ),
+                total_digest_blocks=self._num_digest_blocks(),
+            )
 
     def observe_query(
         self,
@@ -188,6 +219,91 @@ class RecoverySidecar:
         if shape is None:
             return None
         return [int(dim) for dim in shape]
+
+    def _observe_block_offsets(
+        self,
+        layer_name: str,
+        block_ids: Any,
+        block_offsets: Any,
+        block_size: int,
+        kv_cache: Any,
+        layer_event_idx: int | None,
+    ) -> list[int]:
+        if kv_cache is None:
+            raise ValueError(f"MPR requires kv_cache for digesting {layer_name}.")
+        if kv_cache.ndim != 5 or kv_cache.shape[0] != 2:
+            raise ValueError(
+                "MPR digest cache currently expects FlashAttention KV cache "
+                "layout [2, num_blocks, block_size, num_kv_heads, head_dim], "
+                f"got {tuple(kv_cache.shape)} for {layer_name}."
+            )
+        if int(kv_cache.shape[2]) != block_size:
+            raise AssertionError(
+                f"MPR block_size mismatch for {layer_name}: "
+                f"block_size={block_size}, kv_cache.shape[2]={int(kv_cache.shape[2])}."
+            )
+
+        key_cache = kv_cache[0]
+        layer_offsets = self._block_offsets.setdefault(layer_name, {})
+        layer_digests = self._digest_cache.setdefault(layer_name, {})
+        created_block_ids: list[int] = []
+
+        block_id_values = block_ids.detach().cpu().tolist()
+        block_offset_values = block_offsets.detach().cpu().tolist()
+        for block_id_raw, block_offset_raw in zip(block_id_values, block_offset_values):
+            block_id = int(block_id_raw)
+            block_offset = int(block_offset_raw)
+            if block_id < 0 or block_id >= int(key_cache.shape[0]):
+                raise AssertionError(
+                    f"MPR observed block id outside KV cache for {layer_name}: "
+                    f"block_id={block_id}, num_blocks={int(key_cache.shape[0])}."
+                )
+            if block_offset < 0 or block_offset >= block_size:
+                raise AssertionError(
+                    f"MPR observed block offset outside block for {layer_name}: "
+                    f"block_offset={block_offset}, block_size={block_size}."
+                )
+
+            offsets = layer_offsets.setdefault(block_id, set())
+            offsets.add(block_offset)
+            if len(offsets) == block_size and block_id not in layer_digests:
+                digest = summarize_key_block(key_cache[block_id])
+                layer_digests[block_id] = self._to_block_digest(
+                    digest,
+                    layer_event_idx,
+                )
+                created_block_ids.append(block_id)
+                if layer_name in self._layer_indices:
+                    self._record(
+                        "digest_created",
+                        layer_name=layer_name,
+                        layer_event_idx=layer_event_idx,
+                        physical_block_id=block_id,
+                        digest_min_shape=self._shape_of(digest.digest_min),
+                        digest_max_shape=self._shape_of(digest.digest_max),
+                        valid_token_count=digest.valid_token_count,
+                        block_size=digest.block_size,
+                        num_digest_blocks_for_layer=len(layer_digests),
+                        total_digest_blocks=self._num_digest_blocks(),
+                    )
+
+        return created_block_ids
+
+    @staticmethod
+    def _to_block_digest(
+        digest: KeyBlockDigest,
+        layer_event_idx: int | None,
+    ) -> BlockDigest:
+        return BlockDigest(
+            digest_min=digest.digest_min,
+            digest_max=digest.digest_max,
+            valid_token_count=digest.valid_token_count,
+            block_size=digest.block_size,
+            layer_event_idx=-1 if layer_event_idx is None else layer_event_idx,
+        )
+
+    def _num_digest_blocks(self) -> int:
+        return sum(len(layer_digests) for layer_digests in self._digest_cache.values())
 
     def _record(self, event: str, **fields: Any) -> None:
         self.counters[event] += 1
