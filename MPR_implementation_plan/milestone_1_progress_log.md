@@ -291,11 +291,60 @@ python -m py_compile vllm/model_executor/layers/attention/attention.py \
   vllm/v1/mixed_precision_recovery/*.py
 ```
 
-Full runtime validation is still pending in the target GPU environment.
+Target GPU validation completed by user:
+
+```text
+generation completed
+block_size inference error resolved
+PAD_SLOT_ID=-1 padding handled
+observe_kv_write JSONL records created
+10 observed layers each recorded 10 KV write events
+```
+
+Step 1.2 is complete for the current smoke scope.
+
+### Step 1.3 Digest Cache Design Notes
+
+ArkVale reference checked:
+
+```text
+ArkVale/source/arkvale/infer_state.py
+  InferState._summarize_keys(...)
+  InferState.prefill_save_digests(...)
+  InferState.decode_save_1_digest(...)
+```
+
+For vLLM Milestone 1, we should reference ArkVale's digest formula and
+full-page/key-only policy, not its whole KV pool/cache lifecycle.
+
+Initial vLLM sidecar storage candidate:
+
+```text
+(layer_name, physical_block_id) -> digest_max
+(layer_name, physical_block_id) -> digest_min
+(layer_name, physical_block_id) -> valid_token_count
+```
+
+The simple first implementation can store these in layer-local Python dicts,
+for example:
+
+```text
+dict[layer_name, dict[physical_block_id, BlockDigest]]
+```
+
+Potential direction:
+
+```text
+If digest count or Python dict overhead becomes large for long sequences,
+multi-request batches, or many layers, move digest storage to a paged tensor
+layout similar in spirit to ArkVale's digest cache. This would make digest
+packing/scoring and future ArkVale-kernel adapter work more natural, but it is
+not required for the first Step 1.3 prototype.
+```
 
 ## Next Step
 
-Run Step 1.2 validation in the target vLLM environment.
+Discuss and implement Step 1.3: ArkVale-style digest cache v0.
 
 Recommended first validation:
 
