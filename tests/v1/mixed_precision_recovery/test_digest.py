@@ -59,7 +59,11 @@ def test_sidecar_creates_digest_once_block_is_full():
     )
 
     block_digest = sidecar._digest_cache["model.layers.0.self_attn.attn"][1]
+    expected_digest = summarize_key_block(kv_cache[0, 1])
+
     assert block_digest.block_size == 4
     assert block_digest.valid_token_count == 4
     assert list(block_digest.digest_min.shape) == [1, 2]
     assert list(block_digest.digest_max.shape) == [1, 2]
+    torch.testing.assert_close(block_digest.digest_min, expected_digest.digest_min)
+    torch.testing.assert_close(block_digest.digest_max, expected_digest.digest_max)
