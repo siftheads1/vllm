@@ -503,6 +503,25 @@ The comments now state the expected FlashAttention KV cache shape:
   digest_min/max: [num_kv_heads, head_dim]
 ```
 
+Validation tooling follow-up:
+
+```text
+Added scripts/mpr_validate_debug_jsonl.py to validate Step 1.3 smoke JSONL
+without manually reading raw cat/jq output.
+
+The validator checks:
+  observe_kv_write block/offset invariants
+  digest_created metadata invariants
+  digest_min_shape == digest_max_shape
+  valid_token_count == block_size for full-block digest v0
+  each digest_created event matches an observe_kv_write event with the same
+    (layer_name, layer_event_idx)
+  physical_block_id appears in the observe event's digest_created_block_ids
+
+Added tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py for
+matching and unmatched digest event cases.
+```
+
 ## Next Step
 
 Validate Step 1.3 on the target GPU server.
@@ -530,6 +549,7 @@ Expected debug check:
 ```bash
 cat /tmp/vllm_mpr_debug/*.jsonl | grep observe_kv_write | head
 cat /tmp/vllm_mpr_debug/*.jsonl | grep digest_created | head
+python scripts/mpr_validate_debug_jsonl.py /tmp/vllm_mpr_debug/*.jsonl
 ```
 
 Expected outcome:
