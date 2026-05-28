@@ -5,16 +5,6 @@ import argparse
 import os
 
 
-def _is_truthy_env(value: str | None) -> bool:
-    """Return whether an environment value should be treated as enabled."""
-    return value is not None and value.strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a small deterministic vLLM baseline generation."
@@ -44,8 +34,8 @@ def parse_args() -> argparse.Namespace:
         "--defer-mpr-enable",
         action="store_true",
         help=(
-            "If VLLM_MPR_ENABLE is enabled, disable it during LLM init/profile "
-            "and restore it before generation."
+            "Deprecated compatibility flag. MPR now skips vLLM dummy/profile "
+            "runs inside the engine process."
         ),
     )
     return parser.parse_args()
@@ -59,35 +49,23 @@ def main() -> None:
 
     from vllm import LLM, SamplingParams
 
-    original_mpr_enable = os.environ.get("VLLM_MPR_ENABLE")
-    should_defer_mpr_enable = (
-        args.defer_mpr_enable and _is_truthy_env(original_mpr_enable)
-    )
-    if should_defer_mpr_enable:
-        os.environ["VLLM_MPR_ENABLE"] = "0"
-
     print("baseline_model:", args.model)
     print("hf_home:", os.environ.get("HF_HOME"))
     print("vllm_use_v1:", os.environ.get("VLLM_USE_V1"))
-    print("mpr_defer_enable:", should_defer_mpr_enable)
+    print("mpr_defer_enable:", args.defer_mpr_enable)
     print("mpr_enable_during_init:", os.environ.get("VLLM_MPR_ENABLE"))
 
-    try:
-        llm = LLM(
-            model=args.model,
-            tensor_parallel_size=args.tensor_parallel_size,
-            dtype=args.dtype,
-            seed=args.seed,
-            max_model_len=args.max_model_len,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            enforce_eager=not args.no_enforce_eager,
-            enable_chunked_prefill=False,
-            trust_remote_code=args.trust_remote_code,
-        )
-    finally:
-        if should_defer_mpr_enable:
-            assert original_mpr_enable is not None
-            os.environ["VLLM_MPR_ENABLE"] = original_mpr_enable
+    llm = LLM(
+        model=args.model,
+        tensor_parallel_size=args.tensor_parallel_size,
+        dtype=args.dtype,
+        seed=args.seed,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        enforce_eager=not args.no_enforce_eager,
+        enable_chunked_prefill=False,
+        trust_remote_code=args.trust_remote_code,
+    )
     print("mpr_enable_during_generate:", os.environ.get("VLLM_MPR_ENABLE"))
 
     sampling_params = SamplingParams(

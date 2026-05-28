@@ -545,23 +545,25 @@ events if vLLM emits KV writes before the user request.
 Profile-run isolation follow-up:
 
 ```text
-scripts/mpr_baseline_qwen3_8b.py added --defer-mpr-enable.
+The first script-level --defer-mpr-enable implementation tried to set
+VLLM_MPR_ENABLE=0 during LLM(...), then restore it before llm.generate(...).
+That failed for the target SyncMP/EngineCore path because EngineCore runs in a
+separate process. The child process inherited VLLM_MPR_ENABLE=0 during startup
+and did not see the parent process restore it, so no JSONL file was created.
 
-When VLLM_MPR_ENABLE is truthy and --defer-mpr-enable is passed, the script:
-  1. saves the original VLLM_MPR_ENABLE value
-  2. sets VLLM_MPR_ENABLE=0 before LLM(...)
-  3. lets vLLM run initialization/profile/warmup without MPR observation
-  4. restores the original VLLM_MPR_ENABLE value before llm.generate(...)
+Fix:
+  vllm.forward_context.ForwardContext now carries is_dummy_run
+  GPUModelRunner.execute_model passes dummy_run into set_forward_context(...)
+  _maybe_observe_mpr_kv_write skips observation when forward_context.is_dummy_run
 
-The script now prints:
+This keeps VLLM_MPR_ENABLE=1 inside the EngineCore process while filtering
+dummy/profile model-runner forwards in the MPR hook itself.
+
+scripts/mpr_baseline_qwen3_8b.py keeps --defer-mpr-enable as a compatibility
+flag, but it no longer toggles VLLM_MPR_ENABLE. The script still prints:
   mpr_defer_enable
   mpr_enable_during_init
   mpr_enable_during_generate
-
-This is a smoke-test isolation mechanism only. It avoids initial profile/dummy
-KV writes polluting Step 1.3 JSONL. It does not yet add a general in-engine
-profile/dummy-run filter to the MPR hook.
-```
 ```
 
 ## Next Step

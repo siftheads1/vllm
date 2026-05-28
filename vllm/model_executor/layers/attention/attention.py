@@ -698,6 +698,9 @@ def _maybe_observe_mpr_kv_write(
 ) -> None:
     if not envs.VLLM_MPR_ENABLE:
         return
+    forward_context: ForwardContext = get_forward_context()
+    if forward_context.is_dummy_run:
+        return
 
     block_size = getattr(attn_layer.impl, "block_size", None)
     if block_size is None:
