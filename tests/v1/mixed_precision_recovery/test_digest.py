@@ -9,6 +9,7 @@ from vllm.v1.mixed_precision_recovery.sidecar import RecoverySidecar
 
 
 def test_summarize_key_block_matches_arkvale_formula():
+    """Check that the standalone digest helper matches the ArkVale formula."""
     key_block = torch.tensor(
         [
             [[1.0, 3.0], [2.0, 4.0]],
@@ -31,6 +32,7 @@ def test_summarize_key_block_matches_arkvale_formula():
 
 
 def test_sidecar_creates_digest_once_block_is_full():
+    """Check that sidecar stores the exact digest for a completed KV block."""
     sidecar = RecoverySidecar(config=MPRConfig(enabled=True))
     kv_cache = torch.zeros(2, 2, 4, 1, 2)
     kv_cache[0, 1] = torch.tensor(

@@ -487,6 +487,22 @@ cannot be used here because the local torch version lacks
 `torch.library.infer_schema`, which this vLLM tree expects. Run the pytest and
 GPU smoke in the target `/workspace/vllm` environment.
 
+Documentation follow-up:
+
+```text
+Added docstrings and explicit shape comments to the Step 1.3 digest path:
+  summarize_key_block(...)
+  RecoverySidecar.observe_kv_write(...)
+  RecoverySidecar._observe_block_offsets(...)
+  BlockDigest / KeyBlockDigest
+
+The comments now state the expected FlashAttention KV cache shape:
+  kv_cache: [2, num_blocks, block_size, num_kv_heads, head_dim]
+  key_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+  key_block: [block_size, num_kv_heads, head_dim]
+  digest_min/max: [num_kv_heads, head_dim]
+```
+
 ## Next Step
 
 Validate Step 1.3 on the target GPU server.

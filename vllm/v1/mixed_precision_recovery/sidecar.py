@@ -24,6 +24,19 @@ logger = init_logger(__name__)
 
 @dataclass
 class BlockDigest:
+    """Sidecar-owned digest cache entry for one physical KV block.
+
+    Attributes:
+        digest_min: Lower digest bound, shaped ``[num_kv_heads, head_dim]``.
+        digest_max: Upper digest bound, shaped ``[num_kv_heads, head_dim]``.
+        valid_token_count: Number of token slots summarized. For Step 1.3 this
+            equals ``block_size`` because only full-block digests are created.
+        block_size: Number of token slots in the physical KV block.
+        layer_event_idx: Per-layer KV-write event index that first completed
+            the block. ``-1`` means the digest was created while the event was
+            outside the debug dump window.
+    """
+
     digest_min: Any
     digest_max: Any
     valid_token_count: int
@@ -50,6 +63,7 @@ class RecoverySidecar:
     _debug_writer: MPRDebugWriter = field(init=False)
 
     def __post_init__(self) -> None:
+        """Initialize optional debug output and emit the init event."""
         self._debug_writer = MPRDebugWriter(self.config)
         if self.config.enabled:
             logger.info(
@@ -62,6 +76,7 @@ class RecoverySidecar:
             self._record("init")
 
     def enabled(self) -> bool:
+        """Return whether MPR sidecar observation is enabled."""
         return self.config.enabled
 
     def observe_kv_write(
@@ -73,6 +88,25 @@ class RecoverySidecar:
         slot_mapping: Any = None,
         block_size: int | None = None,
     ) -> None:
+        """Observe a KV-cache write and create digests for newly full blocks.
+
+        Args:
+            layer_name: vLLM attention layer name.
+            key: Incoming key tensor for the current KV update. It is used only
+                for debug shape reporting here. Expected shape is the
+                attention-backend update shape for this forward pass, commonly
+                ``[num_tokens, num_kv_heads, head_dim]`` for FlashAttention.
+            value: Incoming value tensor for the current KV update. It is used
+                only for debug shape reporting. Expected shape matches ``key``.
+            kv_cache: FlashAttention KV cache after the write, shaped
+                ``[2, num_blocks, block_size, num_kv_heads, head_dim]``. The
+                leading dimension selects key/value; ``kv_cache[0]`` is the key
+                cache used for digest generation.
+            slot_mapping: Flat physical slot ids for the current update. Shape
+                is typically ``[num_slots]`` after flattening. ``PAD_SLOT_ID``
+                entries are CUDA graph padding and are ignored.
+            block_size: Number of token slots per physical KV block.
+        """
         if not self.config.enabled:
             return
         should_record, layer_event_idx = self._should_record_layer_event(
@@ -87,6 +121,8 @@ class RecoverySidecar:
         if slot_mapping is None:
             raise ValueError(f"MPR requires slot_mapping for {layer_name}.")
 
+        # flat_slots: flattened physical slot ids for this KV write.
+        # Shape: [num_slots].
         flat_slots = slot_mapping.detach().reshape(-1)
         num_slots = int(flat_slots.numel())
         if num_slots == 0:
@@ -106,6 +142,8 @@ class RecoverySidecar:
 
             # vLLM pads unused CUDA graph slots with PAD_SLOT_ID. These are not
             # KV writes and should not participate in block/offset summaries.
+            # valid_slots: physical slot ids that correspond to real KV writes.
+            # Shape: [num_valid_slots].
             valid_slots = flat_slots[flat_slots != PAD_SLOT_ID]
             num_pad_slots = num_slots - int(valid_slots.numel())
             if valid_slots.numel() == 0:
@@ -114,7 +152,12 @@ class RecoverySidecar:
                 max_block_offset = None
                 digest_created_block_ids = []
             else:
+                # block_ids: physical KV block id for each valid slot.
+                # Shape: [num_valid_slots].
                 block_ids = valid_slots // block_size
+
+                # block_offsets: token offset within the physical block.
+                # Shape: [num_valid_slots].
                 block_offsets = valid_slots % block_size
                 unique_block_ids = [
                     int(block_id)
@@ -160,6 +203,11 @@ class RecoverySidecar:
         query: Any = None,
         attn_metadata: Any = None,
     ) -> None:
+        """Observe an attention query tensor.
+
+        Step 1.3 does not score queries yet, so this method only records a
+        debug event when enabled.
+        """
         if not self.config.enabled:
             return
         self._record("observe_query", layer_name=layer_name)
@@ -171,6 +219,19 @@ class RecoverySidecar:
         attn_metadata: Any = None,
         block_size: int | None = None,
     ) -> None:
+        """Placeholder for future digest/query scoring.
+
+        Args:
+            layer_name: vLLM attention layer name.
+            window_query: Future query window summary. The planned shape is a
+                query tensor or query summary over up to
+                ``VLLM_MPR_WINDOW_SIZE`` decode tokens.
+            attn_metadata: vLLM attention metadata for the current layer.
+            block_size: Number of token slots per physical KV block.
+
+        Returns:
+            ``None`` until Step 1.4 scoring is implemented.
+        """
         if not self.config.enabled:
             return None
         self._record(
@@ -181,9 +242,11 @@ class RecoverySidecar:
         return None
 
     def snapshot_stats(self) -> dict[str, int]:
+        """Return a copy of sidecar event counters for smoke tests."""
         return dict(self.counters)
 
     def close(self) -> None:
+        """Close any debug writer resources owned by this sidecar."""
         self._debug_writer.close()
 
     def _should_record_layer_event(
@@ -191,6 +254,20 @@ class RecoverySidecar:
         layer_name: str,
         event_counts: Counter[str],
     ) -> tuple[bool, int | None]:
+        """Update per-layer debug counters and decide whether to dump JSONL.
+
+        Args:
+            layer_name: vLLM attention layer name.
+            event_counts: Counter keyed by layer name for the event family being
+                limited.
+
+        Returns:
+            A tuple ``(should_record, layer_event_idx)``. ``should_record``
+            controls only JSONL/debug output; sidecar state updates should still
+            proceed when it is false. ``layer_event_idx`` is the 1-based count
+            for this layer, or ``None`` if the layer is outside
+            ``VLLM_MPR_MAX_LAYERS``.
+        """
         if layer_name not in self._layer_indices:
             if (
                 self.config.max_layers is not None
@@ -215,6 +292,7 @@ class RecoverySidecar:
 
     @staticmethod
     def _shape_of(value: Any) -> list[int] | None:
+        """Return ``value.shape`` as JSON-serializable ints when present."""
         shape = getattr(value, "shape", None)
         if shape is None:
             return None
@@ -229,6 +307,23 @@ class RecoverySidecar:
         kv_cache: Any,
         layer_event_idx: int | None,
     ) -> list[int]:
+        """Track written block offsets and digest blocks that become full.
+
+        Args:
+            layer_name: vLLM attention layer name.
+            block_ids: Physical KV block id for each valid slot, shaped
+                ``[num_valid_slots]``.
+            block_offsets: Token offset within each physical block, shaped
+                ``[num_valid_slots]``.
+            block_size: Number of token slots per physical KV block.
+            kv_cache: FlashAttention KV cache after the write, shaped
+                ``[2, num_blocks, block_size, num_kv_heads, head_dim]``.
+            layer_event_idx: Per-layer KV-write event index for debug output,
+                or ``None`` when the layer is outside the debug dump window.
+
+        Returns:
+            Physical block ids whose digest was created by this observation.
+        """
         if kv_cache is None:
             raise ValueError(f"MPR requires kv_cache for digesting {layer_name}.")
         if kv_cache.ndim != 5 or kv_cache.shape[0] != 2:
@@ -243,15 +338,28 @@ class RecoverySidecar:
                 f"block_size={block_size}, kv_cache.shape[2]={int(kv_cache.shape[2])}."
             )
 
+        # key_cache: FlashAttention key plane.
+        # Shape: [num_blocks, block_size, num_kv_heads, head_dim].
         key_cache = kv_cache[0]
+
+        # layer_offsets: observed token offsets by physical block id.
+        # Structure: dict[physical_block_id, set[block_offset]].
         layer_offsets = self._block_offsets.setdefault(layer_name, {})
+
+        # layer_digests: cached digest entries by physical block id.
+        # Each digest_min/digest_max has shape [num_kv_heads, head_dim].
         layer_digests = self._digest_cache.setdefault(layer_name, {})
         created_block_ids: list[int] = []
 
+        # block_id_values/block_offset_values are CPU scalar lists used only for
+        # Python-side bookkeeping. They preserve the [num_valid_slots] pairing.
         block_id_values = block_ids.detach().cpu().tolist()
         block_offset_values = block_offsets.detach().cpu().tolist()
         for block_id_raw, block_offset_raw in zip(block_id_values, block_offset_values):
+            # block_id: physical KV block index into key_cache dim 0.
             block_id = int(block_id_raw)
+
+            # block_offset: token slot index within key_cache[block_id] dim 0.
             block_offset = int(block_offset_raw)
             if block_id < 0 or block_id >= int(key_cache.shape[0]):
                 raise AssertionError(
@@ -267,6 +375,8 @@ class RecoverySidecar:
             offsets = layer_offsets.setdefault(block_id, set())
             offsets.add(block_offset)
             if len(offsets) == block_size and block_id not in layer_digests:
+                # key_cache[block_id]: one full key block.
+                # Shape: [block_size, num_kv_heads, head_dim].
                 digest = summarize_key_block(key_cache[block_id])
                 layer_digests[block_id] = self._to_block_digest(
                     digest,
@@ -294,6 +404,17 @@ class RecoverySidecar:
         digest: KeyBlockDigest,
         layer_event_idx: int | None,
     ) -> BlockDigest:
+        """Convert a helper digest into the sidecar cache entry type.
+
+        Args:
+            digest: Digest returned by ``summarize_key_block``. Its min/max
+                tensors are shaped ``[num_kv_heads, head_dim]``.
+            layer_event_idx: Per-layer KV-write event index, or ``None`` when
+                the digest was created outside the debug dump window.
+
+        Returns:
+            A ``BlockDigest`` stored in ``_digest_cache``.
+        """
         return BlockDigest(
             digest_min=digest.digest_min,
             digest_max=digest.digest_max,
@@ -303,9 +424,11 @@ class RecoverySidecar:
         )
 
     def _num_digest_blocks(self) -> int:
+        """Return the total number of cached block digests across layers."""
         return sum(len(layer_digests) for layer_digests in self._digest_cache.values())
 
     def _record(self, event: str, **fields: Any) -> None:
+        """Increment an event counter and append one JSONL debug record."""
         self.counters[event] += 1
         self._debug_writer.write(
             {
