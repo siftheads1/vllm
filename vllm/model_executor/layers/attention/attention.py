@@ -701,12 +701,20 @@ def _maybe_observe_mpr_kv_write(
 
     block_size = getattr(attn_layer.impl, "block_size", None)
     if block_size is None:
+        impl_name = attn_layer.impl.__class__.__name__
+        if impl_name != "FlashAttentionImpl":
+            raise ValueError(
+                "MPR block_size fallback is currently implemented only for "
+                f"FlashAttentionImpl, got {impl_name}."
+            )
         if kv_cache.ndim >= 3 and kv_cache.shape[0] == 2:
+            # FlashAttention KV cache layout is
+            # [2, num_blocks, block_size, num_kv_heads, head_size].
             block_size = int(kv_cache.shape[2])
         else:
             raise ValueError(
                 "MPR could not infer block_size for "
-                f"{attn_layer.impl.__class__.__name__}; "
+                f"{impl_name}; "
                 f"kv_cache_shape={tuple(kv_cache.shape)}."
             )
 

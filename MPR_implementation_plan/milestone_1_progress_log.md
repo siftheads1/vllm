@@ -198,10 +198,17 @@ Fix:
 
 ```text
 _maybe_observe_mpr_kv_write first checks attn_layer.impl.block_size.
-If absent and the KV cache is FlashAttention-shaped, it infers:
+If absent, the fallback is explicitly FlashAttention-specific.
+For FlashAttentionImpl and FlashAttention-shaped KV cache, it infers:
   block_size = kv_cache.shape[2]
-Otherwise it still fails fast with the KV cache shape in the error message.
+Otherwise it fails fast with the backend name and KV cache shape in the error
+message.
 ```
+
+This is intentionally backend-specific for Milestone 1 because the target scope
+is vLLM v1 + FlashAttention. Other attention backends must not silently reuse
+the `kv_cache.shape[2]` interpretation unless their KV cache layout has been
+checked separately.
 
 Second target-server Step 1.2 validation failed with:
 
