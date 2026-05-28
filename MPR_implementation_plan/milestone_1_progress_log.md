@@ -541,6 +541,27 @@ validator total is what the MPR hook actually observed in KV writes and is the
 more direct signal for digest-count debugging. It can include profile/warmup
 events if vLLM emits KV writes before the user request.
 ```
+
+Profile-run isolation follow-up:
+
+```text
+scripts/mpr_baseline_qwen3_8b.py added --defer-mpr-enable.
+
+When VLLM_MPR_ENABLE is truthy and --defer-mpr-enable is passed, the script:
+  1. saves the original VLLM_MPR_ENABLE value
+  2. sets VLLM_MPR_ENABLE=0 before LLM(...)
+  3. lets vLLM run initialization/profile/warmup without MPR observation
+  4. restores the original VLLM_MPR_ENABLE value before llm.generate(...)
+
+The script now prints:
+  mpr_defer_enable
+  mpr_enable_during_init
+  mpr_enable_during_generate
+
+This is a smoke-test isolation mechanism only. It avoids initial profile/dummy
+KV writes polluting Step 1.3 JSONL. It does not yet add a general in-engine
+profile/dummy-run filter to the MPR hook.
+```
 ```
 
 ## Next Step
@@ -561,6 +582,7 @@ VLLM_MPR_MAX_LAYERS=10 \
 VLLM_MPR_MAX_STEPS=20 \
 VLLM_MPR_DUMP_EVERY=1 \
 python scripts/mpr_baseline_qwen3_8b.py \
+  --defer-mpr-enable \
   --prompt "Say hello." \
   --max-tokens 8
 ```
