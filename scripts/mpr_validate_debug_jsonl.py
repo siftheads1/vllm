@@ -252,6 +252,14 @@ def print_summary(
     digest_counts_by_layer = Counter(
         event.get("layer_name") for event in digest_events
     )
+    observed_valid_slots_by_layer: defaultdict[str, int] = defaultdict(int)
+    block_sizes_by_layer: defaultdict[str, set[int]] = defaultdict(set)
+    for event in observe_events:
+        layer_name = event.get("layer_name")
+        if not isinstance(layer_name, str):
+            continue
+        observed_valid_slots_by_layer[layer_name] += event["num_valid_slots"]
+        block_sizes_by_layer[layer_name].add(event["block_size"])
 
     print("MPR debug JSONL validation passed")
     print(f"files: {len(paths)}")
@@ -264,6 +272,32 @@ def print_summary(
         print("\ndigest count by layer:")
         for layer_name, count in digest_counts_by_layer.most_common():
             print(f"  {count:4d}  {layer_name}")
+
+    if observed_valid_slots_by_layer:
+        print("\nobserved KV write slots by layer:")
+        print(
+            "  valid_slots  block_size  lower_bound_full_blocks  "
+            "digests  layer_name"
+        )
+        for layer_name, valid_slots in sorted(
+            observed_valid_slots_by_layer.items()
+        ):
+            block_sizes = block_sizes_by_layer[layer_name]
+            if len(block_sizes) == 1:
+                block_size = next(iter(block_sizes))
+                lower_bound_full_blocks = valid_slots // block_size
+                block_size_text = str(block_size)
+                full_blocks_text = str(lower_bound_full_blocks)
+            else:
+                block_size_text = str(sorted(block_sizes))
+                full_blocks_text = "n/a"
+            print(
+                f"  {valid_slots:11d}  "
+                f"{block_size_text:10s}  "
+                f"{full_blocks_text:23s}  "
+                f"{digest_counts_by_layer.get(layer_name, 0):7d}  "
+                f"{layer_name}"
+            )
 
     if show > 0 and digest_events:
         print("\nfirst digest_created events:")

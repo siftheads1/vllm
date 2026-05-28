@@ -520,6 +520,27 @@ The validator checks:
 
 Added tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py for
 matching and unmatched digest event cases.
+
+Token-count follow-up:
+
+```text
+scripts/mpr_baseline_qwen3_8b.py now prints:
+  prompt_token_count
+  generated_token_count
+  total_token_count
+
+scripts/mpr_validate_debug_jsonl.py now prints per-layer observed KV write
+slot totals:
+  valid_slots
+  block_size
+  lower_bound_full_blocks = valid_slots // block_size
+  digests
+
+The baseline total is the user request's prompt+generated token count. The
+validator total is what the MPR hook actually observed in KV writes and is the
+more direct signal for digest-count debugging. It can include profile/warmup
+events if vLLM emits KV writes before the user request.
+```
 ```
 
 ## Next Step

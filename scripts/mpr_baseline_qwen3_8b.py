@@ -65,9 +65,20 @@ def main() -> None:
 
     outputs = llm.generate([args.prompt], sampling_params)
     for output in outputs:
+        prompt_token_count = (
+            len(output.prompt_token_ids)
+            if output.prompt_token_ids is not None
+            else 0
+        )
+        generated_token_count = len(output.outputs[0].token_ids)
+        total_token_count = prompt_token_count + generated_token_count
+
         print("prompt:", output.prompt)
+        print("prompt_token_count:", prompt_token_count)
         print("generated_text:", output.outputs[0].text)
         print("generated_token_ids:", output.outputs[0].token_ids)
+        print("generated_token_count:", generated_token_count)
+        print("total_token_count:", total_token_count)
 
 
 if __name__ == "__main__":
