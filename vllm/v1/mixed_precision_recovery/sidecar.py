@@ -331,7 +331,7 @@ class RecoverySidecar:
             return
 
         scores = estimate_digest_scores(
-            window_query=window_query,
+            query_window=window_query,
             digest_min=digest_min,
             digest_max=digest_max,
             score_agg=self.config.score_agg,
