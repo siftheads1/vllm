@@ -668,3 +668,32 @@ Notes:
   counter, not a unique-slot count and not a final request token count. It is
   useful for detecting unexpected extra forwards, as above.
 ```
+
+CUDA graph capture isolation revalidation note:
+
+```text
+After the is_dummy_run=True capture-context fix, the target server still showed
+large num_valid_slots entries in the layer-0 histogram. Therefore, the 256/512
+events are not fully explained by the capture-time set_forward_context path
+patched above, or there is another warmup/capture/replay path that still lacks
+an MPR skip signal.
+
+Current decision:
+  Do not block Step 1.3 on this. The originally intended smoke checks are still
+  satisfied:
+    generation completed
+    no negative-slot assertion
+    no block_size/backend assertion
+    digest_created events exist
+    validator matching checks pass
+
+Open follow-up:
+  Before serving-style validation, revisit MPR observation boundaries and split
+  the debug counters into:
+    actual request KV writes
+    warmup/profile/capture/replay writes
+    unique physical slots observed per layer
+
+This matters for interpreting validator summary counters, but the current
+digest creation path still appears correct for the blocks it observes.
+```
