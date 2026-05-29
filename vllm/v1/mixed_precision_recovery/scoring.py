@@ -14,11 +14,14 @@ def estimate_digest_scores(
     digest_max: torch.Tensor,
     score_agg: str,
 ) -> torch.Tensor:
-    """Estimate one score per digest block from a decode query window.
+    """Estimate one layer-local score per digest block.
 
     This helper intentionally knows nothing about sidecar dictionaries, layer
     names, request ids, or block ownership. It is the replaceable Step 1.4
     scoring core; callers are responsible for packing query/digest inputs.
+    The returned scores are per physical KV block within one layer, not per-head
+    scores. Query-head scores are an intermediate value that is aggregated away
+    according to ``score_agg``.
 
     Args:
         query_window: Rolling decode query average, shaped
@@ -32,7 +35,7 @@ def estimate_digest_scores(
             default all-head averaging when it returns one group.
 
     Returns:
-        Scores shaped ``[num_blocks]``.
+        Layer-local block scores shaped ``[num_blocks]``.
     """
     if query_window.ndim != 2:
         raise ValueError(
@@ -85,10 +88,11 @@ def estimate_digest_scores(
     max_terms = query_terms * digest_max.unsqueeze(2)
     min_terms = query_terms * digest_min.unsqueeze(2)
 
-    # per_query_head_scores: [num_blocks, num_kv_heads, group_size].
+    # per_query_head_scores is an intermediate only:
+    # [num_blocks, num_kv_heads, group_size].
+    # The returned output is layer-local block scoring, not head-level scoring.
     per_query_head_scores = torch.maximum(max_terms, min_terms).sum(dim=-1)
     flattened_scores = per_query_head_scores.reshape(num_blocks, num_q_heads)
     if score_agg == "max":
         return flattened_scores.max(dim=1).values
     return flattened_scores.mean(dim=1)
-

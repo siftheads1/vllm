@@ -789,6 +789,11 @@ Scoring core:
     digest_max:   [num_blocks, num_kv_heads, head_dim]
   It maps query heads to KV heads for GQA/MQA, computes per-query-head cuboid
   scores, then aggregates query-head scores with VLLM_MPR_SCORE_AGG.
+  The Step 1.4 output is layer-local physical KV block scoring:
+    layer_name -> physical_block_id -> score
+  It is not head-level scoring. Head/group scores are intermediate values only.
+  Future recall policies may need head/group-aware decisions, but this v0 debug
+  artifact intentionally records a single score per block per layer.
 
 Debug:
   score_estimated JSONL records:
