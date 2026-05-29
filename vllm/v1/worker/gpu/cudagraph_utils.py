@@ -369,6 +369,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                     num_tokens_across_dp=num_tokens_across_dp,
                     slot_mapping=slot_mappings,
                     batch_descriptor=batch_descriptor,
+                    is_dummy_run=True,
                 ):
                     model_output = model(**model_inputs)
 

@@ -635,3 +635,36 @@ unique_block_ids is non-empty for decode writes
 0 <= min_block_offset <= max_block_offset < block_size
 no invalid negative-slot assertion
 ```
+
+CUDA graph capture isolation follow-up:
+
+```text
+Target smoke validation showed this layer-0 num_valid_slots histogram:
+  [(1, 31), (34, 1), (256, 1), (512, 1)]
+
+Interpretation:
+  34      likely the actual prompt prefill KV write
+  1 x 31  likely actual decode KV writes
+  256/512 likely CUDA graph capture or warmup-style forwards
+
+The previous dummy/profile isolation only covered GPUModelRunner.execute_model
+paths where dummy_run=True is passed into set_forward_context(...). CUDA graph
+capture uses prepare_dummy_inputs(...) and prepare_inputs_to_capture(...), but
+its capture-time forward context did not mark is_dummy_run=True. As a result,
+MPR could observe capture-time dummy KV writes as if they belonged to the real
+request.
+
+Fix:
+  vllm/v1/worker/gpu/cudagraph_utils.py now passes is_dummy_run=True to
+  set_forward_context(...) inside CudagraphModelRunner.capture().
+
+Expected revalidation signal:
+  The 256/512 entries should disappear from the per-layer num_valid_slots
+  histogram. For the same smoke run, layer 0 should be close to:
+    [(1, 31), (34, 1)]
+
+Notes:
+  valid_slots in the validator summary is still an observed KV-write volume
+  counter, not a unique-slot count and not a final request token count. It is
+  useful for detecting unexpected extra forwards, as above.
+```
