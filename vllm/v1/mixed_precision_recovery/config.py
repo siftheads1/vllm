@@ -36,6 +36,15 @@ def _parse_optional_limit(name: str) -> int | None:
     return None if value < 0 else value
 
 
+def _parse_choice(name: str, default: str, choices: set[str]) -> str:
+    raw = os.getenv(name)
+    value = default if raw is None else raw.strip().lower()
+    if value not in choices:
+        choices_text = ", ".join(sorted(choices))
+        raise ValueError(f"{name} must be one of {choices_text}, got {raw!r}.")
+    return value
+
+
 @dataclass(frozen=True)
 class MPRConfig:
     """Configuration for the score-only MPR sidecar.
@@ -51,6 +60,7 @@ class MPRConfig:
     max_steps: int | None = None
     dump_every: int = 1
     window_size: int = 64
+    score_agg: str = "max"
 
     @classmethod
     def from_env(cls) -> "MPRConfig":
@@ -62,4 +72,9 @@ class MPRConfig:
             max_steps=_parse_optional_limit("VLLM_MPR_MAX_STEPS"),
             dump_every=_parse_int("VLLM_MPR_DUMP_EVERY", 1, 1),
             window_size=_parse_int("VLLM_MPR_WINDOW_SIZE", 64, 1),
+            score_agg=_parse_choice(
+                "VLLM_MPR_SCORE_AGG",
+                "max",
+                {"max", "mean"},
+            ),
         )

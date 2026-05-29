@@ -31,6 +31,12 @@ def parse_args() -> argparse.Namespace:
         help="Minimum number of digest_created events required.",
     )
     parser.add_argument(
+        "--min-score-events",
+        type=int,
+        default=0,
+        help="Minimum number of score_estimated events required.",
+    )
+    parser.add_argument(
         "--allow-unmatched-digest-events",
         action="store_true",
         help=(
@@ -181,6 +187,66 @@ def validate_digest_event(event: dict[str, Any]) -> None:
         )
 
 
+def validate_score_event(event: dict[str, Any]) -> None:
+    """Validate one score_estimated event's score metadata."""
+    window_query_len = require_int(event, "window_query_len", minimum=1)
+    num_digest_blocks = require_int(event, "num_digest_blocks", minimum=1)
+    score_count = require_int(event, "score_count", minimum=1)
+    topk = require_int(event, "topk", minimum=0)
+
+    if score_count != num_digest_blocks:
+        raise AssertionError(
+            f"{event['_source']}: score_count={score_count} must match "
+            f"num_digest_blocks={num_digest_blocks}."
+        )
+    if topk > score_count:
+        raise AssertionError(
+            f"{event['_source']}: topk={topk} exceeds score_count={score_count}."
+        )
+
+    score_agg = event.get("score_agg")
+    if score_agg not in ("max", "mean"):
+        raise AssertionError(
+            f"{event['_source']}: score_agg must be 'max' or 'mean'."
+        )
+
+    window_query_shape = event.get("window_query_shape")
+    if (
+        not isinstance(window_query_shape, list)
+        or len(window_query_shape) != 2
+        or not all(isinstance(dim, int) and dim > 0 for dim in window_query_shape)
+    ):
+        raise AssertionError(
+            f"{event['_source']}: window_query_shape must be "
+            "[num_q_heads, head_dim]."
+        )
+
+    topk_block_ids = event.get("topk_block_ids")
+    topk_scores = event.get("topk_scores")
+    if not isinstance(topk_block_ids, list) or len(topk_block_ids) != topk:
+        raise AssertionError(
+            f"{event['_source']}: topk_block_ids must have length {topk}."
+        )
+    if not all(isinstance(block_id, int) and block_id >= 0
+               for block_id in topk_block_ids):
+        raise AssertionError(
+            f"{event['_source']}: topk_block_ids must contain non-negative ints."
+        )
+    if not isinstance(topk_scores, list) or len(topk_scores) != topk:
+        raise AssertionError(
+            f"{event['_source']}: topk_scores must have length {topk}."
+        )
+    if not all(isinstance(score, (int, float)) for score in topk_scores):
+        raise AssertionError(
+            f"{event['_source']}: topk_scores must contain numeric values."
+        )
+    if window_query_len > 0 and topk == 0:
+        raise AssertionError(
+            f"{event['_source']}: score event with digest blocks should have "
+            "topk > 0."
+        )
+
+
 def validate_digest_observe_matches(
     digest_events: list[dict[str, Any]],
     observe_events: list[dict[str, Any]],
@@ -246,6 +312,7 @@ def print_summary(
     events: list[dict[str, Any]],
     digest_events: list[dict[str, Any]],
     observe_events: list[dict[str, Any]],
+    score_events: list[dict[str, Any]],
     show: int,
 ) -> None:
     """Print a compact validation summary."""
@@ -266,6 +333,7 @@ def print_summary(
     print(f"events: {len(events)}")
     print(f"observe_kv_write: {len(observe_events)}")
     print(f"digest_created: {len(digest_events)}")
+    print(f"score_estimated: {len(score_events)}")
     print(f"digest_layers: {len(digest_counts_by_layer)}")
 
     if digest_counts_by_layer:
@@ -315,6 +383,14 @@ def print_summary(
                 f"{event['layer_name']}"
             )
 
+    if score_events:
+        score_counts_by_layer = Counter(
+            event.get("layer_name") for event in score_events
+        )
+        print("\nscore count by layer:")
+        for layer_name, count in score_counts_by_layer.most_common():
+            print(f"  {count:4d}  {layer_name}")
+
 
 def main() -> None:
     """Run JSONL validation and print a compact summary."""
@@ -333,16 +409,26 @@ def main() -> None:
     digest_events = [
         event for event in events if event.get("event") == "digest_created"
     ]
+    score_events = [
+        event for event in events if event.get("event") == "score_estimated"
+    ]
 
     for event in observe_events:
         validate_observe_event(event)
     for event in digest_events:
         validate_digest_event(event)
+    for event in score_events:
+        validate_score_event(event)
 
     if len(digest_events) < args.min_digest_events:
         raise AssertionError(
             f"Expected at least {args.min_digest_events} digest_created events, "
             f"found {len(digest_events)}."
+        )
+    if len(score_events) < args.min_score_events:
+        raise AssertionError(
+            f"Expected at least {args.min_score_events} score_estimated events, "
+            f"found {len(score_events)}."
         )
 
     validate_digest_observe_matches(
@@ -350,7 +436,14 @@ def main() -> None:
         observe_events,
         allow_unmatched=args.allow_unmatched_digest_events,
     )
-    print_summary(paths, events, digest_events, observe_events, args.show)
+    print_summary(
+        paths,
+        events,
+        digest_events,
+        observe_events,
+        score_events,
+        args.show,
+    )
 
 
 if __name__ == "__main__":

@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import threading
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Any
+
+import torch
 
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -18,6 +20,7 @@ from vllm.v1.mixed_precision_recovery.digest import (
     KeyBlockDigest,
     summarize_key_block,
 )
+from vllm.v1.mixed_precision_recovery.scoring import estimate_digest_scores
 
 logger = init_logger(__name__)
 
@@ -58,8 +61,13 @@ class RecoverySidecar:
     # Debug-only layer bookkeeping for VLLM_MPR_MAX_LAYERS dump limiting.
     _layer_indices: dict[str, int] = field(default_factory=dict)
     _kv_write_counts: Counter[str] = field(default_factory=Counter)
+    _score_counts: Counter[str] = field(default_factory=Counter)
     _block_offsets: dict[str, dict[int, set[int]]] = field(default_factory=dict)
     _digest_cache: dict[str, dict[int, BlockDigest]] = field(default_factory=dict)
+    # Step 1.4 v0 uses layer_name-only query windows for single-request smoke.
+    # Serving/multi-request support needs request-scoped keys to avoid mixing
+    # decode queries from different requests in the same layer buffer.
+    _query_windows: dict[str, deque[torch.Tensor]] = field(default_factory=dict)
     _debug_writer: MPRDebugWriter = field(init=False)
 
     def __post_init__(self) -> None:
@@ -68,9 +76,10 @@ class RecoverySidecar:
         if self.config.enabled:
             logger.info(
                 "MPR sidecar enabled: topk=%d, window_size=%d, "
-                "debug_dir=%s",
+                "score_agg=%s, debug_dir=%s",
                 self.config.topk,
                 self.config.window_size,
+                self.config.score_agg,
                 self.config.debug_dir,
             )
             self._record("init")
@@ -203,43 +212,189 @@ class RecoverySidecar:
         query: Any = None,
         attn_metadata: Any = None,
     ) -> None:
-        """Observe an attention query tensor.
+        """Observe a decode query and emit score-only digest estimates.
 
-        Step 1.3 does not score queries yet, so this method only records a
-        debug event when enabled.
+        Step 1.4 v0 is intentionally limited to single-request decode batches.
+        Query windows are keyed only by ``layer_name``; multi-request serving
+        would mix requests and requires request-scoped query windows plus block
+        ownership tracking.
         """
         if not self.config.enabled:
             return
-        self._record("observe_query", layer_name=layer_name)
-
-    def estimate_scores(
-        self,
-        layer_name: str,
-        window_query: Any = None,
-        attn_metadata: Any = None,
-        block_size: int | None = None,
-    ) -> None:
-        """Placeholder for future digest/query scoring.
-
-        Args:
-            layer_name: vLLM attention layer name.
-            window_query: Future query window summary. The planned shape is a
-                query tensor or query summary over up to
-                ``VLLM_MPR_WINDOW_SIZE`` decode tokens.
-            attn_metadata: vLLM attention metadata for the current layer.
-            block_size: Number of token slots per physical KV block.
-
-        Returns:
-            ``None`` until Step 1.4 scoring is implemented.
-        """
-        if not self.config.enabled:
-            return None
-        self._record(
-            "estimate_scores",
-            layer_name=layer_name,
-            block_size=block_size,
+        should_record, layer_event_idx = self._should_record_layer_event(
+            layer_name,
+            self._score_counts,
         )
-        return None
+        if query is None:
+            self._record_score_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "missing_query",
+                query=query,
+                attn_metadata=attn_metadata,
+            )
+            return
+        if attn_metadata is None:
+            self._record_score_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "missing_attn_metadata",
+                query=query,
+                attn_metadata=attn_metadata,
+            )
+            return
+
+        max_query_len = getattr(attn_metadata, "max_query_len", None)
+        if max_query_len != 1:
+            self._record_score_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "non_decode_query",
+                query=query,
+                attn_metadata=attn_metadata,
+            )
+            return
+
+        num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", None)
+        # In a max_query_len == 1 decode batch, num_actual_tokens equals the
+        # number of active requests. Step 1.4 v0 uses a layer_name-only rolling
+        # query window, so multi-request batches would mix request A/B queries
+        # and produce scores that cannot be attributed to either request's block
+        # table. Serving support needs request-scoped query windows and
+        # request/block ownership tracking.
+        if num_actual_tokens != 1:
+            raise AssertionError(
+                "MPR Step 1.4 score-only prototype supports only "
+                "single-request decode batches. Multi-request/serving requires "
+                "request-scoped query windows and request/block ownership "
+                f"tracking; got max_query_len={max_query_len}, "
+                f"num_actual_tokens={num_actual_tokens}."
+            )
+        if query.ndim != 3:
+            raise ValueError(
+                "MPR Step 1.4 expects query shaped "
+                f"[num_tokens, num_q_heads, head_dim], got {tuple(query.shape)} "
+                f"for {layer_name}."
+            )
+        if int(query.shape[0]) < 1:
+            self._record_score_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "empty_query",
+                query=query,
+                attn_metadata=attn_metadata,
+            )
+            return
+
+        # query_for_window: current decode query for the single active request.
+        # Shape: [num_q_heads, head_dim].
+        query_for_window = query[0].detach().clone()
+        if not torch.is_floating_point(query_for_window):
+            self._record_score_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "non_floating_query",
+                query=query,
+                attn_metadata=attn_metadata,
+            )
+            return
+        window = self._query_windows.setdefault(
+            layer_name,
+            deque(maxlen=self.config.window_size),
+        )
+        window.append(query_for_window)
+        # window_query: average of the observed decode queries so far, up to
+        # VLLM_MPR_WINDOW_SIZE. Shape: [num_q_heads, head_dim].
+        window_query = torch.stack(tuple(window), dim=0).mean(dim=0)
+
+        physical_block_ids, digest_min, digest_max = self._pack_layer_digests(
+            layer_name,
+            device=window_query.device,
+            dtype=window_query.dtype,
+        )
+        if not physical_block_ids:
+            self._record_score_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "no_digest_blocks",
+                query=query,
+                attn_metadata=attn_metadata,
+                window_query=window_query,
+                window_query_len=len(window),
+            )
+            return
+
+        scores = estimate_digest_scores(
+            window_query=window_query,
+            digest_min=digest_min,
+            digest_max=digest_max,
+            score_agg=self.config.score_agg,
+        )
+        topk = min(self.config.topk, int(scores.numel()))
+        if topk > 0:
+            topk_scores, topk_indices = torch.topk(scores, k=topk)
+            topk_index_values = topk_indices.detach().cpu().tolist()
+            topk_block_ids = [
+                physical_block_ids[int(index)] for index in topk_index_values
+            ]
+            topk_score_values = [
+                float(score)
+                for score in topk_scores.detach().to(torch.float32).cpu().tolist()
+            ]
+        else:
+            topk_block_ids = []
+            topk_score_values = []
+
+        if should_record:
+            self._record(
+                "score_estimated",
+                layer_name=layer_name,
+                layer_event_idx=layer_event_idx,
+                query_shape=self._shape_of(query),
+                window_query_shape=self._shape_of(window_query),
+                window_query_len=len(window),
+                num_digest_blocks=len(physical_block_ids),
+                score_count=int(scores.numel()),
+                score_agg=self.config.score_agg,
+                topk=topk,
+                topk_block_ids=topk_block_ids,
+                topk_scores=topk_score_values,
+            )
+
+    def _record_score_skip(
+        self,
+        should_record: bool,
+        layer_name: str,
+        layer_event_idx: int | None,
+        reason: str,
+        *,
+        query: Any = None,
+        attn_metadata: Any = None,
+        window_query: Any = None,
+        window_query_len: int | None = None,
+    ) -> None:
+        """Record a skipped score event when debug limits allow it."""
+        if not should_record:
+            return
+        self._record(
+            "score_skipped",
+            layer_name=layer_name,
+            layer_event_idx=layer_event_idx,
+            skipped_reason=reason,
+            query_shape=self._shape_of(query),
+            max_query_len=getattr(attn_metadata, "max_query_len", None),
+            num_actual_tokens=getattr(attn_metadata, "num_actual_tokens", None),
+            window_query_shape=self._shape_of(window_query),
+            window_query_len=window_query_len,
+            num_digest_blocks=len(self._digest_cache.get(layer_name, {})),
+            score_agg=self.config.score_agg,
+        )
 
     def snapshot_stats(self) -> dict[str, int]:
         """Return a copy of sidecar event counters for smoke tests."""
@@ -398,6 +553,46 @@ class RecoverySidecar:
                     )
 
         return created_block_ids
+
+    def _pack_layer_digests(
+        self,
+        layer_name: str,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[list[int], torch.Tensor, torch.Tensor]:
+        """Pack cached layer digests into tensor inputs for scoring.
+
+        Args:
+            layer_name: vLLM attention layer name.
+            device: Target device for the packed digest tensors.
+            dtype: Target dtype for the packed digest tensors.
+
+        Returns:
+            A tuple ``(physical_block_ids, digest_min, digest_max)`` where the
+            digest tensors are shaped ``[num_blocks, num_kv_heads, head_dim]``.
+        """
+        layer_digests = self._digest_cache.get(layer_name, {})
+        if not layer_digests:
+            empty = torch.empty(0, device=device, dtype=dtype)
+            return [], empty, empty
+
+        physical_block_ids = sorted(layer_digests)
+        digest_min = torch.stack(
+            [
+                layer_digests[block_id].digest_min.to(device=device, dtype=dtype)
+                for block_id in physical_block_ids
+            ],
+            dim=0,
+        )
+        digest_max = torch.stack(
+            [
+                layer_digests[block_id].digest_max.to(device=device, dtype=dtype)
+                for block_id in physical_block_ids
+            ],
+            dim=0,
+        )
+        return physical_block_ids, digest_min, digest_max
 
     @staticmethod
     def _to_block_digest(

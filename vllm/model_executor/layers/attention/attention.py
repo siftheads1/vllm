@@ -733,6 +733,26 @@ def _maybe_observe_mpr_kv_write(
     )
 
 
+def _maybe_observe_mpr_query(
+    layer_name: str,
+    query: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+) -> None:
+    if not envs.VLLM_MPR_ENABLE:
+        return
+    forward_context: ForwardContext = get_forward_context()
+    if forward_context.is_dummy_run:
+        return
+
+    from vllm.v1.mixed_precision_recovery import get_mpr_sidecar
+
+    get_mpr_sidecar().observe_query(
+        layer_name=layer_name,
+        query=query,
+        attn_metadata=attn_metadata,
+    )
+
+
 def unified_kv_cache_update(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -800,6 +820,7 @@ def unified_attention_with_output(
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+    _maybe_observe_mpr_query(layer_name, query, attn_metadata)
 
     self.impl.forward(
         self,

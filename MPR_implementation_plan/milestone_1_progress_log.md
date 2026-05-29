@@ -749,3 +749,64 @@ Query window and score aggregation:
   Proposed implementation config:
     VLLM_MPR_SCORE_AGG=max|mean, default max
 ```
+
+### Step 1.4 Query-Time Score Hook Implementation
+
+Implemented Step 1.4 score-only path:
+
+```text
+Config:
+  Added VLLM_MPR_SCORE_AGG=max|mean, default max.
+  max preserves the strongest query-head score for accuracy-first inspection.
+  mean is available for ArkVale-style all-head average comparison.
+
+Hook:
+  unified_attention_with_output(...) now calls _maybe_observe_mpr_query(...)
+  after get_attention_context(...) and before self.impl.forward(...).
+  The hook skips MPR disabled and ForwardContext.is_dummy_run paths.
+
+Decode-only scope:
+  sidecar.observe_query(...) scores only max_query_len == 1.
+  max_query_len != 1 records score_skipped(reason=non_decode_query).
+  In max_query_len == 1, num_actual_tokens is treated as active request count.
+  num_actual_tokens != 1 raises AssertionError with an explicit message:
+    Step 1.4 v0 is single-request only.
+    Multi-request/serving needs request-scoped query windows and block ownership.
+
+Query window:
+  _query_windows uses dict[layer_name] -> deque[Tensor] as v0 bookkeeping.
+  The stored query shape is [num_q_heads, head_dim].
+  window_query is mean(last min(num_seen, VLLM_MPR_WINDOW_SIZE) decode queries).
+  This dict/deque structure is not part of the future kernel-facing API.
+
+Scoring core:
+  Added vllm/v1/mixed_precision_recovery/scoring.py.
+  estimate_digest_scores(...) is tensor-only and does not know about sidecar
+  dicts, layer names, request ids, or block ownership.
+  Inputs:
+    query_window: [num_q_heads, head_dim]
+    digest_min:   [num_blocks, num_kv_heads, head_dim]
+    digest_max:   [num_blocks, num_kv_heads, head_dim]
+  It maps query heads to KV heads for GQA/MQA, computes per-query-head cuboid
+  scores, then aggregates query-head scores with VLLM_MPR_SCORE_AGG.
+
+Debug:
+  score_estimated JSONL records:
+    query_shape
+    window_query_shape
+    window_query_len
+    num_digest_blocks
+    score_count
+    score_agg
+    topk
+    topk_block_ids
+    topk_scores
+  score_skipped JSONL records skip reason and relevant shapes/counts.
+  scripts/mpr_validate_debug_jsonl.py now supports --min-score-events and
+  validates score_estimated invariants.
+
+Tests:
+  Added tests/v1/mixed_precision_recovery/test_scoring.py for manual formula
+  matching, max/mean aggregation, invalid head grouping, rolling query window,
+  and single-request fail-fast behavior.
+```
