@@ -259,20 +259,24 @@ class RecoverySidecar:
             return
 
         num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", None)
-        # In a max_query_len == 1 decode batch, num_actual_tokens equals the
-        # number of active requests. Step 1.4 v0 uses a layer_name-only rolling
-        # query window, so multi-request batches would mix request A/B queries
-        # and produce scores that cannot be attributed to either request's block
-        # table. Serving support needs request-scoped query windows and
-        # request/block ownership tracking.
+        # In a max_query_len == 1 decode-shaped batch, num_actual_tokens equals
+        # the number of active rows. Step 1.4 v0 uses a layer_name-only rolling
+        # query window, so multi-request batches would mix request A/B queries.
+        # vLLM startup can also emit synthetic warmup/capture batches with
+        # shapes like max_query_len=1, num_actual_tokens=256, so this must be a
+        # skip for smoke validation rather than an engine-failing assertion.
+        # Serving support still needs request-scoped query windows and
+        # request/block ownership tracking before scoring non-single rows.
         if num_actual_tokens != 1:
-            raise AssertionError(
-                "MPR Step 1.4 score-only prototype supports only "
-                "single-request decode batches. Multi-request/serving requires "
-                "request-scoped query windows and request/block ownership "
-                f"tracking; got max_query_len={max_query_len}, "
-                f"num_actual_tokens={num_actual_tokens}."
+            self._record_score_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "non_single_request_decode",
+                query=query,
+                attn_metadata=attn_metadata,
             )
+            return
         if query.ndim != 3:
             raise ValueError(
                 "MPR Step 1.4 expects query shaped "

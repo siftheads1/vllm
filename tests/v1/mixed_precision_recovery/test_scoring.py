@@ -109,14 +109,15 @@ def test_sidecar_query_window_uses_available_then_recent_queries():
     assert sidecar.counters["score_estimated"] == 3
 
 
-def test_sidecar_query_scoring_is_single_request_only():
+def test_sidecar_query_scoring_skips_non_single_request_decode():
     sidecar = RecoverySidecar(config=MPRConfig(enabled=True))
     metadata = SimpleNamespace(max_query_len=1, num_actual_tokens=2)
 
-    with pytest.raises(AssertionError, match="single-request"):
-        sidecar.observe_query(
-            "model.layers.0.self_attn.attn",
-            torch.ones(2, 1, 2),
-            metadata,
-        )
+    sidecar.observe_query(
+        "model.layers.0.self_attn.attn",
+        torch.ones(2, 1, 2),
+        metadata,
+    )
 
+    assert sidecar.counters["score_skipped"] == 1
+    assert "model.layers.0.self_attn.attn" not in sidecar._query_windows

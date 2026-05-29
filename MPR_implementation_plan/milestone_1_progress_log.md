@@ -769,9 +769,13 @@ Decode-only scope:
   sidecar.observe_query(...) scores only max_query_len == 1.
   max_query_len != 1 records score_skipped(reason=non_decode_query).
   In max_query_len == 1, num_actual_tokens is treated as active request count.
-  num_actual_tokens != 1 raises AssertionError with an explicit message:
-    Step 1.4 v0 is single-request only.
-    Multi-request/serving needs request-scoped query windows and block ownership.
+  num_actual_tokens != 1 records
+  score_skipped(reason=non_single_request_decode). This avoids failing engine
+  startup when vLLM emits synthetic warmup/capture batches such as
+  max_query_len=1, num_actual_tokens=256.
+  Step 1.4 v0 is still single-request scoring only; multi-request/serving needs
+  request-scoped query windows and block ownership before scoring non-single
+  rows.
 
 Query window:
   _query_windows uses dict[layer_name] -> deque[Tensor] as v0 bookkeeping.
@@ -813,5 +817,27 @@ Debug:
 Tests:
   Added tests/v1/mixed_precision_recovery/test_scoring.py for manual formula
   matching, max/mean aggregation, invalid head grouping, rolling query window,
-  and single-request fail-fast behavior.
+  and non-single decode skip behavior.
+```
+
+Step 1.4 startup warmup fix:
+
+```text
+Target smoke with longer decode failed during EngineCore initialization:
+  max_query_len=1, num_actual_tokens=256
+
+This is decode-shaped but not the real single-request generation path. It is
+likely a vLLM startup warmup/capture/profile path that is not fully covered by
+ForwardContext.is_dummy_run. The original fail-fast assertion for
+num_actual_tokens != 1 was too broad because it also killed these synthetic
+startup batches.
+
+Fix:
+  Keep Step 1.4 scoring single-request only, but skip non-single decode-shaped
+  rows with score_skipped(reason=non_single_request_decode) instead of raising.
+
+Serving implication:
+  This does not implement multi-request scoring. It only keeps smoke validation
+  alive in the presence of startup batches. Real serving support still needs
+  request-scoped query windows and request/block ownership tracking.
 ```
