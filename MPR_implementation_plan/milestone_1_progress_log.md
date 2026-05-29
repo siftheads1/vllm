@@ -873,3 +873,69 @@ Strict digest/observe alignment:
 Conclusion:
   Step 1.4 is complete for the current single-request score-only smoke scope.
 ```
+
+### Step 1.5 Debug Output and Inspection Implementation
+
+Implemented Step 1.5 debug metadata for score inspection:
+
+```text
+score_estimated now records request/block context in addition to score values:
+  num_reqs
+  max_query_len
+  num_actual_tokens
+  seq_lens
+  block_size
+  block_table_shape
+  block_table_row
+  valid_block_ids
+  finalized_block_ids
+  observed_digest_block_ids
+  missing_digest_blocks
+  extra_digest_blocks
+
+Definitions:
+  block_table_row is the first request row from FlashAttention metadata.
+  valid_block_ids are block_table entries covering ceil(seq_len / block_size).
+  finalized_block_ids are block_table entries covering floor(seq_len / block_size).
+  observed_digest_block_ids are the cached physical block IDs packed and scored
+  for the current layer.
+  missing_digest_blocks are finalized request blocks without a cached digest.
+  extra_digest_blocks are cached/scored digest blocks outside the current
+  request's valid block-table range.
+
+Important scope note:
+  Step 1.4/1.5 still scores every cached digest for the layer. The new
+  missing/extra fields are debug diagnostics that expose stale/warmup/reuse
+  effects; they do not yet filter scoring to request-owned blocks. Serving
+  support still needs request/block ownership tracking before this should be
+  treated as a production recall policy.
+```
+
+Validator updates:
+
+```text
+scripts/mpr_validate_debug_jsonl.py now validates:
+  score_count == num_digest_blocks
+  observed_digest_block_ids length == score_count
+  topk_block_ids subset of observed_digest_block_ids
+  block/debug list fields contain non-negative ints
+
+The validator summary also prints score events with missing finalized digest
+blocks or extra cached digest blocks when those diagnostics are non-empty.
+```
+
+Tests added:
+
+```text
+tests/v1/mixed_precision_recovery/test_scoring.py:
+  verifies seq_lens/block_table -> valid/finalized/missing/extra debug fields.
+
+tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py:
+  verifies the expanded score event schema and rejects top-k blocks that were
+  not part of the scored digest block list.
+
+Local verification:
+  python -m py_compile passed for sidecar, validator, and updated tests.
+  Local Windows Python did not have pytest installed, so pytest should be run
+  in the target vLLM server environment.
+```

@@ -355,6 +355,16 @@ class RecoverySidecar:
             topk_block_ids = []
             topk_score_values = []
 
+        block_size = self._block_size_for_layer_blocks(
+            layer_name,
+            physical_block_ids,
+        )
+        score_block_debug = self._score_block_debug_fields(
+            attn_metadata=attn_metadata,
+            block_size=block_size,
+            observed_digest_block_ids=physical_block_ids,
+        )
+
         if should_record:
             self._record(
                 "score_estimated",
@@ -369,6 +379,7 @@ class RecoverySidecar:
                 topk=topk,
                 topk_block_ids=topk_block_ids,
                 topk_scores=topk_score_values,
+                **score_block_debug,
             )
 
     def _record_score_skip(
@@ -399,6 +410,101 @@ class RecoverySidecar:
             num_digest_blocks=len(self._digest_cache.get(layer_name, {})),
             score_agg=self.config.score_agg,
         )
+
+    def _score_block_debug_fields(
+        self,
+        *,
+        attn_metadata: Any,
+        block_size: int | None,
+        observed_digest_block_ids: list[int],
+    ) -> dict[str, Any]:
+        """Build request/block metadata for score debug records.
+
+        Args:
+            attn_metadata: FlashAttention metadata for the current attention
+                call. Step 1.5 reads ``seq_lens`` and ``block_table`` only for
+                debug inspection.
+            block_size: vLLM physical KV block size, or ``None`` if no layer
+                digest exposes it yet.
+            observed_digest_block_ids: Physical block IDs that were packed and
+                scored for this layer. Shape-equivalent: ``[num_digest_blocks]``.
+
+        Returns:
+            JSON-serializable fields describing the single request's block table
+            row, the finalized blocks that should have digests, and any missing
+            or extra digest block IDs. Missing/extra fields are diagnostics only;
+            Step 1.4 scoring still scores every cached layer digest.
+        """
+        seq_lens = self._tensor_to_int_list(getattr(attn_metadata, "seq_lens", None))
+        block_table = getattr(attn_metadata, "block_table", None)
+        if block_table is None:
+            block_table = getattr(attn_metadata, "block_table_tensor", None)
+        block_table_shape = self._shape_of(block_table)
+        block_table_row: list[int] = []
+        if block_table is not None and getattr(block_table, "ndim", 0) >= 2:
+            row_values = self._tensor_to_int_list(block_table[0])
+            block_table_row = [] if row_values is None else row_values
+        elif block_table is not None:
+            row_values = self._tensor_to_int_list(block_table)
+            block_table_row = [] if row_values is None else row_values
+
+        inferred_num_reqs = len(seq_lens) if seq_lens is not None else None
+        num_reqs = getattr(attn_metadata, "num_reqs", None)
+        if num_reqs is None:
+            num_reqs = inferred_num_reqs
+
+        seq_len = seq_lens[0] if seq_lens else None
+        valid_block_ids: list[int] = []
+        finalized_block_ids: list[int] = []
+        has_block_table_context = (
+            block_size is not None
+            and seq_len is not None
+            and block_size > 0
+            and bool(block_table_row)
+        )
+        if has_block_table_context:
+            valid_block_count = (seq_len + block_size - 1) // block_size
+            finalized_block_count = seq_len // block_size
+            valid_block_ids = block_table_row[:valid_block_count]
+            finalized_block_ids = block_table_row[:finalized_block_count]
+
+        observed_set = set(observed_digest_block_ids)
+        valid_set = set(valid_block_ids)
+        finalized_set = set(finalized_block_ids)
+        missing_digest_blocks = (
+            sorted(finalized_set - observed_set) if has_block_table_context else []
+        )
+        extra_digest_blocks = (
+            sorted(observed_set - valid_set) if has_block_table_context else []
+        )
+
+        return {
+            "num_reqs": num_reqs,
+            "max_query_len": getattr(attn_metadata, "max_query_len", None),
+            "num_actual_tokens": getattr(attn_metadata, "num_actual_tokens", None),
+            "seq_lens": seq_lens,
+            "block_size": block_size,
+            "block_table_shape": block_table_shape,
+            "block_table_row": block_table_row,
+            "valid_block_ids": valid_block_ids,
+            "finalized_block_ids": finalized_block_ids,
+            "observed_digest_block_ids": list(observed_digest_block_ids),
+            "missing_digest_blocks": missing_digest_blocks,
+            "extra_digest_blocks": extra_digest_blocks,
+        }
+
+    def _block_size_for_layer_blocks(
+        self,
+        layer_name: str,
+        physical_block_ids: list[int],
+    ) -> int | None:
+        """Return the cached block size for scored layer blocks, if present."""
+        layer_digests = self._digest_cache.get(layer_name, {})
+        for block_id in physical_block_ids:
+            digest = layer_digests.get(block_id)
+            if digest is not None:
+                return int(digest.block_size)
+        return None
 
     def snapshot_stats(self) -> dict[str, int]:
         """Return a copy of sidecar event counters for smoke tests."""
@@ -625,6 +731,19 @@ class RecoverySidecar:
     def _num_digest_blocks(self) -> int:
         """Return the total number of cached block digests across layers."""
         return sum(len(layer_digests) for layer_digests in self._digest_cache.values())
+
+    @staticmethod
+    def _tensor_to_int_list(value: Any) -> list[int] | None:
+        """Convert a tensor-like value to a flat Python int list for JSONL."""
+        if value is None:
+            return None
+        if hasattr(value, "detach"):
+            value = value.detach().cpu()
+        if hasattr(value, "reshape") and hasattr(value, "tolist"):
+            return [int(item) for item in value.reshape(-1).tolist()]
+        if isinstance(value, (list, tuple)):
+            return [int(item) for item in value]
+        return None
 
     def _record(self, event: str, **fields: Any) -> None:
         """Increment an event counter and append one JSONL debug record."""

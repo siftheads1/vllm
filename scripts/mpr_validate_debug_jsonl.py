@@ -123,6 +123,27 @@ def require_shape(event: dict[str, Any], field: str) -> list[int]:
     ):
         raise AssertionError(
             f"{event['_source']}: {field} must be [num_kv_heads, head_dim]."
+    )
+    return value
+
+
+def require_int_list(
+    event: dict[str, Any],
+    field: str,
+    *,
+    minimum: int | None = None,
+) -> list[int]:
+    """Read an integer list field and optionally enforce a minimum value."""
+    value = event.get(field)
+    if not isinstance(value, list):
+        raise AssertionError(f"{event['_source']}: {field} must be a list.")
+    if not all(isinstance(item, int) for item in value):
+        raise AssertionError(
+            f"{event['_source']}: {field} must contain integer values."
+        )
+    if minimum is not None and any(item < minimum for item in value):
+        raise AssertionError(
+            f"{event['_source']}: {field} must contain values >= {minimum}."
         )
     return value
 
@@ -244,6 +265,47 @@ def validate_score_event(event: dict[str, Any]) -> None:
         raise AssertionError(
             f"{event['_source']}: score event with digest blocks should have "
             "topk > 0."
+        )
+
+    observed_digest_block_ids = event.get("observed_digest_block_ids")
+    if observed_digest_block_ids is not None:
+        observed_digest_block_ids = require_int_list(
+            event,
+            "observed_digest_block_ids",
+            minimum=0,
+        )
+        if len(observed_digest_block_ids) != score_count:
+            raise AssertionError(
+                f"{event['_source']}: observed_digest_block_ids length must "
+                f"match score_count={score_count}."
+            )
+        if not set(topk_block_ids).issubset(set(observed_digest_block_ids)):
+            raise AssertionError(
+                f"{event['_source']}: topk_block_ids must be a subset of "
+                "observed_digest_block_ids."
+            )
+
+    if event.get("block_table_row") is not None:
+        require_int_list(event, "block_table_row")
+
+    for field in (
+        "valid_block_ids",
+        "finalized_block_ids",
+        "missing_digest_blocks",
+        "extra_digest_blocks",
+    ):
+        if event.get(field) is not None:
+            require_int_list(event, field, minimum=0)
+
+    if event.get("seq_lens") is not None:
+        require_int_list(event, "seq_lens", minimum=0)
+
+    block_size = event.get("block_size")
+    if block_size is not None and (
+        not isinstance(block_size, int) or block_size <= 0
+    ):
+        raise AssertionError(
+            f"{event['_source']}: block_size must be a positive int when set."
         )
 
 
@@ -390,6 +452,33 @@ def print_summary(
         print("\nscore count by layer:")
         for layer_name, count in score_counts_by_layer.most_common():
             print(f"  {count:4d}  {layer_name}")
+
+        missing_digest_events = [
+            event for event in score_events if event.get("missing_digest_blocks")
+        ]
+        extra_digest_events = [
+            event for event in score_events if event.get("extra_digest_blocks")
+        ]
+        if missing_digest_events:
+            print(
+                "\nscore events with missing finalized digest blocks: "
+                f"{len(missing_digest_events)}"
+            )
+            for event in missing_digest_events[:show]:
+                print(
+                    f"  {event['_source']}  layer={event.get('layer_name')}  "
+                    f"missing={event.get('missing_digest_blocks')}"
+                )
+        if extra_digest_events:
+            print(
+                "\nscore events with extra cached digest blocks: "
+                f"{len(extra_digest_events)}"
+            )
+            for event in extra_digest_events[:show]:
+                print(
+                    f"  {event['_source']}  layer={event.get('layer_name')}  "
+                    f"extra={event.get('extra_digest_blocks')}"
+                )
 
 
 def main() -> None:

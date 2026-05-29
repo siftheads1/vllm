@@ -121,3 +121,28 @@ def test_sidecar_query_scoring_skips_non_single_request_decode():
 
     assert sidecar.counters["score_skipped"] == 1
     assert "model.layers.0.self_attn.attn" not in sidecar._query_windows
+
+
+def test_sidecar_score_debug_fields_describe_block_table_state():
+    sidecar = RecoverySidecar(config=MPRConfig(enabled=True))
+    metadata = SimpleNamespace(
+        max_query_len=1,
+        num_actual_tokens=1,
+        seq_lens=torch.tensor([33]),
+        block_table=torch.tensor([[10, 11, 12, 99]]),
+    )
+
+    fields = sidecar._score_block_debug_fields(
+        attn_metadata=metadata,
+        block_size=16,
+        observed_digest_block_ids=[10, 12, 20],
+    )
+
+    assert fields["num_reqs"] == 1
+    assert fields["seq_lens"] == [33]
+    assert fields["block_table_row"] == [10, 11, 12, 99]
+    assert fields["valid_block_ids"] == [10, 11, 12]
+    assert fields["finalized_block_ids"] == [10, 11]
+    assert fields["observed_digest_block_ids"] == [10, 12, 20]
+    assert fields["missing_digest_blocks"] == [11]
+    assert fields["extra_digest_blocks"] == [20]
