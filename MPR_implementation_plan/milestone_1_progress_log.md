@@ -697,3 +697,55 @@ Open follow-up:
 This matters for interpreting validator summary counters, but the current
 digest creation path still appears correct for the blocks it observes.
 ```
+
+### Step 1.4 Query-Time Score Hook Discussion
+
+Initial decisions before implementation:
+
+```text
+Hook location:
+  Use vllm/model_executor/layers/attention/attention.py:
+    unified_attention_with_output(...)
+  Place the MPR score-only observation after get_attention_context(...) and
+  before self.impl.forward(...), so query, attn_metadata, kv_cache, attn_layer,
+  and layer_name are all available while the attention output remains unchanged.
+
+Rolling query buffer identity:
+  Step 1.4 v0 will use layer_name as the rolling-buffer key.
+  This is intentionally single-request smoke scope only. Multi-batch and
+  serving scenarios need request identity / sequence ownership in the key;
+  otherwise decode queries from different requests can be mixed in one layer
+  buffer.
+
+ArkVale reference:
+  ArkVale's decode score path is q_len == 1:
+    adapter/modeling.py calls estimate_select_recall(cur_id, query_states)
+    only in the decode branch.
+  ArkVale's prefill eviction path uses query_states[:, -1:, ...], not the
+  whole prefill query sequence.
+  Therefore Step 1.4 should not treat full prefill query tensors as decode
+  scoring input. The v0 filter should score only max_query_len == 1 decode
+  batches and skip prefill/mixed/chunked cases.
+
+Top-k:
+  VLLM_MPR_TOPK is debug-output policy for compact inspection, not a fundamental
+  scoring requirement. The score vector is the primary artifact; top-k block ids
+  are only a convenient reduced view for smoke/debug.
+
+Query window and score aggregation:
+  If the number of generated decode tokens is smaller than VLLM_MPR_WINDOW_SIZE,
+  compute window_query from the queries observed so far:
+    window_query = mean(last min(num_seen, window_size) decode queries)
+  Record window_query_len in debug JSONL so early-step scores can be interpreted.
+
+  For GQA/MQA, Step 1.4 should follow ArkVale's order:
+    1. compute scores per query head against the corresponding KV-head digest
+    2. aggregate query-head scores within each group
+
+  The aggregation policy should be configurable:
+    max   preserve the strongest query-head signal; default for accuracy-first
+    mean  average query-head scores; useful for ArkVale-style comparison
+
+  Proposed implementation config:
+    VLLM_MPR_SCORE_AGG=max|mean, default max
+```
