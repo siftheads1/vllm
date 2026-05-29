@@ -441,6 +441,31 @@ future multi-request/prefix-cache/block-reuse support must invalidate or
 refresh digest state when vLLM reuses a physical block for different tokens
 ```
 
+Serving/lifecycle risk:
+
+```text
+The current sidecar keys digest state only by:
+  (layer_name, physical_block_id)
+
+This is sufficient for a single-request smoke run, but not sufficient for a
+long-lived serving engine. After a request finishes, vLLM can return its
+physical KV blocks to a free list and later assign the same physical_block_id
+to a different request. If the sidecar keeps the old entry:
+  _block_offsets[layer_name][physical_block_id]
+  _digest_cache[layer_name][physical_block_id]
+
+then the digest can describe the previous request's tokens while the KV cache
+block now contains another request's tokens. The current `block_id not in
+layer_digests` guard can also prevent the new request's digest from being
+recomputed.
+
+Before serving-style validation or long-lived engine experiments, revisit this
+design and add one of:
+  request/block ownership tracking with invalidation on block free/reuse
+  a physical-block generation/epoch in the sidecar key
+  integration with vLLM KV cache manager free/reuse events
+```
+
 Debug JSONL additions:
 
 ```text
