@@ -841,3 +841,35 @@ Serving implication:
   alive in the presence of startup batches. Real serving support still needs
   request-scoped query windows and request/block ownership tracking.
 ```
+
+Step 1.4 validation result:
+
+```text
+Unit tests:
+  tests/v1/mixed_precision_recovery/test_scoring.py
+  tests/v1/mixed_precision_recovery/test_digest.py
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py
+  passed on the target server. Only dependency deprecation warnings were seen.
+
+Long decode smoke:
+  A 512-token decode smoke was run with:
+    VLLM_MPR_ENABLE=1
+    VLLM_MPR_WINDOW_SIZE=64
+    VLLM_MPR_TOPK=8
+    VLLM_MPR_SCORE_AGG=max
+  The JSONL validator passed with --min-score-events and
+  --allow-unmatched-digest-events for the long run.
+
+Manual long-run checks:
+  window_query_len reached and capped at 64.
+  score_count matched num_digest_blocks.
+  digest/score count progression looked normal.
+  top-k block ids could be inspected over later decode events.
+
+Strict digest/observe alignment:
+  A shorter smoke with VLLM_MPR_DUMP_EVERY=1 passed the JSONL validator without
+  --allow-unmatched-digest-events.
+
+Conclusion:
+  Step 1.4 is complete for the current single-request score-only smoke scope.
+```
