@@ -1,5 +1,21 @@
 # vLLM × ArkVale 기반 Mixed-Precision Recovery 큰 그림
 
+## Collaboration and Execution Rules
+
+These rules apply to all milestones in this MPR project.
+
+1. Before starting each new milestone step, identify any design or policy
+   decisions and ask the user to decide instead of choosing alone.
+2. Before making implementation changes or creating a commit, brief the user on
+   the concrete implementation plan.
+3. Only proceed with implementation and commit after the user explicitly agrees
+   with the plan, for example by saying to implement it as described.
+4. Record important decisions and validation results in the relevant markdown
+   progress documents so the context survives conversation compaction.
+5. Treat scoring, recall policy, request/block ownership, serving behavior, and
+   ArkVale kernel integration as design-sensitive areas that require explicit
+   user confirmation before code changes.
+
 ## 1. 연구 Framing
 
 이 작업의 목표는 기존 offloading 기반 LLM inference 연구를 다음 단계로 확장하는 것이다.
@@ -259,4 +275,3 @@ class RecoverySidecar:
 ## 10. One-Sentence Contribution
 
 We extend offloading-based LLM inference from binary KV fetch/evict decisions to page-level, score-guided mixed-precision recovery, using lightweight digest scoring to recover only the KV pages that matter and only at the precision they warrant.
-
