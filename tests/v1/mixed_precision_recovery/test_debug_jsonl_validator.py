@@ -9,8 +9,9 @@ from scripts.mpr_validate_debug_jsonl import (
     load_jsonl,
     validate_digest_event,
     validate_digest_observe_matches,
-    validate_score_event,
     validate_observe_event,
+    validate_score_event,
+    validate_strict_current_request_score_event,
 )
 
 
@@ -117,6 +118,7 @@ def test_debug_jsonl_validator_accepts_score_event(tmp_path):
 
     events = load_jsonl([path])
     validate_score_event(events[0])
+    validate_strict_current_request_score_event(events[0])
 
 
 def test_debug_jsonl_validator_rejects_topk_outside_scored_digests(tmp_path):
@@ -141,3 +143,31 @@ def test_debug_jsonl_validator_rejects_topk_outside_scored_digests(tmp_path):
     events = load_jsonl([path])
     with pytest.raises(AssertionError, match="subset"):
         validate_score_event(events[0])
+
+
+def test_debug_jsonl_validator_rejects_non_current_request_scores(tmp_path):
+    path = tmp_path / "mpr.jsonl"
+    score_event = {
+        "event": "score_estimated",
+        "layer_name": "model.layers.0.self_attn.attn",
+        "layer_event_idx": 4,
+        "query_shape": [1, 32, 128],
+        "window_query_shape": [32, 128],
+        "window_query_len": 3,
+        "num_digest_blocks": 2,
+        "score_count": 2,
+        "score_agg": "max",
+        "topk": 1,
+        "topk_block_ids": [7],
+        "topk_scores": [4.0],
+        "finalized_block_ids": [7],
+        "observed_digest_block_ids": [7, 8],
+        "missing_digest_blocks": [],
+        "extra_digest_blocks": [],
+    }
+    path.write_text(json.dumps(score_event), encoding="utf-8")
+
+    events = load_jsonl([path])
+    validate_score_event(events[0])
+    with pytest.raises(AssertionError, match="must match finalized"):
+        validate_strict_current_request_score_event(events[0])

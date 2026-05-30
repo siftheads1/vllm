@@ -939,3 +939,65 @@ Local verification:
   Local Windows Python did not have pytest installed, so pytest should be run
   in the target vLLM server environment.
 ```
+
+Step 1.5 smoke validation result:
+
+```text
+The target server smoke run completed successfully.
+
+Confirmed by user:
+  generation completed
+  JSONL validation passed
+  no missing finalized digest block summary section was printed
+  no extra cached digest block summary section was printed
+
+Interpretation:
+  For the validated single-request run, scored digest blocks matched the
+  current request's valid/finalized block-table view. The Step 1.5 debug fields
+  are therefore usable for Step 1.6 strict metadata validation.
+```
+
+### Step 1.6 Validation Implementation
+
+Added stricter validation helpers for Milestone 1 completion checks:
+
+```text
+scripts/mpr_validate_debug_jsonl.py:
+  --strict-current-request-scores
+
+This mode is intended for the current single-request smoke scope. It requires:
+  observed_digest_block_ids to be present
+  finalized_block_ids to be present
+  missing_digest_blocks == []
+  extra_digest_blocks == []
+  set(observed_digest_block_ids) == set(finalized_block_ids)
+  topk_block_ids subset of finalized_block_ids
+  topk_scores are finite numbers
+
+This is intentionally not a serving/multi-request validation mode. Multi-request
+serving still needs request-scoped query windows and request/block ownership
+tracking before strict request-local scoring can be required.
+```
+
+Added deterministic generation comparison helper:
+
+```text
+scripts/mpr_compare_generation_outputs.py
+
+It reads two mpr_baseline_qwen3_8b.py logs, extracts generated_token_ids, and
+fails if the sidecar-on run differs from the sidecar-off baseline.
+```
+
+Recommended Step 1.6 commands on the target server:
+
+```bash
+python scripts/mpr_validate_debug_jsonl.py \
+  --min-score-events 50 \
+  --allow-unmatched-digest-events \
+  --strict-current-request-scores \
+  /tmp/vllm_mpr_debug/*.jsonl
+
+python scripts/mpr_compare_generation_outputs.py \
+  /tmp/mpr_baseline_off.log \
+  /tmp/mpr_baseline_on.log
+```

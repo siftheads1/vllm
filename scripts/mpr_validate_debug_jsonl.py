@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,15 @@ def parse_args() -> argparse.Namespace:
             "Do not fail when a digest_created event has no matching "
             "observe_kv_write record. This can happen with restrictive "
             "VLLM_MPR_MAX_STEPS or VLLM_MPR_DUMP_EVERY settings."
+        ),
+    )
+    parser.add_argument(
+        "--strict-current-request-scores",
+        action="store_true",
+        help=(
+            "Require every score_estimated event to score exactly the current "
+            "request's finalized block IDs. This is intended for single-request "
+            "Step 1.6 smoke validation, not multi-request serving."
         ),
     )
     parser.add_argument(
@@ -257,9 +267,12 @@ def validate_score_event(event: dict[str, Any]) -> None:
         raise AssertionError(
             f"{event['_source']}: topk_scores must have length {topk}."
         )
-    if not all(isinstance(score, (int, float)) for score in topk_scores):
+    if not all(
+        isinstance(score, (int, float)) and math.isfinite(float(score))
+        for score in topk_scores
+    ):
         raise AssertionError(
-            f"{event['_source']}: topk_scores must contain numeric values."
+            f"{event['_source']}: topk_scores must contain finite numeric values."
         )
     if window_query_len > 0 and topk == 0:
         raise AssertionError(
@@ -306,6 +319,56 @@ def validate_score_event(event: dict[str, Any]) -> None:
     ):
         raise AssertionError(
             f"{event['_source']}: block_size must be a positive int when set."
+        )
+
+
+def validate_strict_current_request_score_event(event: dict[str, Any]) -> None:
+    """Validate score candidates against the current request's finalized blocks."""
+    observed_digest_block_ids = require_int_list(
+        event,
+        "observed_digest_block_ids",
+        minimum=0,
+    )
+    finalized_block_ids = require_int_list(
+        event,
+        "finalized_block_ids",
+        minimum=0,
+    )
+    topk_block_ids = require_int_list(event, "topk_block_ids", minimum=0)
+    missing_digest_blocks = require_int_list(
+        event,
+        "missing_digest_blocks",
+        minimum=0,
+    )
+    extra_digest_blocks = require_int_list(
+        event,
+        "extra_digest_blocks",
+        minimum=0,
+    )
+
+    if missing_digest_blocks:
+        raise AssertionError(
+            f"{event['_source']}: strict score validation found missing "
+            f"finalized digest blocks: {missing_digest_blocks}."
+        )
+    if extra_digest_blocks:
+        raise AssertionError(
+            f"{event['_source']}: strict score validation found extra cached "
+            f"digest blocks: {extra_digest_blocks}."
+        )
+
+    observed_set = set(observed_digest_block_ids)
+    finalized_set = set(finalized_block_ids)
+    if observed_set != finalized_set:
+        raise AssertionError(
+            f"{event['_source']}: scored digest blocks must match finalized "
+            f"request blocks; observed={sorted(observed_set)}, "
+            f"finalized={sorted(finalized_set)}."
+        )
+    if not set(topk_block_ids).issubset(finalized_set):
+        raise AssertionError(
+            f"{event['_source']}: topk_block_ids must be a subset of "
+            "finalized_block_ids."
         )
 
 
@@ -508,6 +571,8 @@ def main() -> None:
         validate_digest_event(event)
     for event in score_events:
         validate_score_event(event)
+        if args.strict_current_request_scores:
+            validate_strict_current_request_score_event(event)
 
     if len(digest_events) < args.min_digest_events:
         raise AssertionError(
@@ -533,6 +598,8 @@ def main() -> None:
         score_events,
         args.show,
     )
+    if args.strict_current_request_scores:
+        print("strict_current_request_scores: passed")
 
 
 if __name__ == "__main__":
