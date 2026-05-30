@@ -1001,3 +1001,27 @@ python scripts/mpr_compare_generation_outputs.py \
   /tmp/mpr_baseline_off.log \
   /tmp/mpr_baseline_on.log
 ```
+
+Step 1.6 validation result:
+
+```text
+The target server validation completed successfully.
+
+Confirmed by user:
+  Baseline non-regression passed:
+    sidecar-off and sidecar-on generated_token_ids matched.
+  Metadata alignment passed:
+    strict JSONL validation passed with --strict-current-request-scores.
+  Digest sanity passed:
+    digest/score invariants checked by scripts/mpr_validate_debug_jsonl.py
+    completed without assertion failures.
+
+Interpretation:
+  For the current single-GPU, single-request, score-only smoke scope,
+  Milestone 1 Step 1.6 validation is complete.
+
+Remaining scope caveat:
+  This does not validate multi-request serving, request/block ownership under
+  block reuse, or production recall behavior. Those remain future design and
+  implementation items.
+```
