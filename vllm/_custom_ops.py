@@ -33,6 +33,44 @@ else:
 # scaled_fp4_quant functional + out variant for torch.compile buffer management
 
 
+def mpr_estimate_attn_score(
+    q: torch.Tensor,
+    out: torch.Tensor,
+    metadata_data: torch.Tensor,
+    metadata_indices: torch.Tensor,
+    metadata_indptr: torch.Tensor,
+    metadata_last_page_len: int,
+    metadata_last_page_idx: int,
+    layout: int,
+) -> None:
+    """Estimate Quest-style MPR digest scores with the CUDA custom op.
+
+    The underlying op is intentionally optional while the Quest CUDA backend is
+    under development. Selecting ``VLLM_MPR_SCORING_BACKEND=quest_cuda`` before
+    building the op will fail here with a clear error instead of silently falling
+    back to the PyTorch reference scorer.
+    """
+    if not hasattr(torch.ops, "_C") or not hasattr(
+        torch.ops._C,
+        "mpr_estimate_attn_score",
+    ):
+        raise RuntimeError(
+            "mpr_estimate_attn_score custom op is not registered. Rebuild vLLM "
+            "with the MPR Quest estimate binding before using "
+            "VLLM_MPR_SCORING_BACKEND=quest_cuda."
+        )
+    torch.ops._C.mpr_estimate_attn_score(
+        q,
+        out,
+        metadata_data,
+        metadata_indices,
+        metadata_indptr,
+        metadata_last_page_len,
+        metadata_last_page_idx,
+        layout,
+    )
+
+
 def create_fp4_scale_tensor(
     m: int,
     n: int,

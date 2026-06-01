@@ -60,7 +60,11 @@ class MPRConfig:
     max_steps: int | None = None
     dump_every: int = 1
     window_size: int = 64
+    recent_tokens: int = 64
     score_agg: str = "max"
+    scoring_backend: str = "torch_quest"
+    digest_kind: str = "raw_minmax"
+    score_granularity: str = "kv_head"
 
     @classmethod
     def from_env(cls) -> "MPRConfig":
@@ -72,9 +76,25 @@ class MPRConfig:
             max_steps=_parse_optional_limit("VLLM_MPR_MAX_STEPS"),
             dump_every=_parse_int("VLLM_MPR_DUMP_EVERY", 1, 1),
             window_size=_parse_int("VLLM_MPR_WINDOW_SIZE", 64, 1),
+            recent_tokens=_parse_int("VLLM_MPR_RECENT_TOKENS", 64, 0),
             score_agg=_parse_choice(
                 "VLLM_MPR_SCORE_AGG",
                 "max",
                 {"max", "mean"},
+            ),
+            scoring_backend=_parse_choice(
+                "VLLM_MPR_SCORING_BACKEND",
+                "torch_quest",
+                {"torch_quest", "quest_cuda"},
+            ),
+            digest_kind=_parse_choice(
+                "VLLM_MPR_DIGEST_KIND",
+                "raw_minmax",
+                {"arkvale", "raw_minmax"},
+            ),
+            score_granularity=_parse_choice(
+                "VLLM_MPR_SCORE_GRANULARITY",
+                "kv_head",
+                {"block", "kv_head", "query_head"},
             ),
         )

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""ArkVale-style key digest helpers for MPR."""
+"""Key digest helpers for MPR."""
 
 from __future__ import annotations
 
@@ -10,9 +10,14 @@ from dataclasses import dataclass
 import torch
 
 
+ARKVALE_DIGEST_KIND = "arkvale"
+RAW_MINMAX_DIGEST_KIND = "raw_minmax"
+SUPPORTED_DIGEST_KINDS = frozenset({ARKVALE_DIGEST_KIND, RAW_MINMAX_DIGEST_KIND})
+
+
 @dataclass(frozen=True)
 class KeyBlockDigest:
-    """ArkVale-style summary for one full key-cache block.
+    """Summary for one full key-cache block.
 
     Attributes:
         digest_min: Lower digest bound, shaped ``[num_kv_heads, head_dim]``.
@@ -21,27 +26,17 @@ class KeyBlockDigest:
             is always equal to ``block_size`` because partial-block digests are
             not created.
         block_size: Number of token slots in the source block.
+        digest_kind: Digest construction policy.
     """
 
     digest_min: torch.Tensor
     digest_max: torch.Tensor
     valid_token_count: int
     block_size: int
+    digest_kind: str = ARKVALE_DIGEST_KIND
 
 
-def summarize_key_block(key_block: torch.Tensor) -> KeyBlockDigest:
-    """Summarize one full KV-cache key block.
-
-    Args:
-        key_block: FlashAttention key-cache block with shape
-            ``[block_size, num_kv_heads, head_dim]``. This is expected to be
-            ``kv_cache[0, physical_block_id]`` where the leading ``0`` selects
-            keys rather than values from FlashAttention's KV cache.
-
-    Returns:
-        An ArkVale-style bounding digest with min/max tensors shaped
-        ``[num_kv_heads, head_dim]``.
-    """
+def _validate_key_block(key_block: torch.Tensor) -> tuple[torch.Tensor, int]:
     if key_block.ndim != 3:
         raise ValueError(
             "MPR key block digest expects a 3D tensor shaped "
@@ -49,17 +44,49 @@ def summarize_key_block(key_block: torch.Tensor) -> KeyBlockDigest:
         )
 
     key_block = key_block.detach()
-
-    # block_size: number of token slots in this physical KV block.
-    # num_kv_heads/head_dim remain in dimensions 1 and 2.
     block_size = int(key_block.shape[0])
     if block_size <= 0:
         raise ValueError("MPR key block digest requires a non-empty block.")
+    return key_block, block_size
 
-    # raw_max/raw_min: per-head/per-channel extrema over the block token axis.
-    # Shape: [num_kv_heads, head_dim].
+
+def summarize_key_block(
+    key_block: torch.Tensor,
+    digest_kind: str = ARKVALE_DIGEST_KIND,
+) -> KeyBlockDigest:
+    """Summarize one full KV-cache key block.
+
+    Args:
+        key_block: FlashAttention key-cache block with shape
+            ``[block_size, num_kv_heads, head_dim]``. This is expected to be
+            ``kv_cache[0, physical_block_id]`` where the leading ``0`` selects
+            keys rather than values from FlashAttention's KV cache.
+        digest_kind: ``"arkvale"`` uses ArkVale's tightened center +/- mean
+            distance bounds. ``"raw_minmax"`` uses Quest-style raw extrema.
+
+    Returns:
+        A bounding digest with min/max tensors shaped
+        ``[num_kv_heads, head_dim]``.
+    """
+    if digest_kind not in SUPPORTED_DIGEST_KINDS:
+        raise ValueError(
+            "MPR digest kind must be 'arkvale' or 'raw_minmax', "
+            f"got {digest_kind!r}."
+        )
+
+    key_block, block_size = _validate_key_block(key_block)
+
     raw_max = key_block.amax(dim=0)
     raw_min = key_block.amin(dim=0)
+
+    if digest_kind == RAW_MINMAX_DIGEST_KIND:
+        return KeyBlockDigest(
+            digest_min=raw_min,
+            digest_max=raw_max,
+            valid_token_count=block_size,
+            block_size=block_size,
+            digest_kind=digest_kind,
+        )
 
     # centers: midpoint of the raw bounding box.
     # Shape: [num_kv_heads, head_dim].
@@ -76,4 +103,5 @@ def summarize_key_block(key_block: torch.Tensor) -> KeyBlockDigest:
         digest_max=centers + dists,
         valid_token_count=block_size,
         block_size=block_size,
+        digest_kind=digest_kind,
     )

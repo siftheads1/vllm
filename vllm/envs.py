@@ -283,7 +283,11 @@ if TYPE_CHECKING:
     VLLM_MPR_MAX_STEPS: int = -1
     VLLM_MPR_DUMP_EVERY: int = 1
     VLLM_MPR_WINDOW_SIZE: int = 64
+    VLLM_MPR_RECENT_TOKENS: int = 64
     VLLM_MPR_SCORE_AGG: str = "max"
+    VLLM_MPR_SCORING_BACKEND: str = "torch_quest"
+    VLLM_MPR_DIGEST_KIND: str = "raw_minmax"
+    VLLM_MPR_SCORE_GRANULARITY: str = "kv_head"
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
 
 
@@ -1972,8 +1976,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MPR_DUMP_EVERY": lambda: int(os.getenv("VLLM_MPR_DUMP_EVERY", "1")),
     # Rolling decode query window size for MPR score-only instrumentation.
     "VLLM_MPR_WINDOW_SIZE": lambda: int(os.getenv("VLLM_MPR_WINDOW_SIZE", "64")),
+    # Recent token window protected from MPR score/top-k candidate selection.
+    "VLLM_MPR_RECENT_TOKENS": lambda: int(
+        os.getenv("VLLM_MPR_RECENT_TOKENS", "64")
+    ),
     # Query-head score aggregation for MPR score-only instrumentation.
     "VLLM_MPR_SCORE_AGG": lambda: os.getenv("VLLM_MPR_SCORE_AGG", "max").lower(),
+    # Digest scoring backend for MPR score-only instrumentation.
+    "VLLM_MPR_SCORING_BACKEND": lambda: os.getenv(
+        "VLLM_MPR_SCORING_BACKEND",
+        "torch_quest",
+    ).lower(),
+    # Digest construction policy for MPR score-only instrumentation.
+    "VLLM_MPR_DIGEST_KIND": lambda: os.getenv(
+        "VLLM_MPR_DIGEST_KIND",
+        "raw_minmax",
+    ).lower(),
+    # Score tensor granularity to expose in MPR debug output.
+    "VLLM_MPR_SCORE_GRANULARITY": lambda: os.getenv(
+        "VLLM_MPR_SCORE_GRANULARITY",
+        "kv_head",
+    ).lower(),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
     # overlap the base layer compute with the LoRA fast path).
@@ -2136,7 +2159,11 @@ def compile_factors() -> dict[str, object]:
         "VLLM_MPR_MAX_STEPS",
         "VLLM_MPR_DUMP_EVERY",
         "VLLM_MPR_WINDOW_SIZE",
+        "VLLM_MPR_RECENT_TOKENS",
         "VLLM_MPR_SCORE_AGG",
+        "VLLM_MPR_SCORING_BACKEND",
+        "VLLM_MPR_DIGEST_KIND",
+        "VLLM_MPR_SCORE_GRANULARITY",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",

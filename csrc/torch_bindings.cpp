@@ -77,6 +77,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    Tensor? output_scale=None) -> ()");
   ops.impl("merge_attn_states", torch::kCUDA, &merge_attn_states);
 
+  ops.def(
+      "mpr_estimate_attn_score("
+      "    Tensor q, Tensor! out, Tensor metadata_data,"
+      "    Tensor metadata_indices, Tensor metadata_indptr,"
+      "    int metadata_last_page_len, int metadata_last_page_idx,"
+      "    int layout) -> ()");
+  ops.impl("mpr_estimate_attn_score", torch::kCUDA,
+           &mpr_estimate_attn_score);
+
   // Activation ops (quantized only — basic ops moved to _C_stable_libtorch)
   ops.def(
       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");

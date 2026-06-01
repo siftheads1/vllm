@@ -311,6 +311,7 @@ set(VLLM_EXT_SRC
   "csrc/attention/paged_attention_v1.cu"
   "csrc/attention/paged_attention_v2.cu"
   "csrc/attention/merge_attn_states.cu"
+  "csrc/mpr/quest_estimate_stub.cpp"
   "csrc/sampler.cu"
   "csrc/topk.cu"
   "csrc/cuda_view.cu"

@@ -39,6 +39,7 @@ def test_debug_jsonl_validator_accepts_matching_digest_event(tmp_path):
         "digest_max_shape": [8, 128],
         "valid_token_count": 16,
         "block_size": 16,
+        "digest_kind": "arkvale",
         "num_digest_blocks_for_layer": 1,
         "total_digest_blocks": 1,
     }
@@ -98,6 +99,12 @@ def test_debug_jsonl_validator_accepts_score_event(tmp_path):
         "num_digest_blocks": 2,
         "score_count": 2,
         "score_agg": "max",
+        "scoring_backend": "torch_quest",
+        "digest_kind": "raw_minmax",
+        "num_q_heads": 32,
+        "num_kv_heads": 8,
+        "gqa_group_size": 4,
+        "score_granularity": "block",
         "topk": 2,
         "topk_block_ids": [7, 8],
         "topk_scores": [4.0, 3.0],
@@ -110,6 +117,10 @@ def test_debug_jsonl_validator_accepts_score_event(tmp_path):
         "block_table_row": [7, 8, 9, 0],
         "valid_block_ids": [7, 8, 9],
         "finalized_block_ids": [7, 8],
+        "recent_tokens": 64,
+        "protected_tail_entries": 1,
+        "protected_block_ids": [9],
+        "score_candidate_block_ids": [7, 8],
         "observed_digest_block_ids": [7, 8],
         "missing_digest_blocks": [],
         "extra_digest_blocks": [],
@@ -119,6 +130,71 @@ def test_debug_jsonl_validator_accepts_score_event(tmp_path):
     events = load_jsonl([path])
     validate_score_event(events[0])
     validate_strict_current_request_score_event(events[0])
+
+
+def test_debug_jsonl_validator_accepts_recent_protected_score_candidates(tmp_path):
+    path = tmp_path / "mpr.jsonl"
+    score_event = {
+        "event": "score_estimated",
+        "layer_name": "model.layers.0.self_attn.attn",
+        "layer_event_idx": 4,
+        "query_shape": [1, 32, 128],
+        "window_query_shape": [32, 128],
+        "window_query_len": 3,
+        "num_digest_blocks": 2,
+        "score_count": 2,
+        "score_agg": "max",
+        "topk": 1,
+        "topk_block_ids": [7],
+        "topk_scores": [4.0],
+        "valid_block_ids": [7, 8, 9, 10],
+        "finalized_block_ids": [7, 8, 9],
+        "recent_tokens": 64,
+        "protected_tail_entries": 2,
+        "protected_block_ids": [9, 10],
+        "score_candidate_block_ids": [7, 8],
+        "observed_digest_block_ids": [7, 8],
+        "missing_digest_blocks": [],
+        "extra_digest_blocks": [],
+    }
+    path.write_text(json.dumps(score_event), encoding="utf-8")
+
+    events = load_jsonl([path])
+    validate_score_event(events[0])
+    validate_strict_current_request_score_event(events[0])
+
+
+def test_debug_jsonl_validator_accepts_head_granularity_score_event(tmp_path):
+    path = tmp_path / "mpr.jsonl"
+    score_event = {
+        "event": "score_estimated",
+        "layer_name": "model.layers.0.self_attn.attn",
+        "layer_event_idx": 4,
+        "query_shape": [1, 4, 128],
+        "window_query_shape": [4, 128],
+        "window_query_len": 3,
+        "num_digest_blocks": 3,
+        "score_count": 3,
+        "score_agg": "max",
+        "scoring_backend": "torch_quest",
+        "digest_kind": "raw_minmax",
+        "num_q_heads": 4,
+        "num_kv_heads": 2,
+        "gqa_group_size": 2,
+        "score_granularity": "kv_head",
+        "num_score_heads": 2,
+        "head_score_count": 6,
+        "topk": 2,
+        "topk_block_ids": [7, 8],
+        "topk_scores": [4.0, 3.0],
+        "topk_block_ids_by_head": [[7, 9], [8, 7]],
+        "topk_scores_by_head": [[5.0, 2.0], [6.0, 1.0]],
+        "observed_digest_block_ids": [7, 8, 9],
+    }
+    path.write_text(json.dumps(score_event), encoding="utf-8")
+
+    events = load_jsonl([path])
+    validate_score_event(events[0])
 
 
 def test_debug_jsonl_validator_rejects_topk_outside_scored_digests(tmp_path):

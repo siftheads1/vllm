@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Any
 
 
+SUPPORTED_DIGEST_KINDS = {"arkvale", "raw_minmax"}
+SUPPORTED_SCORING_BACKENDS = {"torch_quest", "quest_cuda"}
+SUPPORTED_SCORE_GRANULARITIES = {"block", "kv_head", "query_head"}
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the JSONL validator."""
     parser = argparse.ArgumentParser(
@@ -158,6 +163,75 @@ def require_int_list(
     return value
 
 
+def require_nested_int_list(
+    event: dict[str, Any],
+    field: str,
+    *,
+    outer_len: int,
+    inner_len: int,
+    minimum: int | None = None,
+) -> list[list[int]]:
+    """Read a nested integer list and enforce exact outer/inner lengths."""
+    value = event.get(field)
+    if not isinstance(value, list) or len(value) != outer_len:
+        raise AssertionError(
+            f"{event['_source']}: {field} must be a list with "
+            f"{outer_len} rows."
+        )
+    rows: list[list[int]] = []
+    for row_idx, row in enumerate(value):
+        if not isinstance(row, list) or len(row) != inner_len:
+            raise AssertionError(
+                f"{event['_source']}: {field}[{row_idx}] must have "
+                f"length {inner_len}."
+            )
+        if not all(isinstance(item, int) for item in row):
+            raise AssertionError(
+                f"{event['_source']}: {field}[{row_idx}] must contain "
+                "integer values."
+            )
+        if minimum is not None and any(item < minimum for item in row):
+            raise AssertionError(
+                f"{event['_source']}: {field}[{row_idx}] must contain "
+                f"values >= {minimum}."
+            )
+        rows.append(row)
+    return rows
+
+
+def require_nested_finite_number_list(
+    event: dict[str, Any],
+    field: str,
+    *,
+    outer_len: int,
+    inner_len: int,
+) -> list[list[float]]:
+    """Read a nested finite-number list and enforce exact row lengths."""
+    value = event.get(field)
+    if not isinstance(value, list) or len(value) != outer_len:
+        raise AssertionError(
+            f"{event['_source']}: {field} must be a list with "
+            f"{outer_len} rows."
+        )
+    rows: list[list[float]] = []
+    for row_idx, row in enumerate(value):
+        if not isinstance(row, list) or len(row) != inner_len:
+            raise AssertionError(
+                f"{event['_source']}: {field}[{row_idx}] must have "
+                f"length {inner_len}."
+            )
+        if not all(
+            isinstance(item, (int, float)) and math.isfinite(float(item))
+            for item in row
+        ):
+            raise AssertionError(
+                f"{event['_source']}: {field}[{row_idx}] must contain finite "
+                "numeric values."
+            )
+        rows.append([float(item) for item in row])
+    return rows
+
+
 def validate_observe_event(event: dict[str, Any]) -> None:
     """Validate one observe_kv_write event's block/slot invariants."""
     block_size = require_int(event, "block_size", minimum=1)
@@ -217,6 +291,13 @@ def validate_digest_event(event: dict[str, Any]) -> None:
             f"does not match digest_max_shape={digest_max_shape}."
         )
 
+    digest_kind = event.get("digest_kind")
+    if digest_kind is not None and digest_kind not in SUPPORTED_DIGEST_KINDS:
+        raise AssertionError(
+            f"{event['_source']}: digest_kind must be one of "
+            f"{sorted(SUPPORTED_DIGEST_KINDS)}, got {digest_kind!r}."
+        )
+
 
 def validate_score_event(event: dict[str, Any]) -> None:
     """Validate one score_estimated event's score metadata."""
@@ -241,6 +322,23 @@ def validate_score_event(event: dict[str, Any]) -> None:
             f"{event['_source']}: score_agg must be 'max' or 'mean'."
         )
 
+    scoring_backend = event.get("scoring_backend")
+    if (
+        scoring_backend is not None
+        and scoring_backend not in SUPPORTED_SCORING_BACKENDS
+    ):
+        raise AssertionError(
+            f"{event['_source']}: scoring_backend must be one of "
+            f"{sorted(SUPPORTED_SCORING_BACKENDS)}, got {scoring_backend!r}."
+        )
+
+    digest_kind = event.get("digest_kind")
+    if digest_kind is not None and digest_kind not in SUPPORTED_DIGEST_KINDS:
+        raise AssertionError(
+            f"{event['_source']}: digest_kind must be one of "
+            f"{sorted(SUPPORTED_DIGEST_KINDS)}, got {digest_kind!r}."
+        )
+
     window_query_shape = event.get("window_query_shape")
     if (
         not isinstance(window_query_shape, list)
@@ -251,6 +349,38 @@ def validate_score_event(event: dict[str, Any]) -> None:
             f"{event['_source']}: window_query_shape must be "
             "[num_q_heads, head_dim]."
         )
+
+    num_q_heads = event.get("num_q_heads")
+    num_kv_heads = event.get("num_kv_heads")
+    gqa_group_size = event.get("gqa_group_size")
+    score_granularity = event.get("score_granularity", "block")
+    if score_granularity not in SUPPORTED_SCORE_GRANULARITIES:
+        raise AssertionError(
+            f"{event['_source']}: score_granularity must be one of "
+            f"{sorted(SUPPORTED_SCORE_GRANULARITIES)}, "
+            f"got {score_granularity!r}."
+        )
+    if num_q_heads is not None or num_kv_heads is not None:
+        num_q_heads = require_int(event, "num_q_heads", minimum=1)
+        num_kv_heads = require_int(event, "num_kv_heads", minimum=1)
+        if num_q_heads != window_query_shape[0]:
+            raise AssertionError(
+                f"{event['_source']}: num_q_heads={num_q_heads} must match "
+                f"window_query_shape[0]={window_query_shape[0]}."
+            )
+        if num_q_heads % num_kv_heads != 0:
+            raise AssertionError(
+                f"{event['_source']}: num_q_heads must be a multiple of "
+                f"num_kv_heads, got {num_q_heads} and {num_kv_heads}."
+            )
+        expected_group_size = num_q_heads // num_kv_heads
+        if gqa_group_size is not None:
+            gqa_group_size = require_int(event, "gqa_group_size", minimum=1)
+        if gqa_group_size is not None and gqa_group_size != expected_group_size:
+            raise AssertionError(
+                f"{event['_source']}: gqa_group_size={gqa_group_size} "
+                f"must equal {expected_group_size}."
+            )
 
     topk_block_ids = event.get("topk_block_ids")
     topk_scores = event.get("topk_scores")
@@ -298,17 +428,61 @@ def validate_score_event(event: dict[str, Any]) -> None:
                 "observed_digest_block_ids."
             )
 
+    if score_granularity in ("kv_head", "query_head"):
+        num_score_heads = require_int(event, "num_score_heads", minimum=1)
+        head_score_count = require_int(event, "head_score_count", minimum=1)
+        if head_score_count != score_count * num_score_heads:
+            raise AssertionError(
+                f"{event['_source']}: head_score_count={head_score_count} "
+                f"must equal score_count * num_score_heads "
+                f"({score_count * num_score_heads})."
+            )
+        expected_heads = num_kv_heads if score_granularity == "kv_head" else num_q_heads
+        if expected_heads is not None and num_score_heads != expected_heads:
+            raise AssertionError(
+                f"{event['_source']}: num_score_heads={num_score_heads} "
+                f"does not match {score_granularity} expected head count "
+                f"{expected_heads}."
+            )
+        topk_block_ids_by_head = require_nested_int_list(
+            event,
+            "topk_block_ids_by_head",
+            outer_len=num_score_heads,
+            inner_len=topk,
+            minimum=0,
+        )
+        require_nested_finite_number_list(
+            event,
+            "topk_scores_by_head",
+            outer_len=num_score_heads,
+            inner_len=topk,
+        )
+        if observed_digest_block_ids is not None:
+            observed_set = set(observed_digest_block_ids)
+            for row_idx, block_ids in enumerate(topk_block_ids_by_head):
+                if not set(block_ids).issubset(observed_set):
+                    raise AssertionError(
+                        f"{event['_source']}: topk_block_ids_by_head[{row_idx}] "
+                        "must be a subset of observed_digest_block_ids."
+                    )
+
     if event.get("block_table_row") is not None:
         require_int_list(event, "block_table_row")
 
     for field in (
         "valid_block_ids",
         "finalized_block_ids",
+        "protected_block_ids",
+        "score_candidate_block_ids",
         "missing_digest_blocks",
         "extra_digest_blocks",
     ):
         if event.get(field) is not None:
             require_int_list(event, field, minimum=0)
+
+    for field in ("recent_tokens", "protected_tail_entries"):
+        if event.get(field) is not None:
+            require_int(event, field, minimum=0)
 
     if event.get("seq_lens") is not None:
         require_int_list(event, "seq_lens", minimum=0)
@@ -345,11 +519,22 @@ def validate_strict_current_request_score_event(event: dict[str, Any]) -> None:
         "extra_digest_blocks",
         minimum=0,
     )
+    score_candidate_block_ids = event.get("score_candidate_block_ids")
+    if score_candidate_block_ids is not None:
+        expected_block_ids = require_int_list(
+            event,
+            "score_candidate_block_ids",
+            minimum=0,
+        )
+        expected_label = "score_candidate_block_ids"
+    else:
+        expected_block_ids = finalized_block_ids
+        expected_label = "finalized_block_ids"
 
     if missing_digest_blocks:
         raise AssertionError(
             f"{event['_source']}: strict score validation found missing "
-            f"finalized digest blocks: {missing_digest_blocks}."
+            f"candidate digest blocks: {missing_digest_blocks}."
         )
     if extra_digest_blocks:
         raise AssertionError(
@@ -358,17 +543,17 @@ def validate_strict_current_request_score_event(event: dict[str, Any]) -> None:
         )
 
     observed_set = set(observed_digest_block_ids)
-    finalized_set = set(finalized_block_ids)
-    if observed_set != finalized_set:
+    expected_set = set(expected_block_ids)
+    if observed_set != expected_set:
         raise AssertionError(
-            f"{event['_source']}: scored digest blocks must match finalized "
-            f"request blocks; observed={sorted(observed_set)}, "
-            f"finalized={sorted(finalized_set)}."
+            f"{event['_source']}: scored digest blocks must match "
+            f"{expected_label}; observed={sorted(observed_set)}, "
+            f"expected={sorted(expected_set)}."
         )
-    if not set(topk_block_ids).issubset(finalized_set):
+    if not set(topk_block_ids).issubset(expected_set):
         raise AssertionError(
             f"{event['_source']}: topk_block_ids must be a subset of "
-            "finalized_block_ids."
+            f"{expected_label}."
         )
 
 

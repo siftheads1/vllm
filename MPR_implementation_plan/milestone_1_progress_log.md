@@ -1,6 +1,6 @@
 # Milestone 1 Progress Log
 
-Last updated: 2026-05-28
+Last updated: 2026-06-01
 
 ## Current State
 
@@ -1024,4 +1024,451 @@ Remaining scope caveat:
   This does not validate multi-request serving, request/block ownership under
   block reuse, or production recall behavior. Those remain future design and
   implementation items.
+```
+
+### Step 1.7 ArkVale Kernel Analysis and First-Pass Compatibility
+
+Created report:
+
+```text
+/home/han/KV_cache_quant/proposed_method_develop/vllm/MPR_implementation_plan/milestone_1_step_1_7_arkvale_kernel_compatibility_report.md
+```
+
+Summary:
+
+```text
+direct_reuse = no
+single_request_reuse_after_packing = likely yes
+multi_request_reuse_after_packing = not yet
+```
+
+Key findings:
+
+```text
+ArkVale estimate_scores mathematically matches the current cuboid digest score.
+The kernel expects FlashInfer-style paged digest-cache inputs, not the current
+sidecar's Python dict keyed by vLLM physical block id.
+ArkVale dg_indices are digest-cache page ids, not vLLM physical block ids.
+The current MPR default aggregation is max, while ArkVale's exposed wrapper
+mean-reduces query heads within groups.
+The kernel is safe for the current single-request smoke scope, but should not
+be treated as general variable-length multi-request serving support yet.
+```
+
+Open Step 1.7 decisions before adapter design:
+
+```text
+1. Should ArkVale-kernel mode initially force score_agg=mean, or should the
+   wrapper/kernel expose max aggregation?
+2. Should the first packing prototype allocate temporary compact dg_data per
+   score call, or introduce persistent sidecar paged digest storage?
+```
+
+### Reference Scoring Reports: Quest And DiffKV
+
+Created Quest scoring reference report:
+
+```text
+/home/han/KV_cache_quant/proposed_method_develop/vllm/MPR_implementation_plan/reference_quest_scoring_report.md
+```
+
+Created DiffKV scoring reference report:
+
+```text
+/home/han/KV_cache_quant/proposed_method_develop/vllm/MPR_implementation_plan/reference_diffkv_scoring_report.md
+```
+
+Current interpretation:
+
+```text
+Quest is the closest mainstream reference for query-aware page scoring with
+page-level max/min metadata.
+
+DiffKV is not a digest scorer. It uses accumulated post-softmax attention mass
+as a token importance signal, max-aggregated over GQA query heads, then applies
+thresholds to choose high precision, low precision, or prune.
+
+For MPR, Quest/ArkVale are better references for runtime digest scoring.
+DiffKV is more useful as a precision-allocation policy reference and as a
+possible attention-mass oracle/calibration signal.
+```
+
+### Step 1.7 Modular Scoring Implementation
+
+Created implementation report:
+
+```text
+/home/han/KV_cache_quant/proposed_method_develop/vllm/MPR_implementation_plan/milestone_1_step_1_7_modular_scoring_implementation_report.md
+```
+
+Implemented the first modular scoring pass:
+
+```text
+vllm/v1/mixed_precision_recovery/config.py
+  added scoring_backend and digest_kind
+
+vllm/v1/mixed_precision_recovery/digest.py
+  summarize_key_block(..., digest_kind=...)
+  digest_kind=arkvale keeps existing tightened digest behavior
+  digest_kind=raw_minmax enables Quest-style raw extrema metadata
+
+vllm/v1/mixed_precision_recovery/scoring.py
+  added DigestScoringBackend protocol
+  added TorchQuestScorer
+  added DigestScoreResult
+  exposed per_query_head_scores and per_kv_head_scores
+  kept estimate_digest_scores(...) as a legacy block-score wrapper
+
+vllm/v1/mixed_precision_recovery/sidecar.py
+  resolves configured scorer once in RecoverySidecar.__post_init__
+  creates configured digest kind in observe_kv_write
+  calls backend.estimate(...) in observe_query
+
+vllm/envs.py
+  registered VLLM_MPR_SCORING_BACKEND
+  registered VLLM_MPR_DIGEST_KIND
+  registered VLLM_MPR_SCORE_GRANULARITY
+```
+
+Default behavior:
+
+```text
+VLLM_MPR_SCORING_BACKEND=torch_quest
+VLLM_MPR_DIGEST_KIND=raw_minmax
+VLLM_MPR_SCORE_AGG=max
+VLLM_MPR_SCORE_GRANULARITY=kv_head
+```
+
+GQA policy implemented for the current Quest-style path:
+
+```text
+q_head -> kv_head mapping:
+  group_size = num_q_heads // num_kv_heads
+  kv_head = q_head // group_size
+
+score_agg=max:
+  per_kv_head_score = max over query heads in that KV group
+  block_score = max over KV groups
+
+This is the agreed conservative union policy for GQA in the current block-level
+top-k debug path.
+```
+
+Head-level score selection follow-up:
+
+```text
+Added VLLM_MPR_SCORE_GRANULARITY=block|kv_head|query_head.
+
+block:
+  Existing behavior. topk_block_ids/topk_scores are computed from block_scores:
+    [num_blocks]
+
+kv_head:
+  Keeps the existing block aggregate top-k fields for backward compatibility.
+  Adds topk_block_ids_by_head/topk_scores_by_head from per_kv_head_scores:
+    [num_blocks, num_kv_heads]
+
+query_head:
+  Keeps the existing block aggregate top-k fields for backward compatibility.
+  Adds topk_block_ids_by_head/topk_scores_by_head from per_query_head_scores:
+    [num_blocks, num_q_heads]
+
+The default Quest-style head-level smoke is now:
+  VLLM_MPR_DIGEST_KIND=raw_minmax
+  VLLM_MPR_SCORE_GRANULARITY=kv_head
+  VLLM_MPR_SCORE_AGG=max
+```
+
+Default-policy update:
+
+```text
+The project default moved from ArkVale tightened digest + block score output to:
+  Quest-style raw_minmax digest
+  head-level output at KV-head granularity
+
+For MHA, num_q_heads == num_kv_heads, so kv_head granularity is equivalent to
+attention-head granularity. For GQA/MQA, kv_head granularity uses the
+conservative max/union over query heads in each KV group.
+
+ArkVale tightened digest and block-level scoring remain available via:
+  VLLM_MPR_DIGEST_KIND=arkvale
+  VLLM_MPR_SCORE_GRANULARITY=block
+```
+
+Debug JSONL additions:
+
+```text
+digest_kind
+scoring_backend
+num_q_heads
+num_kv_heads
+gqa_group_size
+score_granularity
+num_score_heads
+head_score_count
+topk_block_ids_by_head
+topk_scores_by_head
+```
+
+Validator/test updates:
+
+```text
+scripts/mpr_validate_debug_jsonl.py accepts and validates optional modular
+scoring fields while preserving older JSONL compatibility.
+
+tests/v1/mixed_precision_recovery/test_digest.py covers raw_minmax digest.
+tests/v1/mixed_precision_recovery/test_scoring.py covers structured scorer
+metadata and conservative GQA max aggregation.
+tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py covers the
+expanded score event schema.
+```
+
+Local validation:
+
+```text
+python -m py_compile passed for selected MPR source/test/validator files.
+git diff --check passed.
+direct importlib smoke for digest.py and scoring.py passed.
+```
+
+Local pytest status:
+
+```text
+Full pytest is blocked in the local base environment before MPR tests run:
+  tests/conftest.py imports transformers/sklearn/scipy
+  local NumPy is 2.3.5
+  installed SciPy/sklearn extension was built against NumPy 1.x
+
+Running with parent conftest disabled avoids that issue, but this base
+environment is missing cbor2, which vLLM imports through vllm.config.
+
+The target vLLM environment should run the focused MPR pytest suite.
+```
+
+### Step 1.7 Quest Estimate Kernel Detailed Analysis
+
+Created detailed Quest estimate kernel report:
+
+```text
+/home/han/KV_cache_quant/proposed_method_develop/vllm/MPR_implementation_plan/milestone_1_step_1_7_quest_estimate_kernel_analysis_report.md
+```
+
+Key conclusion:
+
+```text
+Quest's exposed Python/C++ wrapper is not directly reusable for MPR because it
+is batch-size-1, assumes q_heads == metadata_heads, and depends on Quest's own
+InferenceController/KvCache metadata cache.
+
+Quest's underlying estimate kernel design is a strong fit for the current MPR
+default because it computes raw_minmax page scores per query head and its lower
+level dispatch is GQA-shaped.
+```
+
+Recommended adapter direction:
+
+```text
+Implement estimate-only CUDA backend first.
+Pack MPR raw_minmax digests into Quest-style metadata pages:
+  [metadata_pages, 2, page_size, num_kv_heads, head_dim]
+
+Expose or modify a binding that keeps num_q_heads and num_kv_heads separate.
+Return per-query-head scores from CUDA.
+Reuse current Python aggregation for:
+  per_query_head_scores -> per_kv_head_scores -> topk_block_ids_by_head
+
+Defer kernel-side KV-head max aggregation and Quest topk_filtering reuse until
+after PyTorch-vs-CUDA score parity is established.
+```
+
+### Step 1.7 Quest-Style Candidate Packing Implementation
+
+Implemented the pre-CUDA adapter layer for Quest-style estimate integration.
+
+Config addition:
+
+```text
+VLLM_MPR_RECENT_TOKENS
+  default: 64
+  meaning: recent token window excluded from score/top-k candidates and kept
+  protected by policy
+```
+
+Sidecar candidate selection now uses current-request logical block order when
+`block_table` and `seq_lens` are available:
+
+```text
+valid_block_ids:
+  block_table row up to ceil(seq_len / block_size)
+
+finalized_block_ids:
+  block_table row up to floor(seq_len / block_size)
+
+protected_tail_entries:
+  ceil(recent_tokens / block_size)
+
+protected_block_ids:
+  tail of valid_block_ids
+
+score_candidate_block_ids:
+  finalized_block_ids excluding protected_block_ids
+```
+
+This means scoring is no longer based on sorted physical block ids when current
+request block metadata is available. It preserves the request's logical block
+order and makes the recent-token protection policy explicit.
+
+Added Quest-compatible metadata packer:
+
+```text
+vllm/v1/mixed_precision_recovery/quest_packing.py
+
+pack_quest_metadata_cache(...)
+  input:
+    digest_min/max [num_candidates, num_kv_heads, head_dim]
+    metadata_page_size
+    entry_block_ids
+
+  output:
+    metadata_data [num_metadata_pages, 2, page_size, num_kv_heads, head_dim]
+    metadata_indices int32 [num_metadata_pages]
+    metadata_indptr int32 [2]
+    metadata_last_page_len
+    metadata_last_page_idx
+    entry_block_ids
+```
+
+The packer appends one guard metadata entry by default. This matches the current
+Quest estimate kernel behavior, which subtracts/excludes the last logical
+metadata entry. With the guard entry, all real MPR score candidates remain
+visible to the unmodified Quest estimate kernel.
+
+Important caveat:
+
+```text
+The guard entry is an explicit Quest-kernel compatibility shim, not a general
+MPR policy decision.
+
+MPR recent-token protection is handled before packing through:
+  score_candidate_block_ids = finalized blocks excluding protected tail blocks
+
+The extra guard exists only because the current Quest estimate kernel always
+drops the final logical metadata entry. If the MPR estimate binding later
+accepts an explicit score-entry count or exclusion count, this guard should be
+removed and the exact candidate length should be passed to the kernel instead.
+```
+
+Debug JSONL additions:
+
+```text
+recent_tokens
+protected_tail_entries
+protected_block_ids
+score_candidate_block_ids
+```
+
+The validator now treats `score_candidate_block_ids` as the strict comparison
+target when present. This allows strict validation to pass when recent protected
+blocks are intentionally excluded from scoring.
+
+Validation:
+
+```text
+python -m py_compile passed for updated MPR source/test/validator files.
+git diff --check passed.
+quest_packing importlib smoke passed.
+
+Focused pytest is still blocked in the local base environment before tests run:
+  tests/conftest.py imports transformers/sklearn/scipy
+  local NumPy is 2.3.5
+  installed SciPy/sklearn extension was built against NumPy 1.x
+```
+
+### Step 1.7 Quest CUDA Backend Binding Surface
+
+Implemented the first binding surface for the Quest CUDA scoring backend.
+
+Python backend:
+
+```text
+QuestCudaScorer
+  backend name: quest_cuda
+
+Flow:
+  validate query/digest shapes
+  require GQA group_size in {1, 4, 8}
+  require CUDA query tensors
+  pack digest_min/max with pack_quest_metadata_cache(add_guard_entry=True)
+  allocate output [num_q_heads, num_score_entries]
+  call vllm._custom_ops.mpr_estimate_attn_score(...)
+  transpose output to [num_score_entries, num_q_heads]
+  reuse Python aggregate_query_head_scores(...)
+```
+
+Configuration:
+
+```text
+VLLM_MPR_SCORING_BACKEND=quest_cuda
+```
+
+is now accepted by `MPRConfig`.
+
+vLLM custom op surface:
+
+```text
+torch.ops._C.mpr_estimate_attn_score(
+    q,
+    out,
+    metadata_data,
+    metadata_indices,
+    metadata_indptr,
+    metadata_last_page_len,
+    metadata_last_page_idx,
+    layout,
+)
+```
+
+The current C++ registration is intentionally a stub:
+
+```text
+csrc/mpr/quest_estimate_stub.cpp
+```
+
+It fixes the op schema and build integration point but throws at runtime. The
+next implementation step is to replace this stub with the actual Quest estimate
+wrapper that separates:
+
+```text
+num_q_heads  = q.size(1)
+num_kv_heads = metadata_data.size(3)  # NHD
+```
+
+and calls the existing Quest lower-level estimate kernel with:
+
+```text
+paged_kv.num_heads = num_kv_heads
+num_qo_heads       = num_q_heads
+```
+
+Validation:
+
+```text
+python -m py_compile passed for updated Python files.
+git diff --check passed.
+```
+
+Open performance note:
+
+```text
+QuestCudaScorer.estimate currently calls pack_quest_metadata_cache(...) on every
+score event.
+
+This is correctness-first and keeps the backend stateless, but it may add
+noticeable overhead because each decode scoring call repacks compact
+metadata_data/indices/indptr from digest_min/digest_max.
+
+Do not optimize this before profiling. Candidate follow-ups after profiling:
+  cache packed metadata per layer/request candidate set
+  update packed metadata incrementally when new digest blocks arrive
+  keep a persistent Quest-style paged digest cache instead of per-call packing
 ```

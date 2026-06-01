@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -20,7 +21,10 @@ from vllm.v1.mixed_precision_recovery.digest import (
     KeyBlockDigest,
     summarize_key_block,
 )
-from vllm.v1.mixed_precision_recovery.scoring import estimate_digest_scores
+from vllm.v1.mixed_precision_recovery.scoring import (
+    DigestScoringBackend,
+    get_digest_scoring_backend,
+)
 
 logger = init_logger(__name__)
 
@@ -35,6 +39,7 @@ class BlockDigest:
         valid_token_count: Number of token slots summarized. For Step 1.3 this
             equals ``block_size`` because only full-block digests are created.
         block_size: Number of token slots in the physical KV block.
+        digest_kind: Digest construction policy used for this entry.
         layer_event_idx: Per-layer KV-write event index that first completed
             the block. ``-1`` means the digest was created while the event was
             outside the debug dump window.
@@ -45,6 +50,27 @@ class BlockDigest:
     valid_token_count: int
     block_size: int
     layer_event_idx: int
+    digest_kind: str = "arkvale"
+
+
+@dataclass(frozen=True)
+class RequestBlockContext:
+    """Current-request block context used for score candidate selection."""
+
+    num_reqs: int | None
+    max_query_len: int | None
+    num_actual_tokens: int | None
+    seq_lens: list[int] | None
+    block_size: int | None
+    block_table_shape: list[int] | None
+    block_table_row: list[int]
+    valid_block_ids: list[int]
+    finalized_block_ids: list[int]
+    recent_tokens: int
+    protected_tail_entries: int
+    protected_block_ids: list[int]
+    score_candidate_block_ids: list[int]
+    has_block_table_context: bool
 
 
 @dataclass
@@ -69,17 +95,26 @@ class RecoverySidecar:
     # decode queries from different requests in the same layer buffer.
     _query_windows: dict[str, deque[torch.Tensor]] = field(default_factory=dict)
     _debug_writer: MPRDebugWriter = field(init=False)
+    _scoring_backend: DigestScoringBackend = field(init=False)
 
     def __post_init__(self) -> None:
         """Initialize optional debug output and emit the init event."""
         self._debug_writer = MPRDebugWriter(self.config)
+        self._scoring_backend = get_digest_scoring_backend(
+            self.config.scoring_backend,
+        )
         if self.config.enabled:
             logger.info(
                 "MPR sidecar enabled: topk=%d, window_size=%d, "
-                "score_agg=%s, debug_dir=%s",
+                "recent_tokens=%d, score_agg=%s, scoring_backend=%s, "
+                "digest_kind=%s, score_granularity=%s, debug_dir=%s",
                 self.config.topk,
                 self.config.window_size,
+                self.config.recent_tokens,
                 self.config.score_agg,
+                self.config.scoring_backend,
+                self.config.digest_kind,
+                self.config.score_granularity,
                 self.config.debug_dir,
             )
             self._record("init")
@@ -204,6 +239,7 @@ class RecoverySidecar:
                     self._digest_cache.get(layer_name, {})
                 ),
                 total_digest_blocks=self._num_digest_blocks(),
+                digest_kind=self.config.digest_kind,
             )
 
     def observe_query(
@@ -316,17 +352,33 @@ class RecoverySidecar:
         # VLLM_MPR_WINDOW_SIZE. Shape: [num_q_heads, head_dim].
         window_query = torch.stack(tuple(window), dim=0).mean(dim=0)
 
+        block_size = self._block_size_for_layer(layer_name)
+        request_context = self._request_block_context(
+            attn_metadata=attn_metadata,
+            block_size=block_size,
+        )
+        candidate_block_ids = (
+            request_context.score_candidate_block_ids
+            if request_context.has_block_table_context
+            else None
+        )
         physical_block_ids, digest_min, digest_max = self._pack_layer_digests(
             layer_name,
             device=window_query.device,
             dtype=window_query.dtype,
+            candidate_block_ids=candidate_block_ids,
         )
         if not physical_block_ids:
+            skip_reason = (
+                "no_score_candidate_blocks"
+                if request_context.has_block_table_context
+                else "no_digest_blocks"
+            )
             self._record_score_skip(
                 should_record,
                 layer_name,
                 layer_event_idx,
-                "no_digest_blocks",
+                skip_reason,
                 query=query,
                 attn_metadata=attn_metadata,
                 window_query=window_query,
@@ -334,34 +386,28 @@ class RecoverySidecar:
             )
             return
 
-        scores = estimate_digest_scores(
+        score_result = self._scoring_backend.estimate(
             query_window=window_query,
             digest_min=digest_min,
             digest_max=digest_max,
             score_agg=self.config.score_agg,
+            metadata_page_size=block_size,
         )
+        scores = score_result.block_scores
         topk = min(self.config.topk, int(scores.numel()))
-        if topk > 0:
-            topk_scores, topk_indices = torch.topk(scores, k=topk)
-            topk_index_values = topk_indices.detach().cpu().tolist()
-            topk_block_ids = [
-                physical_block_ids[int(index)] for index in topk_index_values
-            ]
-            topk_score_values = [
-                float(score)
-                for score in topk_scores.detach().to(torch.float32).cpu().tolist()
-            ]
-        else:
-            topk_block_ids = []
-            topk_score_values = []
-
-        block_size = self._block_size_for_layer_blocks(
-            layer_name,
-            physical_block_ids,
+        topk_block_ids, topk_score_values = self._topk_block_scores(
+            scores=scores,
+            physical_block_ids=physical_block_ids,
+            topk=topk,
         )
+        head_debug = self._head_score_debug_fields(
+            score_result=score_result,
+            physical_block_ids=physical_block_ids,
+            topk=topk,
+        )
+
         score_block_debug = self._score_block_debug_fields(
-            attn_metadata=attn_metadata,
-            block_size=block_size,
+            request_context=request_context,
             observed_digest_block_ids=physical_block_ids,
         )
 
@@ -376,9 +422,16 @@ class RecoverySidecar:
                 num_digest_blocks=len(physical_block_ids),
                 score_count=int(scores.numel()),
                 score_agg=self.config.score_agg,
+                scoring_backend=score_result.scoring_backend,
+                digest_kind=self.config.digest_kind,
+                num_q_heads=score_result.num_q_heads,
+                num_kv_heads=score_result.num_kv_heads,
+                gqa_group_size=score_result.group_size,
+                score_granularity=self.config.score_granularity,
                 topk=topk,
                 topk_block_ids=topk_block_ids,
                 topk_scores=topk_score_values,
+                **head_debug,
                 **score_block_debug,
             )
 
@@ -409,32 +462,102 @@ class RecoverySidecar:
             window_query_len=window_query_len,
             num_digest_blocks=len(self._digest_cache.get(layer_name, {})),
             score_agg=self.config.score_agg,
+            scoring_backend=self.config.scoring_backend,
+            digest_kind=self.config.digest_kind,
+            score_granularity=self.config.score_granularity,
         )
+
+    def _head_score_debug_fields(
+        self,
+        *,
+        score_result: Any,
+        physical_block_ids: list[int],
+        topk: int,
+    ) -> dict[str, Any]:
+        """Build optional head-level top-k fields for score debug records."""
+        score_granularity = self.config.score_granularity
+        if score_granularity == "block":
+            return {}
+        if score_granularity == "kv_head":
+            head_scores = score_result.per_kv_head_scores
+        elif score_granularity == "query_head":
+            head_scores = score_result.per_query_head_scores
+        else:
+            raise ValueError(
+                "MPR score_granularity must be 'block', 'kv_head', or "
+                f"'query_head', got {score_granularity!r}."
+            )
+
+        topk_block_ids_by_head, topk_scores_by_head = self._topk_head_scores(
+            scores_by_block_head=head_scores,
+            physical_block_ids=physical_block_ids,
+            topk=topk,
+        )
+        return {
+            "num_score_heads": int(head_scores.shape[1]),
+            "head_score_count": int(head_scores.numel()),
+            "topk_block_ids_by_head": topk_block_ids_by_head,
+            "topk_scores_by_head": topk_scores_by_head,
+        }
 
     def _score_block_debug_fields(
         self,
         *,
-        attn_metadata: Any,
-        block_size: int | None,
+        request_context: RequestBlockContext,
         observed_digest_block_ids: list[int],
     ) -> dict[str, Any]:
         """Build request/block metadata for score debug records.
 
         Args:
-            attn_metadata: FlashAttention metadata for the current attention
-                call. Step 1.5 reads ``seq_lens`` and ``block_table`` only for
-                debug inspection.
-            block_size: vLLM physical KV block size, or ``None`` if no layer
-                digest exposes it yet.
+            request_context: Parsed FlashAttention request/block context.
             observed_digest_block_ids: Physical block IDs that were packed and
                 scored for this layer. Shape-equivalent: ``[num_digest_blocks]``.
 
         Returns:
             JSON-serializable fields describing the single request's block table
             row, the finalized blocks that should have digests, and any missing
-            or extra digest block IDs. Missing/extra fields are diagnostics only;
-            Step 1.4 scoring still scores every cached layer digest.
+            or extra digest block IDs. Missing/extra fields are diagnostics for
+            the current score-candidate set after recent-tail protection.
         """
+        observed_set = set(observed_digest_block_ids)
+        score_candidate_set = set(request_context.score_candidate_block_ids)
+        missing_digest_blocks = (
+            sorted(score_candidate_set - observed_set)
+            if request_context.has_block_table_context
+            else []
+        )
+        extra_digest_blocks = (
+            sorted(observed_set - score_candidate_set)
+            if request_context.has_block_table_context
+            else []
+        )
+
+        return {
+            "num_reqs": request_context.num_reqs,
+            "max_query_len": request_context.max_query_len,
+            "num_actual_tokens": request_context.num_actual_tokens,
+            "seq_lens": request_context.seq_lens,
+            "block_size": request_context.block_size,
+            "block_table_shape": request_context.block_table_shape,
+            "block_table_row": request_context.block_table_row,
+            "valid_block_ids": request_context.valid_block_ids,
+            "finalized_block_ids": request_context.finalized_block_ids,
+            "recent_tokens": request_context.recent_tokens,
+            "protected_tail_entries": request_context.protected_tail_entries,
+            "protected_block_ids": request_context.protected_block_ids,
+            "score_candidate_block_ids": request_context.score_candidate_block_ids,
+            "observed_digest_block_ids": list(observed_digest_block_ids),
+            "missing_digest_blocks": missing_digest_blocks,
+            "extra_digest_blocks": extra_digest_blocks,
+        }
+
+    def _request_block_context(
+        self,
+        *,
+        attn_metadata: Any,
+        block_size: int | None,
+    ) -> RequestBlockContext:
+        """Parse the single-request block table and select score candidates."""
         seq_lens = self._tensor_to_int_list(getattr(attn_metadata, "seq_lens", None))
         block_table = getattr(attn_metadata, "block_table", None)
         if block_table is None:
@@ -456,6 +579,9 @@ class RecoverySidecar:
         seq_len = seq_lens[0] if seq_lens else None
         valid_block_ids: list[int] = []
         finalized_block_ids: list[int] = []
+        protected_tail_entries = 0
+        protected_block_ids: list[int] = []
+        score_candidate_block_ids: list[int] = []
         has_block_table_context = (
             block_size is not None
             and seq_len is not None
@@ -467,31 +593,42 @@ class RecoverySidecar:
             finalized_block_count = seq_len // block_size
             valid_block_ids = block_table_row[:valid_block_count]
             finalized_block_ids = block_table_row[:finalized_block_count]
+            if self.config.recent_tokens > 0:
+                protected_tail_entries = min(
+                    len(valid_block_ids),
+                    math.ceil(self.config.recent_tokens / block_size),
+                )
+                protected_block_ids = valid_block_ids[-protected_tail_entries:]
+            protected_set = set(protected_block_ids)
+            score_candidate_block_ids = [
+                block_id
+                for block_id in finalized_block_ids
+                if block_id not in protected_set
+            ]
 
-        observed_set = set(observed_digest_block_ids)
-        valid_set = set(valid_block_ids)
-        finalized_set = set(finalized_block_ids)
-        missing_digest_blocks = (
-            sorted(finalized_set - observed_set) if has_block_table_context else []
-        )
-        extra_digest_blocks = (
-            sorted(observed_set - valid_set) if has_block_table_context else []
+        return RequestBlockContext(
+            num_reqs=num_reqs,
+            max_query_len=getattr(attn_metadata, "max_query_len", None),
+            num_actual_tokens=getattr(attn_metadata, "num_actual_tokens", None),
+            seq_lens=seq_lens,
+            block_size=block_size,
+            block_table_shape=block_table_shape,
+            block_table_row=block_table_row,
+            valid_block_ids=valid_block_ids,
+            finalized_block_ids=finalized_block_ids,
+            recent_tokens=self.config.recent_tokens,
+            protected_tail_entries=protected_tail_entries,
+            protected_block_ids=protected_block_ids,
+            score_candidate_block_ids=score_candidate_block_ids,
+            has_block_table_context=has_block_table_context,
         )
 
-        return {
-            "num_reqs": num_reqs,
-            "max_query_len": getattr(attn_metadata, "max_query_len", None),
-            "num_actual_tokens": getattr(attn_metadata, "num_actual_tokens", None),
-            "seq_lens": seq_lens,
-            "block_size": block_size,
-            "block_table_shape": block_table_shape,
-            "block_table_row": block_table_row,
-            "valid_block_ids": valid_block_ids,
-            "finalized_block_ids": finalized_block_ids,
-            "observed_digest_block_ids": list(observed_digest_block_ids),
-            "missing_digest_blocks": missing_digest_blocks,
-            "extra_digest_blocks": extra_digest_blocks,
-        }
+    def _block_size_for_layer(self, layer_name: str) -> int | None:
+        """Return the cached block size for a layer, if any digest exists."""
+        layer_digests = self._digest_cache.get(layer_name, {})
+        for digest in layer_digests.values():
+            return int(digest.block_size)
+        return None
 
     def _block_size_for_layer_blocks(
         self,
@@ -505,6 +642,55 @@ class RecoverySidecar:
             if digest is not None:
                 return int(digest.block_size)
         return None
+
+    @staticmethod
+    def _topk_block_scores(
+        *,
+        scores: torch.Tensor,
+        physical_block_ids: list[int],
+        topk: int,
+    ) -> tuple[list[int], list[float]]:
+        """Map a block score vector's top-k indices to physical block IDs."""
+        if topk <= 0:
+            return [], []
+        topk_scores, topk_indices = torch.topk(scores, k=topk)
+        topk_index_values = topk_indices.detach().cpu().tolist()
+        topk_block_ids = [physical_block_ids[int(index)] for index in topk_index_values]
+        topk_score_values = [
+            float(score)
+            for score in topk_scores.detach().to(torch.float32).cpu().tolist()
+        ]
+        return topk_block_ids, topk_score_values
+
+    @classmethod
+    def _topk_head_scores(
+        cls,
+        *,
+        scores_by_block_head: torch.Tensor,
+        physical_block_ids: list[int],
+        topk: int,
+    ) -> tuple[list[list[int]], list[list[float]]]:
+        """Map per-head score columns to head-local top-k physical block IDs."""
+        if scores_by_block_head.ndim != 2:
+            raise ValueError(
+                "MPR head top-k expects scores_by_block_head shaped "
+                f"[num_blocks, num_heads], got {tuple(scores_by_block_head.shape)}."
+            )
+        num_heads = int(scores_by_block_head.shape[1])
+        if topk <= 0:
+            return [[] for _ in range(num_heads)], [[] for _ in range(num_heads)]
+
+        topk_block_ids_by_head: list[list[int]] = []
+        topk_scores_by_head: list[list[float]] = []
+        for head_idx in range(num_heads):
+            head_block_ids, head_scores = cls._topk_block_scores(
+                scores=scores_by_block_head[:, head_idx],
+                physical_block_ids=physical_block_ids,
+                topk=topk,
+            )
+            topk_block_ids_by_head.append(head_block_ids)
+            topk_scores_by_head.append(head_scores)
+        return topk_block_ids_by_head, topk_scores_by_head
 
     def snapshot_stats(self) -> dict[str, int]:
         """Return a copy of sidecar event counters for smoke tests."""
@@ -642,7 +828,10 @@ class RecoverySidecar:
             if len(offsets) == block_size and block_id not in layer_digests:
                 # key_cache[block_id]: one full key block.
                 # Shape: [block_size, num_kv_heads, head_dim].
-                digest = summarize_key_block(key_cache[block_id])
+                digest = summarize_key_block(
+                    key_cache[block_id],
+                    digest_kind=self.config.digest_kind,
+                )
                 layer_digests[block_id] = self._to_block_digest(
                     digest,
                     layer_event_idx,
@@ -658,6 +847,7 @@ class RecoverySidecar:
                         digest_max_shape=self._shape_of(digest.digest_max),
                         valid_token_count=digest.valid_token_count,
                         block_size=digest.block_size,
+                        digest_kind=digest.digest_kind,
                         num_digest_blocks_for_layer=len(layer_digests),
                         total_digest_blocks=self._num_digest_blocks(),
                     )
@@ -670,6 +860,7 @@ class RecoverySidecar:
         *,
         device: torch.device,
         dtype: torch.dtype,
+        candidate_block_ids: list[int] | None = None,
     ) -> tuple[list[int], torch.Tensor, torch.Tensor]:
         """Pack cached layer digests into tensor inputs for scoring.
 
@@ -677,6 +868,9 @@ class RecoverySidecar:
             layer_name: vLLM attention layer name.
             device: Target device for the packed digest tensors.
             dtype: Target dtype for the packed digest tensors.
+            candidate_block_ids: Optional current-request block ids to score, in
+                logical order. Missing digests are skipped and reported through
+                score debug metadata.
 
         Returns:
             A tuple ``(physical_block_ids, digest_min, digest_max)`` where the
@@ -687,7 +881,18 @@ class RecoverySidecar:
             empty = torch.empty(0, device=device, dtype=dtype)
             return [], empty, empty
 
-        physical_block_ids = sorted(layer_digests)
+        if candidate_block_ids is None:
+            physical_block_ids = sorted(layer_digests)
+        else:
+            physical_block_ids = [
+                block_id
+                for block_id in candidate_block_ids
+                if block_id in layer_digests
+            ]
+            if not physical_block_ids:
+                empty = torch.empty(0, device=device, dtype=dtype)
+                return [], empty, empty
+
         digest_min = torch.stack(
             [
                 layer_digests[block_id].digest_min.to(device=device, dtype=dtype)
@@ -726,6 +931,7 @@ class RecoverySidecar:
             valid_token_count=digest.valid_token_count,
             block_size=digest.block_size,
             layer_event_idx=-1 if layer_event_idx is None else layer_event_idx,
+            digest_kind=digest.digest_kind,
         )
 
     def _num_digest_blocks(self) -> int:
