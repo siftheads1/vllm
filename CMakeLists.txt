@@ -311,7 +311,7 @@ set(VLLM_EXT_SRC
   "csrc/attention/paged_attention_v1.cu"
   "csrc/attention/paged_attention_v2.cu"
   "csrc/attention/merge_attn_states.cu"
-  "csrc/mpr/quest_estimate_stub.cpp"
+  "csrc/mpr/quest_estimate.cu"
   "csrc/sampler.cu"
   "csrc/topk.cu"
   "csrc/cuda_view.cu"
@@ -608,8 +608,10 @@ define_extension_target(
   SOURCES ${VLLM_EXT_SRC}
   COMPILE_FLAGS ${VLLM_GPU_FLAGS}
   ARCHITECTURES ${VLLM_GPU_ARCHES}
-  INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR}
-  INCLUDE_DIRECTORIES ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
+  INCLUDE_DIRECTORIES
+    ${CUTLASS_INCLUDE_DIR}
+    ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
+    csrc/third_party/flashinfer/include
   USE_SABI 3
   WITH_SOABI)
 

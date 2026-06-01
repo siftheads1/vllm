@@ -11,7 +11,9 @@ from vllm.v1.mixed_precision_recovery.quest_packing import (
     pack_quest_metadata_cache,
 )
 from vllm.v1.mixed_precision_recovery.scoring import (
+    QUEST_NHD_LAYOUT,
     QuestCudaScorer,
+    TorchQuestScorer,
     aggregate_query_head_scores,
     estimate_digest_score_result,
     estimate_digest_scores,
@@ -103,6 +105,10 @@ def test_mpr_config_accepts_quest_cuda_backend(monkeypatch):
 
     assert config.scoring_backend == "quest_cuda"
     assert isinstance(get_digest_scoring_backend(config.scoring_backend), QuestCudaScorer)
+
+
+def test_quest_cuda_uses_flashinfer_nhd_layout_value():
+    assert QUEST_NHD_LAYOUT == 0
 
 
 def test_estimate_digest_score_result_exposes_gqa_metadata():
@@ -390,6 +396,48 @@ def test_quest_cuda_backend_rejects_unsupported_gqa_group_size():
             score_agg="max",
             metadata_page_size=2,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_quest_cuda_backend_matches_torch_reference_when_op_is_built():
+    torch.manual_seed(0)
+    query_window = torch.randn(4, 64, device="cuda", dtype=torch.float16)
+    digest_center = torch.randn(3, 1, 64, device="cuda", dtype=torch.float16)
+    digest_radius = torch.rand(3, 1, 64, device="cuda", dtype=torch.float16)
+    digest_min = digest_center - digest_radius
+    digest_max = digest_center + digest_radius
+
+    torch_result = TorchQuestScorer().estimate(
+        query_window=query_window,
+        digest_min=digest_min,
+        digest_max=digest_max,
+        score_agg="max",
+        metadata_page_size=2,
+    )
+    try:
+        cuda_result = QuestCudaScorer().estimate(
+            query_window=query_window,
+            digest_min=digest_min,
+            digest_max=digest_max,
+            score_agg="max",
+            metadata_page_size=2,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        if (
+            "custom op is not registered" in message
+            or "placeholder" in message
+            or "could not import vLLM custom ops" in message
+        ):
+            pytest.skip(f"quest_cuda custom op is not built: {message}")
+        raise
+
+    torch.testing.assert_close(
+        cuda_result.per_query_head_scores,
+        torch_result.per_query_head_scores,
+        atol=2e-2,
+        rtol=2e-2,
+    )
 
 
 def test_estimate_digest_scores_rejects_invalid_head_grouping():

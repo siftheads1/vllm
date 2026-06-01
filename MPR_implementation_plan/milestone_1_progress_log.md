@@ -1472,3 +1472,209 @@ Do not optimize this before profiling. Candidate follow-ups after profiling:
   update packed metadata incrementally when new digest blocks arrive
   keep a persistent Quest-style paged digest cache instead of per-call packing
 ```
+
+### Step 1.7 Quest Kernel Dependency Slicing Analysis
+
+Created Quest kernel dependency slicing report:
+
+```text
+/home/han/KV_cache_quant/proposed_method_develop/vllm/MPR_implementation_plan/milestone_1_step_1_7_quest_kernel_dependency_slicing_report.md
+```
+
+Key conclusion:
+
+```text
+Use an estimate-only vendored subset rather than copying Quest's full
+decode_attn.cuh/decode_page.cuh stack directly.
+
+The required score path is:
+  compute_max_possible
+  MaxPossibleSampleWithPagedKVCacheKernel
+  MaxPossibleSampleWithPagedKVCache launcher
+  minimal PageStorage/paged_kv_t accessors
+  small FlashInfer compatibility subset
+  MPR-facing torch binding
+
+The full Quest decode file pulls in unrelated full-attention dependencies such
+as cascade/state/RoPE/partition decode code, so it is a larger and riskier
+compile surface than needed for Step 1.7.
+```
+
+Recommended local file shape:
+
+```text
+csrc/mpr/quest_estimate.cu
+csrc/mpr/quest_estimate_kernel.cuh
+csrc/mpr/quest_paged_kv.cuh
+csrc/mpr/flashinfer_compat/layout.cuh
+csrc/mpr/flashinfer_compat/utils.cuh
+csrc/mpr/flashinfer_compat/math.cuh
+csrc/mpr/flashinfer_compat/cp_async.cuh
+csrc/mpr/flashinfer_compat/vec_dtypes.cuh
+```
+
+Binding direction:
+
+```text
+Keep the existing mpr_estimate_attn_score op schema for the first PoC.
+Replace csrc/mpr/quest_estimate_stub.cpp with csrc/mpr/quest_estimate.cu.
+Derive num_q_heads from q.size(1).
+Derive num_kv_heads from metadata_data.size(3) for NHD.
+Call the lower-level Quest estimate launcher with:
+  paged_kv.num_heads = num_kv_heads
+  num_qo_heads = num_q_heads
+Return per-query-head scores and keep Python-side KV-head aggregation/top-k.
+```
+
+Important pre-kernel fix found during analysis:
+
+```text
+Quest/FlashInfer TensorLayout.NHD == 0
+Quest/FlashInfer TensorLayout.HND == 1
+
+Current MPR Python code still has:
+  QUEST_NHD_LAYOUT = 1
+
+The current stub does not use layout, so tests did not catch this. It must be
+changed to 0 before the real CUDA kernel is connected.
+```
+
+First CUDA PoC limits:
+
+```text
+single-request compact metadata_indptr [0, num_metadata_pages]
+NHD metadata layout only
+PageStorage::kIndices only
+rotary_mode = none
+partition_kv = false
+fp16 first
+GQA group_size in {1, 4, 8}
+head_dim in {64, 128, 256}
+```
+
+Validation plan:
+
+```text
+Build _C with quest_estimate.cu.
+Add a CUDA parity test comparing QuestCudaScorer output to TorchQuestScorer
+per_query_head_scores.
+Cover group_size 1/4/8 and output-length/shape/layout errors.
+Then run focused MPR pytest and one short generation smoke with:
+  VLLM_MPR_ENABLE=1
+  VLLM_MPR_SCORING_BACKEND=quest_cuda
+```
+
+### Step 1.7 Quest CUDA Estimate Kernel Implementation
+
+Implemented the first estimate-only Quest CUDA backend instead of the previous
+runtime stub.
+
+Third-party FlashInfer header snapshot:
+
+```text
+csrc/third_party/flashinfer/README.md
+csrc/third_party/flashinfer/include/flashinfer/layout.cuh
+csrc/third_party/flashinfer/include/flashinfer/utils.cuh
+csrc/third_party/flashinfer/include/flashinfer/math.cuh
+csrc/third_party/flashinfer/include/flashinfer/cp_async.cuh
+csrc/third_party/flashinfer/include/flashinfer/vec_dtypes.cuh
+```
+
+These headers are copied from Quest's FlashInfer third-party snapshot and keep
+their original Apache-2.0 license headers.
+
+MPR-local derived Quest estimate files:
+
+```text
+csrc/mpr/quest_paged_kv.cuh
+csrc/mpr/quest_estimate_kernel.cuh
+csrc/mpr/quest_estimate.cu
+```
+
+Implementation shape:
+
+```text
+quest_paged_kv.cuh
+  minimal PageStorage::kIndices paged digest accessor
+  treats metadata_data plane 0 as digest_max
+  treats metadata_data plane 1 as digest_min
+
+quest_estimate_kernel.cuh
+  estimate-only compute_max_possible path
+  MaxPossibleSampleWithPagedKVCacheKernel
+  MaxPossibleSampleWithPagedKVCache launcher
+  keeps Quest's final-entry exclusion behavior
+
+quest_estimate.cu
+  validates the existing mpr_estimate_attn_score op inputs
+  supports NHD metadata layout only for the first PoC
+  supports batch size 1
+  supports fp16 only
+  supports GQA group_size in {1, 4, 8}
+  supports head_dim in {64, 128, 256}
+```
+
+Build integration:
+
+```text
+CMake now builds csrc/mpr/quest_estimate.cu instead of:
+  csrc/mpr/quest_estimate_stub.cpp
+
+The _C target include path now includes:
+  csrc/third_party/flashinfer/include
+```
+
+Python-side layout fix:
+
+```text
+QUEST_NHD_LAYOUT changed from 1 to 0.
+
+Quest/FlashInfer layout enum:
+  NHD = 0
+  HND = 1
+```
+
+Tests added:
+
+```text
+test_quest_cuda_uses_flashinfer_nhd_layout_value
+
+test_quest_cuda_backend_matches_torch_reference_when_op_is_built
+  CUDA-gated
+  skips if the local _C op has not been rebuilt yet
+  compares quest_cuda per_query_head_scores to TorchQuestScorer
+```
+
+Validation completed:
+
+```text
+git diff --check
+  passed
+
+python -m py_compile vllm/v1/mixed_precision_recovery/scoring.py \
+  tests/v1/mixed_precision_recovery/test_scoring.py
+  passed
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_scoring.py
+  19 passed, 1 skipped
+
+/usr/local/cuda-12.8/bin/nvcc -std=c++20 --expt-relaxed-constexpr \
+  -gencode arch=compute_80,code=sm_80 \
+  -Icsrc -Icsrc/third_party/flashinfer/include \
+  -I...torch includes... \
+  -c csrc/mpr/quest_estimate.cu -o /tmp/mpr_quest_estimate.o
+  passed
+```
+
+Validation limitations:
+
+```text
+The local execution environment reports torch.cuda.is_available() == False, so
+the CUDA runtime parity test was skipped.
+
+Full CMake configure/build was not completed because this checkout attempts to
+FetchContent external dependencies from GitHub. Local Cutlass and Triton
+sources avoided the first two downloads, but DeepGEMM still required network
+access and blocked configure in the restricted environment.
+```

@@ -16,7 +16,7 @@ from vllm.v1.mixed_precision_recovery.quest_packing import (
 
 
 QUEST_CUDA_SUPPORTED_GROUP_SIZES = frozenset({1, 4, 8})
-QUEST_NHD_LAYOUT = 1
+QUEST_NHD_LAYOUT = 0
 
 
 @dataclass(frozen=True)
