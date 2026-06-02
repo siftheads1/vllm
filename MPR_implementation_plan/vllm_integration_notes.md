@@ -334,3 +334,142 @@ The implementation should remain shallow and reversible: score-only, no output
 changes, no CPU layout commitment. If that path becomes too invasive because of
 compile/CUDA graph constraints, switch to InfiniGen for algorithmic prototyping
 while keeping this vLLM map for the later systems implementation.
+
+## Milestone 1 Implementation Status
+
+Milestone 1 has now implemented the intended score-only sidecar path in vLLM.
+The current implementation remains shallow and reversible: it observes vLLM
+metadata, builds digest/scoring side state, and emits debug records, but it does
+not modify attention output, KV cache contents, scheduling, CPU offload, or
+recovery behavior.
+
+Implemented module:
+
+```text
+vllm/v1/mixed_precision_recovery/
+  config.py
+  sidecar.py
+  digest.py
+  scoring.py
+  quest_packing.py
+  debug.py
+```
+
+Implemented hooks:
+
+```text
+unified_kv_cache_update(...)
+  observes slot_mapping, kv_cache, and block_size
+  creates per-layer/per-physical-block key digests when blocks become full
+
+unified_attention_with_output(...)
+  observes decode query and FlashAttention metadata
+  builds rolling window_query
+  scores finalized digest blocks
+  records debug JSONL
+```
+
+Current scoring implementation:
+
+```text
+default digest_kind       = raw_minmax
+default scoring_backend  = torch_quest
+available CUDA backend   = quest_cuda
+default score granularity = kv_head
+```
+
+The CUDA backend uses an estimate-only Quest kernel subset rather than ArkVale's
+exposed `estimate_scores` path. This is a deliberate Milestone 1 decision:
+Quest's raw min/max metadata and per-query-head estimate output match the
+current score-only sidecar more directly. ArkVale compatibility was analyzed
+and remains future work.
+
+## Quest Metadata Fast Path
+
+The initial Quest CUDA path showed that the estimate kernel itself was fast, but
+per-call metadata packing dominated backend latency. Milestone 1 therefore added
+a sidecar-owned persistent Quest metadata cache for `quest_cuda`:
+
+```text
+QuestMetadataStore
+  stores [num_pages, 2, page_size, num_kv_heads, head_dim]
+  appends finalized digest entries at digest creation time
+  keeps a zero guard entry because the Quest estimate kernel excludes the final
+  logical metadata entry
+
+QuestCudaScorer.estimate_packed(...)
+  scores directly from an existing PackedQuestDigestCache view
+```
+
+The sidecar uses this fast path when the current score candidates are a prefix
+of the append-only metadata store and falls back to compact packing otherwise.
+The tested single-request decode run reported:
+
+```text
+quest_packed_fast_path counts: Counter({True: 910})
+fallback_reason: None
+```
+
+Representative scorer microbench:
+
+```text
+torch_quest total:              ~0.071 ms / score call
+quest_cuda with packing:        ~0.163 ms / score call
+quest_cuda persistent metadata: ~0.068 ms / score call
+pack only:                      ~0.092 ms / call
+kernel only:                    ~0.012 ms / call
+```
+
+Interpretation:
+
+```text
+The Quest CUDA kernel path is viable for Milestone 1 scoring.
+The largest CUDA-side overhead was per-call metadata packing.
+The persistent metadata fast path removes that overhead for the tested prefix
+case, making quest_cuda roughly comparable to torch_quest.
+```
+
+## Milestone 2 Handoff
+
+Milestone 1's output is now sufficient for Milestone 2 planning. The useful
+handoff artifacts are:
+
+```text
+layer_name
+physical_block_id
+block_size
+score_candidate_block_ids
+observed_digest_block_ids
+block_scores
+per_kv_head_scores
+protected_recent_blocks
+num_kv_heads
+head_dim
+```
+
+Milestone 2 should focus on what Milestone 1 intentionally avoided:
+
+```text
+CPU fp16 backup layout
+physical block lifecycle and cleanup
+request/block ownership under reuse/preemption
+precision/recovery policy using per-KV-head scores
+materialization path for recovered KV before attention
+eventual CUDA Graph/eager compatibility validation
+```
+
+Known limitations to carry forward:
+
+```text
+quest_cuda is fp16-only for now
+multi-request query-window correctness is not solved
+preemption/reuse lifecycle cleanup is not implemented
+DCP/CP, speculative decoding, and sliding-window special handling are out of scope
+ArkVale-style scoring/backend remains future work
+```
+
+Detailed completion record:
+
+```text
+MPR_implementation_plan/milestone_1_results.md
+```

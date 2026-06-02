@@ -171,7 +171,51 @@ Mixed-Precision Recovery sidecar
 - 기존 offload path와 충돌하지 않는다
 - output sanity check를 통과한다
 
-### Milestone 4: Mixed-Precision Recovery
+### Milestone 4: Recovery Cleanup and Optimization
+
+목표:
+- Milestone 3의 fp16 recovery semantic skeleton을 유지하면서 hot-path overhead를 줄인다
+- validation-only fault injection과 production recovery path를 더 명확히 분리한다
+- 현재 환경에서 불필요한 debug/scoring/recovery 비용을 덜어낸다
+- mixed precision으로 확장하기 전에 recovery/backup path의 비용 구조를 측정 가능하게 만든다
+
+성공 기준:
+- M3 semantic smoke는 계속 통과한다
+- baseline 대비 decode overhead가 명확히 줄거나, 최소한 overhead breakdown이 분리된다
+- recover copy bytes, copy wall time, per-token recovered bytes를 smoke/benchmark에서 확인할 수 있다
+- Sidecar가 scoring, recovery, debug, fault-injection 책임을 지금보다 명확히 나눈다
+
+우선순위:
+
+```text
+1. Recovery materialization 최적화
+   - per-block Python loop 비용 측정
+   - threshold selection이 많은 block을 고를 때 batched copy/index_copy_ 검토
+   - pinned CPU memory / non_blocking copy / DMA-friendly layout 가능성 조사
+
+2. Scoring/recovery hot-path 비용 덜어내기
+   - debug용 tensor -> CPU/list 변환 최소화
+   - recovery enabled일 때 중복 score/debug work 제거
+   - smoke용 fault injection이 production entrypoint에 섞이지 않도록 정리
+
+3. Sidecar 구조 정리
+   - scoring context
+   - CPU backup lifecycle
+   - recovery materialization
+   - debug event emission
+   - validation-only mutation/fault injection
+   를 분리 가능한 경계로 재배치
+
+4. Measurement 정리
+   - MPR debug event 기반 recovered_bytes/recovery_copy_wall_ms
+   - latency benchmark에서 backup/scoring/recovery overhead 분리
+   - 필요 시 nsys/dmon 기반 PCIe traffic 관측 절차 문서화
+```
+
+Milestone 4는 mixed precision 기능 추가가 아니라, M3 skeleton을 실제 다음 단계로
+가져갈 수 있게 만드는 cleanup/optimization milestone이다.
+
+### Milestone 5: Mixed-Precision Recovery
 
 목표:
 - score를 precision tier로 매핑

@@ -4,6 +4,13 @@
 """Mixed-Precision Recovery sidecar scaffolding for vLLM v1."""
 
 from vllm.v1.mixed_precision_recovery.config import MPRConfig
+from vllm.v1.mixed_precision_recovery.cpu_backup import (
+    CPUBackupKey,
+    CPUBackupPutResult,
+    CPUBackupReleaseResult,
+    CPUBackupStats,
+    SemanticCPUBackupStore,
+)
 from vllm.v1.mixed_precision_recovery.digest import (
     ARKVALE_DIGEST_KIND,
     KeyBlockDigest,
@@ -12,7 +19,13 @@ from vllm.v1.mixed_precision_recovery.digest import (
 )
 from vllm.v1.mixed_precision_recovery.quest_packing import (
     PackedQuestDigestCache,
+    QuestMetadataStore,
     pack_quest_metadata_cache,
+)
+from vllm.v1.mixed_precision_recovery.recovery import (
+    BlockRecoveryManager,
+    RecoveryResult,
+    select_recovery_block_ids,
 )
 from vllm.v1.mixed_precision_recovery.scoring import (
     DigestScoreResult,
@@ -32,10 +45,18 @@ from vllm.v1.mixed_precision_recovery.sidecar import (
 
 __all__ = [
     "MPRConfig",
+    "CPUBackupKey",
+    "CPUBackupPutResult",
+    "CPUBackupReleaseResult",
+    "CPUBackupStats",
+    "SemanticCPUBackupStore",
     "ARKVALE_DIGEST_KIND",
     "KeyBlockDigest",
     "RAW_MINMAX_DIGEST_KIND",
     "PackedQuestDigestCache",
+    "QuestMetadataStore",
+    "BlockRecoveryManager",
+    "RecoveryResult",
     "RecoverySidecar",
     "DigestScoreResult",
     "QuestCudaScorer",
@@ -48,5 +69,6 @@ __all__ = [
     "get_mpr_sidecar",
     "pack_quest_metadata_cache",
     "reset_mpr_sidecar",
+    "select_recovery_block_ids",
     "summarize_key_block",
 ]

@@ -10,6 +10,9 @@ from scripts.mpr_validate_debug_jsonl import (
     validate_digest_event,
     validate_digest_observe_matches,
     validate_observe_event,
+    validate_recovery_materialized_event,
+    validate_recovery_skipped_event,
+    validate_recovery_test_mutated_event,
     validate_score_event,
     validate_strict_current_request_score_event,
 )
@@ -247,3 +250,144 @@ def test_debug_jsonl_validator_rejects_non_current_request_scores(tmp_path):
     validate_score_event(events[0])
     with pytest.raises(AssertionError, match="must match finalized"):
         validate_strict_current_request_score_event(events[0])
+
+
+def test_debug_jsonl_validator_accepts_recovery_materialized_event(tmp_path):
+    path = tmp_path / "mpr.jsonl"
+    recovery_event = {
+        "event": "recovery_materialized",
+        "layer_name": "model.layers.0.self_attn.attn",
+        "layer_event_idx": 4,
+        "query_shape": [1, 4, 128],
+        "window_query_shape": [4, 128],
+        "window_query_len": 3,
+        "kv_cache_shape": [2, 16, 32, 2, 128],
+        "recovery_policy": "threshold_block",
+        "recovery_topk": 2,
+        "recovery_threshold": 1.5,
+        "recovery_test_mutate": "zero_selected",
+        "recovery_test_mode": "recover",
+        "recovery_test_mutated_block_ids": [7, 8],
+        "recovery_selected_block_ids": [7, 8, 9],
+        "recovered_block_ids": [7, 8],
+        "missing_backup_block_ids": [9],
+        "skipped_block_ids": [],
+        "recovered_bytes": 32768,
+        "recovery_copy_wall_ms": 0.25,
+        "cpu_backup_block_count": 5,
+        "cpu_backup_bytes": 81920,
+        "valid_block_ids": [7, 8, 9],
+        "finalized_block_ids": [7, 8],
+        "score_candidate_block_ids": [7, 8],
+        "observed_digest_block_ids": [7, 8],
+        "missing_digest_blocks": [],
+        "extra_digest_blocks": [],
+    }
+    path.write_text(json.dumps(recovery_event), encoding="utf-8")
+
+    events = load_jsonl([path])
+    validate_recovery_materialized_event(events[0])
+
+
+def test_debug_jsonl_validator_accepts_recovery_test_mutated_event(tmp_path):
+    path = tmp_path / "mpr.jsonl"
+    mutation_event = {
+        "event": "recovery_test_mutated",
+        "layer_name": "model.layers.0.self_attn.attn",
+        "layer_event_idx": 4,
+        "query_shape": [1, 4, 128],
+        "window_query_shape": [4, 128],
+        "window_query_len": 3,
+        "kv_cache_shape": [2, 16, 32, 2, 128],
+        "recovery_policy": "threshold_block",
+        "recovery_topk": 1,
+        "recovery_threshold": -1000000000.0,
+        "recovery_test_mutate": "zero_selected",
+        "recovery_test_mutated_scope": "selected",
+        "recovery_test_mode": "mutate_only",
+        "recovery_selected_block_ids": [7, 8, 9],
+        "recovery_test_mutated_block_ids": [7, 8],
+        "cpu_backup_block_count": 5,
+        "cpu_backup_bytes": 81920,
+        "valid_block_ids": [7, 8, 9],
+        "finalized_block_ids": [7, 8],
+        "score_candidate_block_ids": [7, 8],
+        "observed_digest_block_ids": [7, 8],
+        "missing_digest_blocks": [],
+        "extra_digest_blocks": [],
+    }
+    path.write_text(json.dumps(mutation_event), encoding="utf-8")
+
+    events = load_jsonl([path])
+    validate_recovery_test_mutated_event(events[0])
+
+
+def test_debug_jsonl_validator_accepts_zero_all_recovery_test_mutated_event(
+    tmp_path,
+):
+    path = tmp_path / "mpr.jsonl"
+    mutation_event = {
+        "event": "recovery_test_mutated",
+        "layer_name": "model.layers.0.self_attn.attn",
+        "layer_event_idx": 4,
+        "kv_cache_shape": [2, 16, 32, 2, 128],
+        "recovery_policy": "threshold_block",
+        "recovery_topk": 1,
+        "recovery_threshold": -1000000000.0,
+        "recovery_test_mutate": "zero_all",
+        "recovery_test_mutated_scope": "all_kv_cache",
+        "recovery_test_mode": "mutate_only",
+        "recovery_selected_block_ids": [7, 8],
+        "recovery_test_mutated_block_ids": list(range(16)),
+    }
+    path.write_text(json.dumps(mutation_event), encoding="utf-8")
+
+    events = load_jsonl([path])
+    validate_recovery_test_mutated_event(events[0])
+
+
+def test_debug_jsonl_validator_accepts_recovery_skipped_event(tmp_path):
+    path = tmp_path / "mpr.jsonl"
+    recovery_event = {
+        "event": "recovery_skipped",
+        "layer_name": "model.layers.0.self_attn.attn",
+        "layer_event_idx": 4,
+        "skipped_reason": "cpu_backup_disabled",
+        "query_shape": [1, 4, 128],
+        "max_query_len": 1,
+        "num_actual_tokens": 1,
+        "kv_cache_shape": [2, 16, 32, 2, 128],
+        "recovery_policy": "topk_block",
+        "recovery_topk": 2,
+        "recovery_threshold": 0.0,
+        "cpu_backup_enabled": False,
+        "scoring_enabled": True,
+    }
+    path.write_text(json.dumps(recovery_event), encoding="utf-8")
+
+    events = load_jsonl([path])
+    validate_recovery_skipped_event(events[0])
+
+
+def test_debug_jsonl_validator_rejects_recovered_outside_selected(tmp_path):
+    path = tmp_path / "mpr.jsonl"
+    recovery_event = {
+        "event": "recovery_materialized",
+        "layer_name": "model.layers.0.self_attn.attn",
+        "layer_event_idx": 4,
+        "kv_cache_shape": [2, 16, 32, 2, 128],
+        "recovery_policy": "topk_block",
+        "recovery_topk": 2,
+        "recovery_threshold": 0.0,
+        "recovery_selected_block_ids": [7],
+        "recovered_block_ids": [8],
+        "missing_backup_block_ids": [],
+        "skipped_block_ids": [],
+        "recovered_bytes": 1024,
+        "recovery_copy_wall_ms": 0.25,
+    }
+    path.write_text(json.dumps(recovery_event), encoding="utf-8")
+
+    events = load_jsonl([path])
+    with pytest.raises(AssertionError, match="subset"):
+        validate_recovery_materialized_event(events[0])

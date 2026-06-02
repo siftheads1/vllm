@@ -288,6 +288,14 @@ if TYPE_CHECKING:
     VLLM_MPR_SCORING_BACKEND: str = "torch_quest"
     VLLM_MPR_DIGEST_KIND: str = "raw_minmax"
     VLLM_MPR_SCORE_GRANULARITY: str = "kv_head"
+    VLLM_MPR_CPU_BACKUP: bool = False
+    VLLM_MPR_SCORING_ENABLE: bool = True
+    VLLM_MPR_RECOVERY_ENABLE: bool = False
+    VLLM_MPR_RECOVERY_TOPK: int = 8
+    VLLM_MPR_RECOVERY_POLICY: str = "topk_block"
+    VLLM_MPR_RECOVERY_THRESHOLD: float = 0.0
+    VLLM_MPR_RECOVERY_TEST_MUTATE: str = "off"
+    VLLM_MPR_RECOVERY_TEST_MODE: str = "recover"
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
 
 
@@ -1997,6 +2005,41 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_MPR_SCORE_GRANULARITY",
         "kv_head",
     ).lower(),
+    # Enable semantic CPU fp16 backup creation for the MPR sidecar.
+    "VLLM_MPR_CPU_BACKUP": lambda: bool(
+        int(os.getenv("VLLM_MPR_CPU_BACKUP", "0"))
+    ),
+    # Keep MPR KV observation/backup enabled while disabling query scoring.
+    "VLLM_MPR_SCORING_ENABLE": lambda: bool(
+        int(os.getenv("VLLM_MPR_SCORING_ENABLE", "1"))
+    ),
+    # Enable MPR CPU backup -> GPU KV cache materialization.
+    "VLLM_MPR_RECOVERY_ENABLE": lambda: bool(
+        int(os.getenv("VLLM_MPR_RECOVERY_ENABLE", "0"))
+    ),
+    # Number of KV blocks to recover for top-k recovery policy.
+    "VLLM_MPR_RECOVERY_TOPK": lambda: int(
+        os.getenv("VLLM_MPR_RECOVERY_TOPK", "8")
+    ),
+    # MPR recovery target selection policy.
+    "VLLM_MPR_RECOVERY_POLICY": lambda: os.getenv(
+        "VLLM_MPR_RECOVERY_POLICY",
+        "topk_block",
+    ).lower(),
+    # Minimum block score for threshold-based recovery.
+    "VLLM_MPR_RECOVERY_THRESHOLD": lambda: float(
+        os.getenv("VLLM_MPR_RECOVERY_THRESHOLD", "0.0")
+    ),
+    # Optional M3 validation-only KV mutation before recovery.
+    "VLLM_MPR_RECOVERY_TEST_MUTATE": lambda: os.getenv(
+        "VLLM_MPR_RECOVERY_TEST_MUTATE",
+        "off",
+    ).lower(),
+    # Validation-only behavior after applying VLLM_MPR_RECOVERY_TEST_MUTATE.
+    "VLLM_MPR_RECOVERY_TEST_MODE": lambda: os.getenv(
+        "VLLM_MPR_RECOVERY_TEST_MODE",
+        "recover",
+    ).lower(),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
     # overlap the base layer compute with the LoRA fast path).
@@ -2164,6 +2207,14 @@ def compile_factors() -> dict[str, object]:
         "VLLM_MPR_SCORING_BACKEND",
         "VLLM_MPR_DIGEST_KIND",
         "VLLM_MPR_SCORE_GRANULARITY",
+        "VLLM_MPR_CPU_BACKUP",
+        "VLLM_MPR_SCORING_ENABLE",
+        "VLLM_MPR_RECOVERY_ENABLE",
+        "VLLM_MPR_RECOVERY_TOPK",
+        "VLLM_MPR_RECOVERY_POLICY",
+        "VLLM_MPR_RECOVERY_THRESHOLD",
+        "VLLM_MPR_RECOVERY_TEST_MUTATE",
+        "VLLM_MPR_RECOVERY_TEST_MODE",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",

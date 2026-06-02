@@ -15,6 +15,7 @@ from typing import Any
 SUPPORTED_DIGEST_KINDS = {"arkvale", "raw_minmax"}
 SUPPORTED_SCORING_BACKENDS = {"torch_quest", "quest_cuda"}
 SUPPORTED_SCORE_GRANULARITIES = {"block", "kv_head", "query_head"}
+SUPPORTED_RECOVERY_POLICIES = {"topk_block", "threshold_block"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +42,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Minimum number of score_estimated events required.",
+    )
+    parser.add_argument(
+        "--min-recovery-events",
+        type=int,
+        default=0,
+        help="Minimum number of recovery_materialized events required.",
+    )
+    parser.add_argument(
+        "--min-test-mutation-events",
+        type=int,
+        default=0,
+        help="Minimum number of recovery_test_mutated events required.",
     )
     parser.add_argument(
         "--allow-unmatched-digest-events",
@@ -496,6 +509,246 @@ def validate_score_event(event: dict[str, Any]) -> None:
         )
 
 
+def validate_recovery_materialized_event(event: dict[str, Any]) -> None:
+    """Validate one recovery_materialized event's recovery metadata."""
+    recovery_policy = event.get("recovery_policy")
+    if recovery_policy not in SUPPORTED_RECOVERY_POLICIES:
+        raise AssertionError(
+            f"{event['_source']}: recovery_policy must be one of "
+            f"{sorted(SUPPORTED_RECOVERY_POLICIES)}, got {recovery_policy!r}."
+        )
+    require_int(event, "recovery_topk", minimum=1)
+    threshold = event.get("recovery_threshold")
+    if not isinstance(threshold, (int, float)) or not math.isfinite(float(threshold)):
+        raise AssertionError(
+            f"{event['_source']}: recovery_threshold must be a finite number."
+        )
+
+    selected_block_ids = require_int_list(
+        event,
+        "recovery_selected_block_ids",
+        minimum=0,
+    )
+    test_mutate = event.get("recovery_test_mutate", "off")
+    if test_mutate not in ("off", "zero_selected", "zero_all"):
+        raise AssertionError(
+            f"{event['_source']}: recovery_test_mutate must be 'off', "
+            f"'zero_selected', or 'zero_all', got {test_mutate!r}."
+        )
+    mutated_scope = event.get("recovery_test_mutated_scope", "selected")
+    if mutated_scope not in ("selected", "all_kv_cache"):
+        raise AssertionError(
+            f"{event['_source']}: recovery_test_mutated_scope must be "
+            f"'selected' or 'all_kv_cache', got {mutated_scope!r}."
+        )
+    test_mode = event.get("recovery_test_mode", "recover")
+    if test_mode not in ("recover", "mutate_only"):
+        raise AssertionError(
+            f"{event['_source']}: recovery_test_mode must be 'recover' or "
+            f"'mutate_only', got {test_mode!r}."
+        )
+    test_mutated_block_ids = event.get("recovery_test_mutated_block_ids")
+    if test_mutated_block_ids is not None:
+        test_mutated_block_ids = require_int_list(
+            event,
+            "recovery_test_mutated_block_ids",
+            minimum=0,
+        )
+        if (
+            mutated_scope == "selected"
+            and not set(test_mutated_block_ids).issubset(set(selected_block_ids))
+        ):
+            raise AssertionError(
+                f"{event['_source']}: recovery_test_mutated_block_ids must be "
+                "a subset of recovery_selected_block_ids."
+            )
+    recovered_block_ids = require_int_list(
+        event,
+        "recovered_block_ids",
+        minimum=0,
+    )
+    missing_backup_block_ids = require_int_list(
+        event,
+        "missing_backup_block_ids",
+        minimum=0,
+    )
+    skipped_block_ids = require_int_list(
+        event,
+        "skipped_block_ids",
+        minimum=0,
+    )
+    selected_set = set(selected_block_ids)
+    for field, block_ids in (
+        ("recovered_block_ids", recovered_block_ids),
+        ("missing_backup_block_ids", missing_backup_block_ids),
+        ("skipped_block_ids", skipped_block_ids),
+    ):
+        if not set(block_ids).issubset(selected_set):
+            raise AssertionError(
+                f"{event['_source']}: {field} must be a subset of "
+                "recovery_selected_block_ids."
+            )
+
+    recovered_bytes = require_int(event, "recovered_bytes", minimum=0)
+    copy_wall_ms = event.get("recovery_copy_wall_ms")
+    if (
+        not isinstance(copy_wall_ms, (int, float))
+        or not math.isfinite(float(copy_wall_ms))
+        or float(copy_wall_ms) < 0
+    ):
+        raise AssertionError(
+            f"{event['_source']}: recovery_copy_wall_ms must be a finite "
+            "non-negative number."
+        )
+    if recovered_block_ids and recovered_bytes <= 0:
+        raise AssertionError(
+            f"{event['_source']}: recovered_bytes must be > 0 when blocks "
+            "were recovered."
+        )
+    if not recovered_block_ids and recovered_bytes != 0:
+        raise AssertionError(
+            f"{event['_source']}: recovered_bytes must be 0 when no blocks "
+            "were recovered."
+        )
+
+    if event.get("kv_cache_shape") is not None:
+        kv_cache_shape = event["kv_cache_shape"]
+        if (
+            not isinstance(kv_cache_shape, list)
+            or len(kv_cache_shape) != 5
+            or kv_cache_shape[0] != 2
+            or not all(isinstance(dim, int) and dim > 0 for dim in kv_cache_shape)
+        ):
+            raise AssertionError(
+                f"{event['_source']}: kv_cache_shape must be "
+                "[2, num_blocks, block_size, num_kv_heads, head_dim]."
+            )
+
+    for field in ("cpu_backup_block_count", "cpu_backup_bytes"):
+        if event.get(field) is not None:
+            require_int(event, field, minimum=0)
+
+    for field in (
+        "valid_block_ids",
+        "finalized_block_ids",
+        "protected_block_ids",
+        "score_candidate_block_ids",
+        "observed_digest_block_ids",
+        "missing_digest_blocks",
+        "extra_digest_blocks",
+    ):
+        if event.get(field) is not None:
+            require_int_list(event, field, minimum=0)
+
+
+def validate_recovery_test_mutated_event(event: dict[str, Any]) -> None:
+    """Validate one recovery_test_mutated event's validation metadata."""
+    recovery_policy = event.get("recovery_policy")
+    if recovery_policy not in SUPPORTED_RECOVERY_POLICIES:
+        raise AssertionError(
+            f"{event['_source']}: recovery_policy must be one of "
+            f"{sorted(SUPPORTED_RECOVERY_POLICIES)}, got {recovery_policy!r}."
+        )
+    require_int(event, "recovery_topk", minimum=1)
+    threshold = event.get("recovery_threshold")
+    if not isinstance(threshold, (int, float)) or not math.isfinite(float(threshold)):
+        raise AssertionError(
+            f"{event['_source']}: recovery_threshold must be a finite number."
+        )
+
+    test_mutate = event.get("recovery_test_mutate")
+    if test_mutate not in ("zero_selected", "zero_all"):
+        raise AssertionError(
+            f"{event['_source']}: recovery_test_mutate must be "
+            f"'zero_selected' or 'zero_all', got {test_mutate!r}."
+        )
+    mutated_scope = event.get("recovery_test_mutated_scope", "selected")
+    if mutated_scope not in ("selected", "all_kv_cache"):
+        raise AssertionError(
+            f"{event['_source']}: recovery_test_mutated_scope must be "
+            f"'selected' or 'all_kv_cache', got {mutated_scope!r}."
+        )
+    test_mode = event.get("recovery_test_mode")
+    if test_mode != "mutate_only":
+        raise AssertionError(
+            f"{event['_source']}: recovery_test_mode must be 'mutate_only', "
+            f"got {test_mode!r}."
+        )
+
+    selected_block_ids = require_int_list(
+        event,
+        "recovery_selected_block_ids",
+        minimum=0,
+    )
+    mutated_block_ids = require_int_list(
+        event,
+        "recovery_test_mutated_block_ids",
+        minimum=0,
+    )
+    if (
+        mutated_scope == "selected"
+        and not set(mutated_block_ids).issubset(set(selected_block_ids))
+    ):
+        raise AssertionError(
+            f"{event['_source']}: recovery_test_mutated_block_ids must be a "
+            "subset of recovery_selected_block_ids."
+        )
+
+    if event.get("kv_cache_shape") is not None:
+        kv_cache_shape = event["kv_cache_shape"]
+        if (
+            not isinstance(kv_cache_shape, list)
+            or len(kv_cache_shape) != 5
+            or kv_cache_shape[0] != 2
+            or not all(isinstance(dim, int) and dim > 0 for dim in kv_cache_shape)
+        ):
+            raise AssertionError(
+                f"{event['_source']}: kv_cache_shape must be "
+                "[2, num_blocks, block_size, num_kv_heads, head_dim]."
+            )
+
+    for field in ("cpu_backup_block_count", "cpu_backup_bytes"):
+        if event.get(field) is not None:
+            require_int(event, field, minimum=0)
+
+    for field in (
+        "valid_block_ids",
+        "finalized_block_ids",
+        "protected_block_ids",
+        "score_candidate_block_ids",
+        "observed_digest_block_ids",
+        "missing_digest_blocks",
+        "extra_digest_blocks",
+    ):
+        if event.get(field) is not None:
+            require_int_list(event, field, minimum=0)
+
+
+def validate_recovery_skipped_event(event: dict[str, Any]) -> None:
+    """Validate one recovery_skipped event's metadata."""
+    reason = event.get("skipped_reason")
+    if not isinstance(reason, str) or not reason:
+        raise AssertionError(
+            f"{event['_source']}: skipped_reason must be a non-empty string."
+        )
+    recovery_policy = event.get("recovery_policy")
+    if recovery_policy not in SUPPORTED_RECOVERY_POLICIES:
+        raise AssertionError(
+            f"{event['_source']}: recovery_policy must be one of "
+            f"{sorted(SUPPORTED_RECOVERY_POLICIES)}, got {recovery_policy!r}."
+        )
+    require_int(event, "recovery_topk", minimum=1)
+    threshold = event.get("recovery_threshold")
+    if not isinstance(threshold, (int, float)) or not math.isfinite(float(threshold)):
+        raise AssertionError(
+            f"{event['_source']}: recovery_threshold must be a finite number."
+        )
+    for field in ("cpu_backup_enabled", "scoring_enabled"):
+        value = event.get(field)
+        if not isinstance(value, bool):
+            raise AssertionError(f"{event['_source']}: {field} must be a bool.")
+
+
 def validate_strict_current_request_score_event(event: dict[str, Any]) -> None:
     """Validate score candidates against the current request's finalized blocks."""
     observed_digest_block_ids = require_int_list(
@@ -623,6 +876,9 @@ def print_summary(
     digest_events: list[dict[str, Any]],
     observe_events: list[dict[str, Any]],
     score_events: list[dict[str, Any]],
+    recovery_events: list[dict[str, Any]],
+    recovery_test_mutated_events: list[dict[str, Any]],
+    recovery_skipped_events: list[dict[str, Any]],
     show: int,
 ) -> None:
     """Print a compact validation summary."""
@@ -644,6 +900,9 @@ def print_summary(
     print(f"observe_kv_write: {len(observe_events)}")
     print(f"digest_created: {len(digest_events)}")
     print(f"score_estimated: {len(score_events)}")
+    print(f"recovery_materialized: {len(recovery_events)}")
+    print(f"recovery_test_mutated: {len(recovery_test_mutated_events)}")
+    print(f"recovery_skipped: {len(recovery_skipped_events)}")
     print(f"digest_layers: {len(digest_counts_by_layer)}")
 
     if digest_counts_by_layer:
@@ -728,6 +987,14 @@ def print_summary(
                     f"extra={event.get('extra_digest_blocks')}"
                 )
 
+    if recovery_events:
+        recovery_counts_by_layer = Counter(
+            event.get("layer_name") for event in recovery_events
+        )
+        print("\nrecovery count by layer:")
+        for layer_name, count in recovery_counts_by_layer.most_common():
+            print(f"  {count:4d}  {layer_name}")
+
 
 def main() -> None:
     """Run JSONL validation and print a compact summary."""
@@ -749,6 +1016,15 @@ def main() -> None:
     score_events = [
         event for event in events if event.get("event") == "score_estimated"
     ]
+    recovery_events = [
+        event for event in events if event.get("event") == "recovery_materialized"
+    ]
+    recovery_test_mutated_events = [
+        event for event in events if event.get("event") == "recovery_test_mutated"
+    ]
+    recovery_skipped_events = [
+        event for event in events if event.get("event") == "recovery_skipped"
+    ]
 
     for event in observe_events:
         validate_observe_event(event)
@@ -758,6 +1034,12 @@ def main() -> None:
         validate_score_event(event)
         if args.strict_current_request_scores:
             validate_strict_current_request_score_event(event)
+    for event in recovery_events:
+        validate_recovery_materialized_event(event)
+    for event in recovery_test_mutated_events:
+        validate_recovery_test_mutated_event(event)
+    for event in recovery_skipped_events:
+        validate_recovery_skipped_event(event)
 
     if len(digest_events) < args.min_digest_events:
         raise AssertionError(
@@ -768,6 +1050,18 @@ def main() -> None:
         raise AssertionError(
             f"Expected at least {args.min_score_events} score_estimated events, "
             f"found {len(score_events)}."
+        )
+    if len(recovery_events) < args.min_recovery_events:
+        raise AssertionError(
+            f"Expected at least {args.min_recovery_events} "
+            "recovery_materialized events, "
+            f"found {len(recovery_events)}."
+        )
+    if len(recovery_test_mutated_events) < args.min_test_mutation_events:
+        raise AssertionError(
+            f"Expected at least {args.min_test_mutation_events} "
+            "recovery_test_mutated events, found "
+            f"{len(recovery_test_mutated_events)}."
         )
 
     validate_digest_observe_matches(
@@ -781,6 +1075,9 @@ def main() -> None:
         digest_events,
         observe_events,
         score_events,
+        recovery_events,
+        recovery_test_mutated_events,
+        recovery_skipped_events,
         args.show,
     )
     if args.strict_current_request_scores:

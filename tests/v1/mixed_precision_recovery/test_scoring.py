@@ -7,7 +7,12 @@ import pytest
 import torch
 
 from vllm.v1.mixed_precision_recovery.config import MPRConfig
+from vllm.v1.mixed_precision_recovery.cpu_backup import (
+    CPUBackupKey,
+    SemanticCPUBackupStore,
+)
 from vllm.v1.mixed_precision_recovery.quest_packing import (
+    QuestMetadataStore,
     pack_quest_metadata_cache,
 )
 from vllm.v1.mixed_precision_recovery.scoring import (
@@ -21,6 +26,7 @@ from vllm.v1.mixed_precision_recovery.scoring import (
     get_digest_scoring_backend,
 )
 from vllm.v1.mixed_precision_recovery.sidecar import BlockDigest, RecoverySidecar
+from vllm.v1.core.kv_cache_manager import KVCacheManager, _mpr_env_enabled
 
 
 def _manual_scores(
@@ -96,6 +102,57 @@ def test_mpr_config_defaults_to_quest_style_digest_and_kv_head_scores():
     assert config.digest_kind == "raw_minmax"
     assert config.score_granularity == "kv_head"
     assert config.recent_tokens == 64
+    assert not config.cpu_backup_enabled
+    assert config.scoring_enabled
+    assert not config.recovery_enabled
+    assert config.recovery_topk == 8
+    assert config.recovery_policy == "topk_block"
+    assert config.recovery_threshold == 0.0
+    assert config.recovery_test_mutate == "off"
+
+
+def test_mpr_config_parses_cpu_backup_flag(monkeypatch):
+    monkeypatch.setenv("VLLM_MPR_CPU_BACKUP", "1")
+
+    config = MPRConfig.from_env()
+
+    assert config.cpu_backup_enabled
+
+
+def test_mpr_config_parses_scoring_enable_flag(monkeypatch):
+    monkeypatch.setenv("VLLM_MPR_SCORING_ENABLE", "0")
+
+    config = MPRConfig.from_env()
+
+    assert not config.scoring_enabled
+
+
+def test_mpr_config_parses_recovery_flags(monkeypatch):
+    monkeypatch.setenv("VLLM_MPR_RECOVERY_ENABLE", "1")
+    monkeypatch.setenv("VLLM_MPR_RECOVERY_TOPK", "4")
+    monkeypatch.setenv("VLLM_MPR_RECOVERY_POLICY", "topk_block")
+    monkeypatch.setenv("VLLM_MPR_RECOVERY_THRESHOLD", "12.5")
+    monkeypatch.setenv("VLLM_MPR_RECOVERY_TEST_MUTATE", "zero_all")
+    monkeypatch.setenv("VLLM_MPR_RECOVERY_TEST_MODE", "mutate_only")
+
+    config = MPRConfig.from_env()
+
+    assert config.recovery_enabled
+    assert config.recovery_topk == 4
+    assert config.recovery_policy == "topk_block"
+    assert config.recovery_threshold == 12.5
+    assert config.recovery_test_mutate == "zero_all"
+    assert config.recovery_test_mode == "mutate_only"
+
+
+def test_mpr_config_accepts_threshold_recovery_policy(monkeypatch):
+    monkeypatch.setenv("VLLM_MPR_RECOVERY_POLICY", "threshold_block")
+    monkeypatch.setenv("VLLM_MPR_RECOVERY_THRESHOLD", "-3.25")
+
+    config = MPRConfig.from_env()
+
+    assert config.recovery_policy == "threshold_block"
+    assert config.recovery_threshold == -3.25
 
 
 def test_mpr_config_accepts_quest_cuda_backend(monkeypatch):
@@ -109,6 +166,98 @@ def test_mpr_config_accepts_quest_cuda_backend(monkeypatch):
 
 def test_quest_cuda_uses_flashinfer_nhd_layout_value():
     assert QUEST_NHD_LAYOUT == 0
+
+
+def test_semantic_cpu_backup_store_copies_fp16_and_releases_by_gpu_block_id():
+    store = SemanticCPUBackupStore()
+    kv_block = torch.arange(16, dtype=torch.float32).reshape(2, 4, 1, 2)
+
+    result = store.put(
+        layer_name="model.layers.0.self_attn.attn",
+        physical_block_id=7,
+        kv_block=kv_block,
+    )
+
+    key = CPUBackupKey(
+        layer_name="model.layers.0.self_attn.attn",
+        physical_block_id=7,
+    )
+    backup = store.get(key)
+    assert backup is not None
+    assert backup.device.type == "cpu"
+    assert backup.dtype == torch.float16
+    assert result.num_bytes == backup.numel() * backup.element_size()
+    torch.testing.assert_close(backup, kv_block.to(torch.float16))
+
+    stats = store.stats()
+    assert stats.block_count == 1
+    assert stats.total_bytes == result.num_bytes
+    assert stats.put_count == 1
+
+    release = store.release_blocks({7})
+    assert release.released_entries == 1
+    assert release.released_bytes == result.num_bytes
+    assert store.get(key) is None
+    assert store.stats().block_count == 0
+
+
+def test_sidecar_creates_cpu_backup_when_full_block_digest_is_created():
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = RecoverySidecar(
+        config=MPRConfig(enabled=True, cpu_backup_enabled=True)
+    )
+    kv_cache = torch.arange(2 * 2 * 4 * 1 * 2, dtype=torch.float32).reshape(
+        2,
+        2,
+        4,
+        1,
+        2,
+    )
+
+    sidecar.observe_kv_write(
+        layer_name=layer_name,
+        kv_cache=kv_cache,
+        slot_mapping=torch.tensor([0, 1, 2, 3]),
+        block_size=4,
+    )
+
+    key = CPUBackupKey(layer_name=layer_name, physical_block_id=0)
+    backup = sidecar._cpu_backup_store.get(key)
+    assert backup is not None
+    assert backup.dtype == torch.float16
+    torch.testing.assert_close(backup, kv_cache[:, 0].to(torch.float16))
+    assert sidecar.cpu_backup_stats().block_count == 1
+    assert sidecar.counters["cpu_backup_created"] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_sidecar_cpu_backup_matches_cuda_kv_cache_block():
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = RecoverySidecar(
+        config=MPRConfig(enabled=True, cpu_backup_enabled=True)
+    )
+    kv_cache = torch.arange(
+        2 * 2 * 4 * 1 * 2,
+        device="cuda",
+        dtype=torch.float16,
+    ).reshape(2, 2, 4, 1, 2)
+
+    sidecar.observe_kv_write(
+        layer_name=layer_name,
+        kv_cache=kv_cache,
+        slot_mapping=torch.tensor([4, 5, 6, 7], device="cuda"),
+        block_size=4,
+    )
+
+    key = CPUBackupKey(layer_name=layer_name, physical_block_id=1)
+    backup = sidecar._cpu_backup_store.get(key)
+    assert backup is not None
+    assert backup.device.type == "cpu"
+    assert backup.dtype == torch.float16
+    torch.testing.assert_close(
+        backup,
+        kv_cache[:, 1].detach().cpu().to(torch.float16),
+    )
 
 
 def test_estimate_digest_score_result_exposes_gqa_metadata():
@@ -337,6 +486,55 @@ def test_sidecar_packs_candidate_digests_in_logical_order():
     torch.testing.assert_close(digest_max[:, 0, 0], torch.tensor([10.0, 4.0, 7.0]))
 
 
+def test_sidecar_release_blocks_cleans_block_keyed_state():
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = RecoverySidecar(
+        config=MPRConfig(
+            enabled=True,
+            cpu_backup_enabled=True,
+            scoring_backend="quest_cuda",
+        )
+    )
+    sidecar._block_offsets[layer_name] = {4: {0, 1}, 7: {0, 1}}
+    sidecar._digest_cache[layer_name] = {
+        block_id: BlockDigest(
+            digest_min=torch.full((1, 2), -float(block_id)),
+            digest_max=torch.full((1, 2), float(block_id)),
+            valid_token_count=2,
+            block_size=2,
+            layer_event_idx=0,
+            digest_kind="raw_minmax",
+        )
+        for block_id in [4, 7]
+    }
+    store = QuestMetadataStore(
+        metadata_page_size=2,
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    store.append_digest(
+        block_id=4,
+        digest_min=torch.full((1, 2), -4.0),
+        digest_max=torch.full((1, 2), 4.0),
+    )
+    sidecar._quest_metadata_stores[layer_name] = store
+    sidecar._cpu_backup_store.put(
+        layer_name=layer_name,
+        physical_block_id=4,
+        kv_block=torch.ones(2, 2, 1, 2),
+    )
+
+    sidecar.release_blocks([4], reason="test")
+
+    assert sidecar._block_offsets[layer_name] == {7: {0, 1}}
+    assert sorted(sidecar._digest_cache[layer_name]) == [7]
+    assert layer_name not in sidecar._quest_metadata_stores
+    assert sidecar.cpu_backup_stats().block_count == 0
+    assert sidecar.counters["blocks_released"] == 1
+
+
 def test_quest_metadata_packing_adds_guard_entry():
     digest_min = torch.tensor(
         [
@@ -370,6 +568,108 @@ def test_quest_metadata_packing_adds_guard_entry():
         packed.metadata_data[1, :, 1],
         torch.zeros_like(packed.metadata_data[1, :, 1]),
     )
+
+
+def test_quest_metadata_store_prefix_view_matches_compact_packer():
+    digest_min = torch.tensor(
+        [
+            [[-1.0, -2.0], [-3.0, -4.0]],
+            [[-5.0, -6.0], [-7.0, -8.0]],
+            [[-9.0, -10.0], [-11.0, -12.0]],
+        ]
+    )
+    digest_max = digest_min.abs()
+    store = QuestMetadataStore(
+        metadata_page_size=2,
+        num_kv_heads=2,
+        head_dim=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    for block_id, min_digest, max_digest in zip(
+        [10, 4, 7],
+        digest_min,
+        digest_max,
+    ):
+        store.append_digest(
+            block_id=block_id,
+            digest_min=min_digest,
+            digest_max=max_digest,
+        )
+
+    packed = store.view_prefix(3)
+    compact = pack_quest_metadata_cache(
+        digest_min=digest_min,
+        digest_max=digest_max,
+        metadata_page_size=2,
+        entry_block_ids=[10, 4, 7],
+    )
+
+    assert store.can_view_prefix([10, 4])
+    assert not store.can_view_prefix([10, 7])
+    assert packed.entry_block_ids == compact.entry_block_ids
+    assert packed.num_score_entries == compact.num_score_entries
+    assert packed.num_packed_entries == compact.num_packed_entries
+    assert packed.metadata_last_page_len == compact.metadata_last_page_len
+    assert packed.metadata_last_page_idx == compact.metadata_last_page_idx
+    torch.testing.assert_close(packed.metadata_data, compact.metadata_data)
+    torch.testing.assert_close(packed.metadata_indices, compact.metadata_indices)
+    torch.testing.assert_close(packed.metadata_indptr, compact.metadata_indptr)
+
+
+def test_sidecar_quest_packed_prefix_fast_path_requires_prefix():
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = RecoverySidecar(
+        config=MPRConfig(enabled=True, scoring_backend="quest_cuda")
+    )
+    sidecar._digest_cache[layer_name] = {
+        block_id: BlockDigest(
+            digest_min=torch.full((1, 2), -float(block_id)),
+            digest_max=torch.full((1, 2), float(block_id)),
+            valid_token_count=2,
+            block_size=2,
+            layer_event_idx=0,
+            digest_kind="raw_minmax",
+        )
+        for block_id in [10, 4, 7]
+    }
+    store = QuestMetadataStore(
+        metadata_page_size=2,
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    for block_id in [10, 4, 7]:
+        digest = sidecar._digest_cache[layer_name][block_id]
+        store.append_digest(
+            block_id=block_id,
+            digest_min=digest.digest_min,
+            digest_max=digest.digest_max,
+        )
+    sidecar._quest_metadata_stores[layer_name] = store
+
+    packed, reason = sidecar._try_get_quest_packed_prefix(
+        layer_name=layer_name,
+        physical_block_ids=[10, 4],
+        block_size=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert reason is None
+    assert packed is not None
+    assert packed.entry_block_ids == [10, 4]
+
+    packed, reason = sidecar._try_get_quest_packed_prefix(
+        layer_name=layer_name,
+        physical_block_ids=[10, 7],
+        block_size=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert packed is None
+    assert reason == "non_prefix_score_candidates"
 
 
 def test_quest_cuda_backend_fails_clearly_without_cuda_tensor():
@@ -415,7 +715,8 @@ def test_quest_cuda_backend_matches_torch_reference_when_op_is_built():
         metadata_page_size=2,
     )
     try:
-        cuda_result = QuestCudaScorer().estimate(
+        scorer = QuestCudaScorer()
+        cuda_result = scorer.estimate(
             query_window=query_window,
             digest_min=digest_min,
             digest_max=digest_max,
@@ -432,8 +733,27 @@ def test_quest_cuda_backend_matches_torch_reference_when_op_is_built():
             pytest.skip(f"quest_cuda custom op is not built: {message}")
         raise
 
+    packed = pack_quest_metadata_cache(
+        digest_min=digest_min,
+        digest_max=digest_max,
+        metadata_page_size=2,
+        add_guard_entry=True,
+    )
+    packed_cuda_result = scorer.estimate_packed(
+        query_window=query_window,
+        packed=packed,
+        num_kv_heads=1,
+        score_agg="max",
+    )
+
     torch.testing.assert_close(
         cuda_result.per_query_head_scores,
+        torch_result.per_query_head_scores,
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    torch.testing.assert_close(
+        packed_cuda_result.per_query_head_scores,
         torch_result.per_query_head_scores,
         atol=2e-2,
         rtol=2e-2,
@@ -493,6 +813,32 @@ def test_sidecar_query_scoring_skips_non_single_request_decode():
     assert "model.layers.0.self_attn.attn" not in sidecar._query_windows
 
 
+def test_sidecar_query_scoring_can_be_disabled_for_cpu_backup_only():
+    sidecar = RecoverySidecar(
+        config=MPRConfig(enabled=True, scoring_enabled=False)
+    )
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar._digest_cache[layer_name] = {
+        7: BlockDigest(
+            digest_min=torch.zeros(1, 2),
+            digest_max=torch.ones(1, 2),
+            valid_token_count=4,
+            block_size=4,
+            layer_event_idx=1,
+        )
+    }
+
+    sidecar.observe_query(
+        layer_name,
+        torch.tensor([[[1.0, 3.0]]]),
+        SimpleNamespace(max_query_len=1, num_actual_tokens=1),
+    )
+
+    assert sidecar.counters["score_skipped_disabled"] == 1
+    assert layer_name not in sidecar._query_windows
+    assert sidecar.counters["score_estimated"] == 0
+
+
 def test_sidecar_score_debug_fields_describe_block_table_state():
     sidecar = RecoverySidecar(config=MPRConfig(enabled=True, recent_tokens=0))
     metadata = SimpleNamespace(
@@ -520,3 +866,47 @@ def test_sidecar_score_debug_fields_describe_block_table_state():
     assert fields["observed_digest_block_ids"] == [10, 12, 20]
     assert fields["missing_digest_blocks"] == [11]
     assert fields["extra_digest_blocks"] == [12, 20]
+
+
+def test_kv_cache_manager_mpr_env_helper_defaults_to_disabled(monkeypatch):
+    monkeypatch.delenv("VLLM_MPR_ENABLE", raising=False)
+
+    assert not _mpr_env_enabled("VLLM_MPR_ENABLE")
+
+
+def test_kv_cache_manager_mpr_hook_is_noop_when_env_disabled(monkeypatch):
+    monkeypatch.delenv("VLLM_MPR_ENABLE", raising=False)
+
+    class FakeManager:
+        def get_block_ids(self, request_id):
+            raise AssertionError("block ids should not be queried when MPR is off")
+
+    KVCacheManager._maybe_release_mpr_blocks(
+        FakeManager(),
+        SimpleNamespace(request_id="req-0"),
+    )
+
+
+def test_kv_cache_manager_mpr_hook_releases_flattened_block_ids(monkeypatch):
+    monkeypatch.setenv("VLLM_MPR_ENABLE", "1")
+    calls = []
+
+    class FakeManager:
+        def get_block_ids(self, request_id):
+            assert request_id == "req-1"
+            return ([3, 1], [2, 3])
+
+    class FakeSidecar:
+        def release_blocks(self, block_ids, *, request_id, reason):
+            calls.append((block_ids, request_id, reason))
+
+    import vllm.v1.mixed_precision_recovery as mpr
+
+    monkeypatch.setattr(mpr, "get_mpr_sidecar", lambda: FakeSidecar())
+
+    KVCacheManager._maybe_release_mpr_blocks(
+        FakeManager(),
+        SimpleNamespace(request_id="req-1"),
+    )
+
+    assert calls == [([1, 2, 3], "req-1", "kv_cache_manager_free")]

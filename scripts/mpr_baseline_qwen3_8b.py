@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import time
 
 
 def parse_args() -> argparse.Namespace:
@@ -20,6 +21,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="Keep generating until max_tokens for throughput comparisons.",
+    )
     parser.add_argument(
         "--trust-remote-code",
         action="store_true",
@@ -55,6 +61,7 @@ def main() -> None:
     print("mpr_defer_enable:", args.defer_mpr_enable)
     print("mpr_enable_during_init:", os.environ.get("VLLM_MPR_ENABLE"))
 
+    load_start = time.perf_counter()
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
@@ -66,15 +73,39 @@ def main() -> None:
         enable_chunked_prefill=False,
         trust_remote_code=args.trust_remote_code,
     )
+    load_elapsed_sec = time.perf_counter() - load_start
     print("mpr_enable_during_generate:", os.environ.get("VLLM_MPR_ENABLE"))
 
     sampling_params = SamplingParams(
         temperature=0.0,
         max_tokens=args.max_tokens,
         seed=args.seed,
+        ignore_eos=args.ignore_eos,
     )
 
+    generate_start = time.perf_counter()
     outputs = llm.generate([args.prompt], sampling_params)
+    generate_elapsed_sec = time.perf_counter() - generate_start
+    total_generated_tokens = sum(len(output.outputs[0].token_ids)
+                                 for output in outputs)
+    total_prompt_tokens = sum(
+        len(output.prompt_token_ids)
+        if output.prompt_token_ids is not None
+        else 0
+        for output in outputs)
+    total_tokens = total_prompt_tokens + total_generated_tokens
+
+    print("load_elapsed_sec:", f"{load_elapsed_sec:.6f}")
+    print("generate_elapsed_sec:", f"{generate_elapsed_sec:.6f}")
+    print("total_generated_token_count:", total_generated_tokens)
+    print("total_prompt_token_count:", total_prompt_tokens)
+    print("total_token_count_all_outputs:", total_tokens)
+    if generate_elapsed_sec > 0:
+        print("generated_tokens_per_sec:",
+              f"{total_generated_tokens / generate_elapsed_sec:.6f}")
+        print("total_tokens_per_sec:",
+              f"{total_tokens / generate_elapsed_sec:.6f}")
+
     for output in outputs:
         prompt_token_count = (
             len(output.prompt_token_ids)

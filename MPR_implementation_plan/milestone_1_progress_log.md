@@ -1678,3 +1678,261 @@ FetchContent external dependencies from GitHub. Local Cutlass and Triton
 sources avoided the first two downloads, but DeepGEMM still required network
 access and blocked configure in the restricted environment.
 ```
+
+### Step 1.7 Source Build Follow-Up: Spinloop Limited-API Fix
+
+After the Quest CUDA estimate kernel commit was pushed, a local source build was
+attempted with:
+
+```text
+CMAKE_BUILD_PARALLEL_LEVEL=2 uv pip install -e . --torch-backend=auto
+```
+
+The previous successful editable install had used precompiled extensions, so it
+did not locally compile `csrc/spinloop.cpp`. The source build exposed an
+unrelated spinloop compile failure before the full vLLM build could finish.
+
+Failure:
+
+```text
+[1/351] Building CXX object CMakeFiles/spinloop.dir/csrc/spinloop.cpp.o
+FAILED: CMakeFiles/spinloop.dir/csrc/spinloop.cpp.o
+
+/usr/bin/c++ ... -DPy_LIMITED_API=0x030b0000 ...
+csrc/spinloop.cpp:58:3: error: 'Py_buffer' was not declared in this scope
+csrc/spinloop.cpp:76:5: error: 'PyBuffer_Release' was not declared in this scope
+```
+
+Interpretation:
+
+```text
+This is not a Quest/MPR kernel compile failure.
+
+The build reached:
+  [7/351] Building CUDA object CMakeFiles/_C.dir/csrc/mpr/quest_estimate.cu.o
+
+The first hard failure was the separate spinloop extension. Its CMake target
+uses USE_SABI 3.11, which injects Py_LIMITED_API into the C++ compile. However,
+spinloop.cpp directly uses Py_buffer/PyBuffer_Release, which are hidden by the
+Python headers under this limited-API compile.
+```
+
+Fix applied:
+
+```text
+CMakeLists.txt
+
+target_compile_options(spinloop PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-UPy_LIMITED_API>)
+```
+
+This mirrors the existing pattern used by FlashMLA CMake integration: keep the
+stable-ABI module target shape, but prevent `Py_LIMITED_API` from leaking into
+the C++/CUDA source compilation when the source uses APIs hidden by the limited
+headers.
+
+### Step 1.7 Quest CUDA Runtime Follow-Up: FP16-Only Limitation
+
+The first `quest_cuda` runtime smoke on Qwen3-8B with `dtype=auto` failed
+because the model query tensor was bf16:
+
+```text
+RuntimeError: MPR Quest estimate currently supports fp16 q tensors only,
+got BFloat16.
+```
+
+Interpretation:
+
+```text
+This matches the original Quest exposed estimate wrapper: its
+DISPATCH_PYTORCH_DTYPE_TO_CTYPE macro dispatches only at::ScalarType::Half.
+
+The lower FlashInfer vector headers include nv_bfloat16 support, so bf16 is not
+obviously impossible, but it is not supported by the original Quest wrapper path
+we mirrored for the first PoC.
+```
+
+Current temporary policy:
+
+```text
+Run quest_cuda smoke/correctness with --dtype half.
+```
+
+Follow-up:
+
+```text
+FP16-only is too restrictive for the MPR integration because common vLLM model
+runs, including Qwen3-8B with dtype=auto, naturally use bf16. After fp16 parity
+is stable, add explicit bf16 dispatch in csrc/mpr/quest_estimate.cu
+(torch::kBFloat16 -> nv_bfloat16), verify the template path compiles, and add a
+bf16 CUDA parity test against TorchQuestScorer.
+```
+
+### Step 1.7 Quest CUDA Performance Measurement Hooks
+
+Added lightweight performance measurement support for the current scoring
+comparison:
+
+```text
+scripts/mpr_baseline_qwen3_8b.py
+  prints load_elapsed_sec
+  prints generate_elapsed_sec
+  prints generated_tokens_per_sec
+  prints total_tokens_per_sec
+  adds --ignore-eos for fixed-length throughput comparisons
+
+scripts/mpr_benchmark_scoring.py
+  synthetic scorer-only benchmark
+  compares TorchQuestScorer total latency
+  compares QuestCudaScorer total latency including per-call packing
+  compares Quest CUDA kernel-only latency with metadata packed once
+  breaks Quest CUDA overhead down into:
+    metadata packing
+    estimate kernel
+    transpose/aggregation postprocess
+    sidecar-style block top-k
+    sidecar-style per-KV-head top-k
+    sidecar-style per-query-head top-k
+```
+
+The intended interpretation is:
+
+```text
+end-to-end throughput
+  answers whether users see a speedup in vLLM generate
+
+scorer-only total latency
+  includes Python-side packing and transpose/aggregation overhead
+
+sidecar-style top-k latency
+  is reported separately because top-k runs after backend.estimate(...)
+  default MPR score_granularity is kv_head, so the default head top-k cost is
+  topk_kv_head_wall_ms, not topk_query_head_wall_ms
+
+quest_cuda kernel-only latency
+  isolates the imported Quest estimate kernel path
+```
+
+This separation is important because the first `quest_cuda` backend still packs
+Quest metadata on every scoring call. If kernel-only latency improves but
+end-to-end throughput does not, the next optimization target is persistent or
+cached metadata packing rather than the estimate kernel itself.
+
+Potential optimization follow-up:
+
+```text
+The current smoke/benchmark path usually runs with enforce_eager=True. This is
+useful while validating sidecar hooks, debug JSONL behavior, and custom scoring
+correctness, but it can suppress normal vLLM CUDA Graph/compiled execution
+benefits.
+
+After quest_cuda correctness is stable, re-run e2e throughput with
+--no-enforce-eager and check whether MPR sidecar/scoring hooks are compatible
+with CUDA Graph capture. If they are not, identify the graph-breaking sections
+and decide whether to keep MPR scoring outside captured regions or refactor the
+runtime path to become graph-friendly.
+```
+
+### Step 1.7 Quest CUDA Persistent Metadata Packing Fast Path
+
+Implemented the first packing-overhead reduction pass for `quest_cuda`.
+
+Motivation:
+
+```text
+Microbench showed Quest CUDA estimate kernel latency is small, but
+QuestCudaScorer.estimate(...) spent most of its time rebuilding Quest metadata
+from digest_min/digest_max on every scoring call.
+
+The initial target is only the packing overhead. Top-k/debug overhead is left as
+is because it is not the recovery policy we expect to keep.
+```
+
+Added:
+
+```text
+vllm/v1/mixed_precision_recovery/quest_packing.py
+  QuestMetadataStore
+    append-only per-layer Quest metadata cache
+    layout: [num_pages, 2, page_size, num_kv_heads, head_dim]
+    plane 0: digest_max
+    plane 1: digest_min
+    keeps one zero guard entry after the real prefix because Quest estimate
+    drops the final logical metadata entry
+
+vllm/v1/mixed_precision_recovery/scoring.py
+  QuestCudaScorer.estimate_packed(...)
+    accepts PackedQuestDigestCache directly
+    skips pack_quest_metadata_cache(...)
+    calls mpr_estimate_attn_score on the existing metadata
+
+vllm/v1/mixed_precision_recovery/sidecar.py
+  _quest_metadata_stores per layer
+  appends to QuestMetadataStore when a full-block digest is created and
+  scoring_backend == quest_cuda
+  tries a quest_cuda persistent prefix fast path before falling back to the
+  previous compact pack path
+```
+
+Fast-path condition:
+
+```text
+scoring_backend == quest_cuda
+candidate digest block ids match the QuestMetadataStore entry prefix
+metadata page size matches block size
+metadata dtype/device match the query dtype/device
+```
+
+Fallback:
+
+```text
+If any condition fails, sidecar uses the existing _pack_layer_digests(...)
+and QuestCudaScorer.estimate(...) path. This preserves correctness for non-prefix
+cases such as multi-request, preemption/reuse, missing middle digests, or
+non-append block ordering.
+```
+
+Debug JSONL additions:
+
+```text
+quest_packed_fast_path: true/false
+quest_packed_fallback_reason: reason string when fallback is used
+```
+
+Benchmark update:
+
+```text
+scripts/mpr_benchmark_scoring.py now reports:
+  quest_cuda_persistent_wall_ms
+  quest_cuda_persistent_cuda_ms
+
+These use QuestCudaScorer.estimate_packed(...) with metadata packed once.
+```
+
+Validation:
+
+```text
+python -m py_compile \
+  vllm/v1/mixed_precision_recovery/quest_packing.py \
+  vllm/v1/mixed_precision_recovery/scoring.py \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  tests/v1/mixed_precision_recovery/test_scoring.py \
+  scripts/mpr_benchmark_scoring.py
+  passed
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_scoring.py
+  21 passed, 1 skipped
+
+git diff --check
+  passed
+```
+
+Design note:
+
+```text
+This is still an intermediate sidecar-owned metadata cache. The likely cleaner
+long-term design is closer to Quest's own separate paged metadata/KV cache
+manager, but this fast path isolates the immediate packing overhead without
+changing the broader MPR ownership model yet.
+```

@@ -31,6 +31,13 @@ def _parse_int(name: str, default: int, min_value: int) -> int:
     return value
 
 
+def _parse_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return float(raw)
+
+
 def _parse_optional_limit(name: str) -> int | None:
     value = _parse_int(name, -1, -1)
     return None if value < 0 else value
@@ -65,6 +72,14 @@ class MPRConfig:
     scoring_backend: str = "torch_quest"
     digest_kind: str = "raw_minmax"
     score_granularity: str = "kv_head"
+    cpu_backup_enabled: bool = False
+    scoring_enabled: bool = True
+    recovery_enabled: bool = False
+    recovery_topk: int = 8
+    recovery_policy: str = "topk_block"
+    recovery_threshold: float = 0.0
+    recovery_test_mutate: str = "off"
+    recovery_test_mode: str = "recover"
 
     @classmethod
     def from_env(cls) -> "MPRConfig":
@@ -96,5 +111,28 @@ class MPRConfig:
                 "VLLM_MPR_SCORE_GRANULARITY",
                 "kv_head",
                 {"block", "kv_head", "query_head"},
+            ),
+            cpu_backup_enabled=_parse_bool("VLLM_MPR_CPU_BACKUP", False),
+            scoring_enabled=_parse_bool("VLLM_MPR_SCORING_ENABLE", True),
+            recovery_enabled=_parse_bool("VLLM_MPR_RECOVERY_ENABLE", False),
+            recovery_topk=_parse_int("VLLM_MPR_RECOVERY_TOPK", 8, 1),
+            recovery_policy=_parse_choice(
+                "VLLM_MPR_RECOVERY_POLICY",
+                "topk_block",
+                {"topk_block", "threshold_block"},
+            ),
+            recovery_threshold=_parse_float(
+                "VLLM_MPR_RECOVERY_THRESHOLD",
+                0.0,
+            ),
+            recovery_test_mutate=_parse_choice(
+                "VLLM_MPR_RECOVERY_TEST_MUTATE",
+                "off",
+                {"off", "zero_selected", "zero_all"},
+            ),
+            recovery_test_mode=_parse_choice(
+                "VLLM_MPR_RECOVERY_TEST_MODE",
+                "recover",
+                {"recover", "mutate_only"},
             ),
         )

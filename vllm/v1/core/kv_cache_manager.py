@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -20,6 +21,14 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _mpr_env_enabled(name: str) -> bool:
+    """Return whether a boolean MPR env flag is explicitly enabled."""
+    raw = os.getenv(name)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass
@@ -434,7 +443,35 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        self._maybe_release_mpr_blocks(request)
         self.coordinator.free(request.request_id)
+
+    def _maybe_release_mpr_blocks(self, request: Request) -> None:
+        """Notify the MPR sidecar before physical KV block ids are reusable."""
+        if not _mpr_env_enabled("VLLM_MPR_ENABLE"):
+            return
+
+        # MPR Milestone 2 prototype hook. This direct KVCacheManager -> MPR
+        # dependency is intentionally isolated here because it is not the
+        # cleanest long-term vLLM integration. A production path should replace
+        # this with a connector/event/lifecycle observer style interface.
+        block_ids_by_group = self.get_block_ids(request.request_id)
+        block_ids = sorted(
+            {
+                block_id
+                for group_block_ids in block_ids_by_group
+                for block_id in group_block_ids
+            }
+        )
+        if not block_ids:
+            return
+        from vllm.v1.mixed_precision_recovery import get_mpr_sidecar
+
+        get_mpr_sidecar().release_blocks(
+            block_ids,
+            request_id=request.request_id,
+            reason="kv_cache_manager_free",
+        )
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int

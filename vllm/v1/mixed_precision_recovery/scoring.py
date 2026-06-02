@@ -11,6 +11,7 @@ from typing import Protocol
 import torch
 
 from vllm.v1.mixed_precision_recovery.quest_packing import (
+    PackedQuestDigestCache,
     pack_quest_metadata_cache,
 )
 
@@ -270,6 +271,119 @@ class QuestCudaScorer:
 
     name = "quest_cuda"
 
+    def estimate_packed(
+        self,
+        *,
+        query_window: torch.Tensor,
+        packed: PackedQuestDigestCache,
+        num_kv_heads: int,
+        score_agg: str,
+    ) -> DigestScoreResult:
+        """Estimate scores from an already packed Quest metadata cache."""
+        if query_window.ndim != 2:
+            raise ValueError(
+                "quest_cuda packed scoring expects query_window shaped "
+                f"[num_q_heads, head_dim], got {tuple(query_window.shape)}."
+            )
+        if score_agg not in {"max", "mean"}:
+            raise ValueError(
+                "MPR scoring score_agg must be 'max' or 'mean', "
+                f"got {score_agg!r}."
+            )
+        num_blocks = packed.num_score_entries
+        num_q_heads = int(query_window.shape[0])
+        if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
+            raise AssertionError(
+                "MPR scoring requires num_q_heads to be a positive multiple of "
+                f"num_kv_heads, got num_q_heads={num_q_heads}, "
+                f"num_kv_heads={num_kv_heads}."
+            )
+        group_size = num_q_heads // num_kv_heads
+        if group_size not in QUEST_CUDA_SUPPORTED_GROUP_SIZES:
+            supported = sorted(QUEST_CUDA_SUPPORTED_GROUP_SIZES)
+            raise RuntimeError(
+                "quest_cuda scoring is unavailable for GQA group_size="
+                f"{group_size}; supported group sizes are {supported}."
+            )
+        if num_blocks <= 0:
+            per_query_head_scores = torch.empty(
+                (0, num_q_heads),
+                dtype=query_window.dtype,
+                device=query_window.device,
+            )
+            block_scores, per_kv_head_scores = aggregate_query_head_scores(
+                per_query_head_scores,
+                num_kv_heads=num_kv_heads,
+                score_agg=score_agg,
+            )
+            return DigestScoreResult(
+                block_scores=block_scores,
+                per_query_head_scores=per_query_head_scores,
+                per_kv_head_scores=per_kv_head_scores,
+                score_agg=score_agg,
+                scoring_backend=self.name,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                group_size=group_size,
+            )
+        if not query_window.is_cuda:
+            raise RuntimeError("quest_cuda scoring requires CUDA query tensors.")
+        if packed.metadata_data.dtype != query_window.dtype:
+            raise RuntimeError(
+                "quest_cuda packed metadata dtype must match query dtype, got "
+                f"{packed.metadata_data.dtype} and {query_window.dtype}."
+            )
+        if packed.metadata_data.device != query_window.device:
+            raise RuntimeError(
+                "quest_cuda packed metadata device must match query device, got "
+                f"{packed.metadata_data.device} and {query_window.device}."
+            )
+
+        try:
+            from vllm import _custom_ops as ops
+        except Exception as exc:
+            raise RuntimeError(
+                "quest_cuda scoring could not import vLLM custom ops."
+            ) from exc
+
+        if not hasattr(ops, "mpr_estimate_attn_score"):
+            raise RuntimeError(
+                "quest_cuda scoring backend is selected, but the "
+                "mpr_estimate_attn_score custom op wrapper is unavailable."
+            )
+
+        output = torch.empty(
+            (num_q_heads, packed.num_score_entries),
+            dtype=query_window.dtype,
+            device=query_window.device,
+        )
+        ops.mpr_estimate_attn_score(
+            query_window.unsqueeze(0).contiguous(),
+            output,
+            packed.metadata_data,
+            packed.metadata_indices,
+            packed.metadata_indptr,
+            packed.metadata_last_page_len,
+            packed.metadata_last_page_idx,
+            QUEST_NHD_LAYOUT,
+        )
+        per_query_head_scores = output.transpose(0, 1).contiguous()
+        block_scores, per_kv_head_scores = aggregate_query_head_scores(
+            per_query_head_scores,
+            num_kv_heads=num_kv_heads,
+            score_agg=score_agg,
+        )
+        return DigestScoreResult(
+            block_scores=block_scores,
+            per_query_head_scores=per_query_head_scores,
+            per_kv_head_scores=per_kv_head_scores,
+            score_agg=score_agg,
+            scoring_backend=self.name,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            group_size=group_size,
+        )
+
     def estimate(
         self,
         *,
@@ -312,68 +426,17 @@ class QuestCudaScorer:
                 "quest_cuda scoring requires a positive metadata_page_size "
                 "matching the digest/KV block size."
             )
-        if group_size not in QUEST_CUDA_SUPPORTED_GROUP_SIZES:
-            supported = sorted(QUEST_CUDA_SUPPORTED_GROUP_SIZES)
-            raise RuntimeError(
-                "quest_cuda scoring is unavailable for GQA group_size="
-                f"{group_size}; supported group sizes are {supported}."
-            )
-        if not query_window.is_cuda:
-            raise RuntimeError("quest_cuda scoring requires CUDA query tensors.")
-
-        try:
-            from vllm import _custom_ops as ops
-        except Exception as exc:
-            raise RuntimeError(
-                "quest_cuda scoring could not import vLLM custom ops."
-            ) from exc
-
-        if not hasattr(ops, "mpr_estimate_attn_score"):
-            raise RuntimeError(
-                "quest_cuda scoring backend is selected, but the "
-                "mpr_estimate_attn_score custom op wrapper is unavailable."
-            )
-
         packed = pack_quest_metadata_cache(
             digest_min=digest_min,
             digest_max=digest_max,
             metadata_page_size=metadata_page_size,
             add_guard_entry=True,
         )
-        # The packer adds one dummy guard entry because the current Quest
-        # estimate kernel always excludes the final logical metadata entry.
-        # Therefore the unmodified kernel should produce exactly one column per
-        # real MPR score candidate.
-        output = torch.empty(
-            (num_q_heads, packed.num_score_entries),
-            dtype=query_window.dtype,
-            device=query_window.device,
-        )
-        ops.mpr_estimate_attn_score(
-            query_window.unsqueeze(0).contiguous(),
-            output,
-            packed.metadata_data,
-            packed.metadata_indices,
-            packed.metadata_indptr,
-            packed.metadata_last_page_len,
-            packed.metadata_last_page_idx,
-            QUEST_NHD_LAYOUT,
-        )
-        per_query_head_scores = output.transpose(0, 1).contiguous()
-        block_scores, per_kv_head_scores = aggregate_query_head_scores(
-            per_query_head_scores,
+        return self.estimate_packed(
+            query_window=query_window,
+            packed=packed,
             num_kv_heads=num_kv_heads,
             score_agg=score_agg,
-        )
-        return DigestScoreResult(
-            block_scores=block_scores,
-            per_query_head_scores=per_query_head_scores,
-            per_kv_head_scores=per_kv_head_scores,
-            score_agg=score_agg,
-            scoring_backend=self.name,
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            group_size=group_size,
         )
 
 

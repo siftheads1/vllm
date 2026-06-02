@@ -702,24 +702,7 @@ def _maybe_observe_mpr_kv_write(
     if forward_context.is_dummy_run:
         return
 
-    block_size = getattr(attn_layer.impl, "block_size", None)
-    if block_size is None:
-        impl_name = attn_layer.impl.__class__.__name__
-        if impl_name != "FlashAttentionImpl":
-            raise ValueError(
-                "MPR block_size fallback is currently implemented only for "
-                f"FlashAttentionImpl, got {impl_name}."
-            )
-        if kv_cache.ndim >= 3 and kv_cache.shape[0] == 2:
-            # FlashAttention KV cache layout is
-            # [2, num_blocks, block_size, num_kv_heads, head_size].
-            block_size = int(kv_cache.shape[2])
-        else:
-            raise ValueError(
-                "MPR could not infer block_size for "
-                f"{impl_name}; "
-                f"kv_cache_shape={tuple(kv_cache.shape)}."
-            )
+    block_size = _infer_mpr_block_size(attn_layer, kv_cache)
 
     from vllm.v1.mixed_precision_recovery import get_mpr_sidecar
 
@@ -733,8 +716,36 @@ def _maybe_observe_mpr_kv_write(
     )
 
 
-def _maybe_observe_mpr_query(
+def _infer_mpr_block_size(
+    attn_layer: "Attention | MLAAttention",
+    kv_cache: torch.Tensor,
+) -> int:
+    """Infer the vLLM KV cache block size for MPR hooks."""
+    block_size = getattr(attn_layer.impl, "block_size", None)
+    if block_size is not None:
+        return int(block_size)
+
+    impl_name = attn_layer.impl.__class__.__name__
+    if impl_name != "FlashAttentionImpl":
+        raise ValueError(
+            "MPR block_size fallback is currently implemented only for "
+            f"FlashAttentionImpl, got {impl_name}."
+        )
+    if kv_cache.ndim >= 3 and kv_cache.shape[0] == 2:
+        # FlashAttention KV cache layout is
+        # [2, num_blocks, block_size, num_kv_heads, head_size].
+        return int(kv_cache.shape[2])
+    raise ValueError(
+        "MPR could not infer block_size for "
+        f"{impl_name}; "
+        f"kv_cache_shape={tuple(kv_cache.shape)}."
+    )
+
+
+def _maybe_observe_or_recover_mpr_query(
     layer_name: str,
+    attn_layer: "Attention | MLAAttention",
+    kv_cache: torch.Tensor,
     query: torch.Tensor,
     attn_metadata: AttentionMetadata,
 ) -> None:
@@ -746,7 +757,27 @@ def _maybe_observe_mpr_query(
 
     from vllm.v1.mixed_precision_recovery import get_mpr_sidecar
 
-    get_mpr_sidecar().observe_query(
+    sidecar = get_mpr_sidecar()
+    if sidecar.config.recovery_enabled:
+        if sidecar.config.recovery_test_mutate != "off":
+            sidecar.recover_before_attention_with_test_mutation(
+                layer_name=layer_name,
+                query=query,
+                attn_metadata=attn_metadata,
+                kv_cache=kv_cache,
+                block_size=_infer_mpr_block_size(attn_layer, kv_cache),
+            )
+            return
+        sidecar.recover_before_attention(
+            layer_name=layer_name,
+            query=query,
+            attn_metadata=attn_metadata,
+            kv_cache=kv_cache,
+            block_size=_infer_mpr_block_size(attn_layer, kv_cache),
+        )
+        return
+
+    sidecar.observe_query(
         layer_name=layer_name,
         query=query,
         attn_metadata=attn_metadata,
@@ -820,7 +851,13 @@ def unified_attention_with_output(
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
-    _maybe_observe_mpr_query(layer_name, query, attn_metadata)
+    _maybe_observe_or_recover_mpr_query(
+        layer_name,
+        self,
+        kv_cache,
+        query,
+        attn_metadata,
+    )
 
     self.impl.forward(
         self,

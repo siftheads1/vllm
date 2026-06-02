@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -39,6 +39,183 @@ class PackedQuestDigestCache:
     num_score_entries: int
     num_packed_entries: int
     metadata_page_size: int
+
+
+@dataclass
+class QuestMetadataStore:
+    """Append-only Quest-style metadata cache for one layer.
+
+    This is a first-step persistent cache for the single-request append-only
+    smoke path. It stores every finalized digest in Quest's NHD metadata layout
+    at digest creation time, so scoring can pass a prefix view to the Quest
+    estimate kernel without rebuilding the dense metadata tensor on every
+    decode step.
+    """
+
+    metadata_page_size: int
+    num_kv_heads: int
+    head_dim: int
+    dtype: torch.dtype
+    device: torch.device
+    metadata_data: torch.Tensor = field(init=False)
+    metadata_indices: torch.Tensor = field(init=False)
+    entry_block_ids: list[int] = field(default_factory=list)
+    block_id_to_entry: dict[int, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.metadata_page_size <= 0:
+            raise ValueError(
+                "Quest metadata store requires a positive metadata_page_size, "
+                f"got {self.metadata_page_size}."
+            )
+        if self.num_kv_heads <= 0 or self.head_dim <= 0:
+            raise ValueError(
+                "Quest metadata store requires positive num_kv_heads and "
+                f"head_dim, got {self.num_kv_heads}, {self.head_dim}."
+            )
+        self.metadata_data = torch.zeros(
+            (
+                1,
+                2,
+                self.metadata_page_size,
+                self.num_kv_heads,
+                self.head_dim,
+            ),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.metadata_indices = torch.arange(
+            1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+    @property
+    def num_entries(self) -> int:
+        """Return the number of real digest entries appended so far."""
+        return len(self.entry_block_ids)
+
+    def can_view_prefix(self, block_ids: list[int]) -> bool:
+        """Return whether ``block_ids`` matches the store's entry prefix."""
+        return self.entry_block_ids[:len(block_ids)] == block_ids
+
+    def append_digest(
+        self,
+        *,
+        block_id: int,
+        digest_min: torch.Tensor,
+        digest_max: torch.Tensor,
+    ) -> None:
+        """Append one block digest and keep one zero guard entry after it."""
+        if block_id in self.block_id_to_entry:
+            raise ValueError(
+                f"Quest metadata store already has block_id={block_id}."
+            )
+        expected_shape = (self.num_kv_heads, self.head_dim)
+        if tuple(digest_min.shape) != expected_shape:
+            raise ValueError(
+                "Quest metadata store digest_min shape mismatch: "
+                f"expected {expected_shape}, got {tuple(digest_min.shape)}."
+            )
+        if tuple(digest_max.shape) != expected_shape:
+            raise ValueError(
+                "Quest metadata store digest_max shape mismatch: "
+                f"expected {expected_shape}, got {tuple(digest_max.shape)}."
+            )
+
+        entry_idx = self.num_entries
+        # Keep capacity for the newly appended entry plus Quest's dummy guard
+        # entry. The guard exists because the current Quest estimate kernel
+        # always excludes the final logical metadata entry from scoring.
+        self._ensure_entry_capacity(entry_idx + 2)
+        page_idx = entry_idx // self.metadata_page_size
+        page_offset = entry_idx % self.metadata_page_size
+        self.metadata_data[page_idx, 0, page_offset].copy_(
+            digest_max.to(device=self.device, dtype=self.dtype)
+        )
+        self.metadata_data[page_idx, 1, page_offset].copy_(
+            digest_min.to(device=self.device, dtype=self.dtype)
+        )
+        self.entry_block_ids.append(block_id)
+        self.block_id_to_entry[block_id] = entry_idx
+        self._zero_entry(entry_idx + 1)
+
+    def view_prefix(self, num_score_entries: int) -> PackedQuestDigestCache:
+        """Return a Quest packed-cache view over the first score entries.
+
+        The returned metadata includes one trailing guard entry because Quest's
+        estimate kernel drops the final logical metadata entry.
+        """
+        if num_score_entries <= 0:
+            raise ValueError(
+                "Quest metadata store prefix view requires at least one score "
+                f"entry, got {num_score_entries}."
+            )
+        if num_score_entries > self.num_entries:
+            raise ValueError(
+                "Quest metadata store prefix view exceeds stored entries: "
+                f"{num_score_entries} > {self.num_entries}."
+            )
+
+        num_packed_entries = num_score_entries + 1
+        self._ensure_entry_capacity(num_packed_entries)
+        self._zero_entry(num_score_entries)
+        num_metadata_pages = (
+            num_packed_entries + self.metadata_page_size - 1
+        ) // self.metadata_page_size
+        metadata_last_page_len = (
+            (num_packed_entries - 1) % self.metadata_page_size
+        ) + 1
+        metadata_indptr = torch.tensor(
+            [0, num_metadata_pages],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        return PackedQuestDigestCache(
+            metadata_data=self.metadata_data[:num_metadata_pages],
+            metadata_indices=self.metadata_indices[:num_metadata_pages],
+            metadata_indptr=metadata_indptr,
+            metadata_last_page_len=metadata_last_page_len,
+            metadata_last_page_idx=num_metadata_pages - 1,
+            entry_block_ids=list(self.entry_block_ids[:num_score_entries]),
+            num_score_entries=num_score_entries,
+            num_packed_entries=num_packed_entries,
+            metadata_page_size=self.metadata_page_size,
+        )
+
+    def _ensure_entry_capacity(self, required_entries: int) -> None:
+        required_pages = (
+            required_entries + self.metadata_page_size - 1
+        ) // self.metadata_page_size
+        current_pages = int(self.metadata_data.shape[0])
+        if required_pages <= current_pages:
+            return
+
+        new_pages = max(required_pages, current_pages * 2)
+        new_metadata_data = torch.zeros(
+            (
+                new_pages,
+                2,
+                self.metadata_page_size,
+                self.num_kv_heads,
+                self.head_dim,
+            ),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        new_metadata_data[:current_pages].copy_(self.metadata_data)
+        self.metadata_data = new_metadata_data
+        self.metadata_indices = torch.arange(
+            new_pages,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+    def _zero_entry(self, entry_idx: int) -> None:
+        self._ensure_entry_capacity(entry_idx + 1)
+        page_idx = entry_idx // self.metadata_page_size
+        page_offset = entry_idx % self.metadata_page_size
+        self.metadata_data[page_idx, :, page_offset].zero_()
 
 
 def pack_quest_metadata_cache(

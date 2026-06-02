@@ -127,6 +127,14 @@ define_extension_target(
   USE_SABI 3.11
   WITH_SOABI)
 
+# The spinloop module uses Py_buffer/PyBuffer_Release directly. Those APIs are
+# hidden from the Python headers when Py_LIMITED_API is visible during C++
+# compilation, even though the module artifact still uses the stable ABI naming
+# convention above. Keep the stable-ABI module target shape, but prevent
+# Py_LIMITED_API from leaking into this source compile.
+target_compile_options(spinloop PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-UPy_LIMITED_API>)
+
 #
 # Forward the non-CUDA device extensions to external CMake scripts.
 #

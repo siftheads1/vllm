@@ -16,12 +16,26 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.mixed_precision_recovery.config import MPRConfig
+from vllm.v1.mixed_precision_recovery.cpu_backup import (
+    CPUBackupStore,
+    CPUBackupStats,
+    SemanticCPUBackupStore,
+)
 from vllm.v1.mixed_precision_recovery.debug import MPRDebugWriter
 from vllm.v1.mixed_precision_recovery.digest import (
     KeyBlockDigest,
     summarize_key_block,
 )
+from vllm.v1.mixed_precision_recovery.quest_packing import (
+    PackedQuestDigestCache,
+    QuestMetadataStore,
+)
+from vllm.v1.mixed_precision_recovery.recovery import (
+    BlockRecoveryManager,
+    select_recovery_block_ids,
+)
 from vllm.v1.mixed_precision_recovery.scoring import (
+    DigestScoreResult,
     DigestScoringBackend,
     get_digest_scoring_backend,
 )
@@ -73,6 +87,27 @@ class RequestBlockContext:
     has_block_table_context: bool
 
 
+@dataclass(frozen=True)
+class QueryScoreContext:
+    """Internal score result plus debug metadata for query-time MPR paths."""
+
+    layer_name: str
+    should_record: bool
+    layer_event_idx: int | None
+    query: Any
+    window_query: torch.Tensor
+    window_query_len: int
+    request_context: RequestBlockContext
+    physical_block_ids: list[int]
+    score_result: DigestScoreResult
+    topk: int
+    topk_block_ids: list[int]
+    topk_scores: list[float]
+    score_packing_debug: dict[str, Any]
+    head_debug: dict[str, Any]
+    score_block_debug: dict[str, Any]
+
+
 @dataclass
 class RecoverySidecar:
     """Score-only sidecar state for Milestone 1.
@@ -90,12 +125,21 @@ class RecoverySidecar:
     _score_counts: Counter[str] = field(default_factory=Counter)
     _block_offsets: dict[str, dict[int, set[int]]] = field(default_factory=dict)
     _digest_cache: dict[str, dict[int, BlockDigest]] = field(default_factory=dict)
+    _quest_metadata_stores: dict[str, QuestMetadataStore] = field(
+        default_factory=dict
+    )
     # Step 1.4 v0 uses layer_name-only query windows for single-request smoke.
     # Serving/multi-request support needs request-scoped keys to avoid mixing
     # decode queries from different requests in the same layer buffer.
     _query_windows: dict[str, deque[torch.Tensor]] = field(default_factory=dict)
+    _cpu_backup_store: CPUBackupStore = field(
+        default_factory=SemanticCPUBackupStore
+    )
     _debug_writer: MPRDebugWriter = field(init=False)
     _scoring_backend: DigestScoringBackend = field(init=False)
+    _recovery_manager: BlockRecoveryManager = field(
+        default_factory=BlockRecoveryManager
+    )
 
     def __post_init__(self) -> None:
         """Initialize optional debug output and emit the init event."""
@@ -107,7 +151,8 @@ class RecoverySidecar:
             logger.info(
                 "MPR sidecar enabled: topk=%d, window_size=%d, "
                 "recent_tokens=%d, score_agg=%s, scoring_backend=%s, "
-                "digest_kind=%s, score_granularity=%s, debug_dir=%s",
+                "digest_kind=%s, score_granularity=%s, cpu_backup=%s, "
+                "scoring_enabled=%s, debug_dir=%s",
                 self.config.topk,
                 self.config.window_size,
                 self.config.recent_tokens,
@@ -115,6 +160,8 @@ class RecoverySidecar:
                 self.config.scoring_backend,
                 self.config.digest_kind,
                 self.config.score_granularity,
+                self.config.cpu_backup_enabled,
+                self.config.scoring_enabled,
                 self.config.debug_dir,
             )
             self._record("init")
@@ -122,6 +169,100 @@ class RecoverySidecar:
     def enabled(self) -> bool:
         """Return whether MPR sidecar observation is enabled."""
         return self.config.enabled
+
+    def cpu_backup_stats(self) -> CPUBackupStats:
+        """Return point-in-time CPU backup stats."""
+        return self._cpu_backup_store.stats()
+
+    def release_blocks(
+        self,
+        block_ids: Any,
+        *,
+        reason: str = "free",
+        request_id: str | None = None,
+    ) -> None:
+        """Release MPR state keyed by GPU KV physical block id.
+
+        This is a Milestone 2 lifecycle cleanup entry point. The caller passes
+        vLLM GPU KV physical block ids, not CPU backup block ids. The CPU
+        backup store maps those external ids to any internal storage handle.
+        This method does not free vLLM GPU KV blocks; vLLM's BlockPool still
+        owns that lifecycle. It only drops MPR metadata and CPU backups that
+        would become stale once those GPU block ids are reusable.
+        """
+        if not self.config.enabled:
+            return
+        physical_block_ids = self._normalize_physical_block_ids(block_ids)
+        if not physical_block_ids:
+            # Defensive no-op path for callers that report a release event
+            # without any concrete GPU physical block ids.
+            self._record(
+                "blocks_released",
+                request_id=request_id,
+                release_reason=reason,
+                released_block_ids=[],
+                released_offset_entries=0,
+                released_digest_entries=0,
+                released_cpu_backup_entries=0,
+                released_cpu_backup_bytes=0,
+                invalidated_quest_metadata_stores=0,
+            )
+            return
+
+        block_id_set = set(physical_block_ids)
+
+        # First drop write-completion bookkeeping. These offset sets are used
+        # only to decide when a physical block has become full enough to digest.
+        released_offset_entries = 0
+        for layer_name in list(self._block_offsets):
+            layer_offsets = self._block_offsets[layer_name]
+            for block_id in block_id_set:
+                if layer_offsets.pop(block_id, None) is not None:
+                    released_offset_entries += 1
+            if not layer_offsets:
+                del self._block_offsets[layer_name]
+
+        # Then drop digest entries keyed by the same GPU physical block ids.
+        # QuestMetadataStore is append-only in the current fast path, so when
+        # a digest is removed we invalidate the whole layer store rather than
+        # risk scoring with stale packed metadata.
+        released_digest_entries = 0
+        invalidated_quest_metadata_stores = 0
+        for layer_name in list(self._digest_cache):
+            layer_digests = self._digest_cache[layer_name]
+            removed_for_layer = 0
+            for block_id in block_id_set:
+                if layer_digests.pop(block_id, None) is not None:
+                    released_digest_entries += 1
+                    removed_for_layer += 1
+            if removed_for_layer and layer_name in self._quest_metadata_stores:
+                # QuestMetadataStore is append-only in M1. Drop the persistent
+                # packed store on release to avoid stale fast-path metadata.
+                # A cleaner production path should use generation-aware keys
+                # or a removable metadata store.
+                del self._quest_metadata_stores[layer_name]
+                invalidated_quest_metadata_stores += 1
+            if not layer_digests:
+                del self._digest_cache[layer_name]
+
+        # Finally release sidecar-owned CPU backup entries. The backup store
+        # maps these external GPU block ids to whatever internal CPU storage
+        # representation it owns.
+        release_result = self._cpu_backup_store.release_blocks(block_id_set)
+        backup_stats = self._cpu_backup_store.stats()
+        self._record(
+            "blocks_released",
+            request_id=request_id,
+            release_reason=reason,
+            released_block_ids=physical_block_ids,
+            released_offset_entries=released_offset_entries,
+            released_digest_entries=released_digest_entries,
+            released_cpu_backup_entries=release_result.released_entries,
+            released_cpu_backup_bytes=release_result.released_bytes,
+            cpu_backup_block_count=backup_stats.block_count,
+            cpu_backup_bytes=backup_stats.total_bytes,
+            invalidated_quest_metadata_stores=invalidated_quest_metadata_stores,
+        )
 
     def observe_kv_write(
         self,
@@ -257,10 +398,224 @@ class RecoverySidecar:
         """
         if not self.config.enabled:
             return
+        if not self.config.scoring_enabled:
+            self.counters["score_skipped_disabled"] += 1
+            return
+        score_context = self._estimate_query_scores(
+            layer_name=layer_name,
+            query=query,
+            attn_metadata=attn_metadata,
+        )
+        if score_context is None:
+            return
+        self._record_score_estimated(score_context)
+
+    def recover_before_attention(
+        self,
+        layer_name: str,
+        query: Any = None,
+        attn_metadata: Any = None,
+        kv_cache: Any = None,
+        block_size: int | None = None,
+    ) -> None:
+        """Materialize selected CPU-backed KV blocks before attention.
+
+        M3 keeps this as a sidecar-level API first. The attention hook should
+        call this instead of ``observe_query`` when recovery is enabled, so the
+        decode query is scored once and appended to the query window once.
+        """
+        self._recover_before_attention_impl(
+            layer_name=layer_name,
+            query=query,
+            attn_metadata=attn_metadata,
+            kv_cache=kv_cache,
+            block_size=block_size,
+            apply_test_mutation=False,
+        )
+
+    def recover_before_attention_with_test_mutation(
+        self,
+        layer_name: str,
+        query: Any = None,
+        attn_metadata: Any = None,
+        kv_cache: Any = None,
+        block_size: int | None = None,
+    ) -> None:
+        """M3 validation-only recovery path with configured fault injection."""
+        self._recover_before_attention_impl(
+            layer_name=layer_name,
+            query=query,
+            attn_metadata=attn_metadata,
+            kv_cache=kv_cache,
+            block_size=block_size,
+            apply_test_mutation=True,
+        )
+
+    def _recover_before_attention_impl(
+        self,
+        *,
+        layer_name: str,
+        query: Any = None,
+        attn_metadata: Any = None,
+        kv_cache: Any = None,
+        block_size: int | None = None,
+        apply_test_mutation: bool,
+    ) -> None:
+        """Shared recovery implementation for production and test paths."""
+        if not self.config.enabled:
+            return
+        if not self.config.recovery_enabled:
+            return
         should_record, layer_event_idx = self._should_record_layer_event(
             layer_name,
             self._score_counts,
         )
+        if not self.config.cpu_backup_enabled:
+            self._record_recovery_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "cpu_backup_disabled",
+                query=query,
+                attn_metadata=attn_metadata,
+                kv_cache=kv_cache,
+            )
+            return
+        if not self.config.scoring_enabled:
+            self._record_recovery_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "scoring_disabled",
+                query=query,
+                attn_metadata=attn_metadata,
+                kv_cache=kv_cache,
+            )
+            return
+        if kv_cache is None:
+            self._record_recovery_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "missing_kv_cache",
+                query=query,
+                attn_metadata=attn_metadata,
+                kv_cache=kv_cache,
+            )
+            return
+
+        score_context = self._estimate_query_scores(
+            layer_name=layer_name,
+            query=query,
+            attn_metadata=attn_metadata,
+            should_record=should_record,
+            layer_event_idx=layer_event_idx,
+            block_size_override=block_size,
+        )
+        if score_context is None:
+            self._record_recovery_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "no_score_context",
+                query=query,
+                attn_metadata=attn_metadata,
+                kv_cache=kv_cache,
+            )
+            return
+
+        selected_block_ids = select_recovery_block_ids(
+            score_result=score_context.score_result,
+            physical_block_ids=score_context.physical_block_ids,
+            policy=self.config.recovery_policy,
+            topk=self.config.recovery_topk,
+            threshold=self.config.recovery_threshold,
+        )
+        test_mutated_block_ids = []
+        if apply_test_mutation:
+            test_mutated_block_ids = self._maybe_mutate_recovery_targets(
+                kv_cache=kv_cache,
+                selected_block_ids=selected_block_ids,
+            )
+            if self.config.recovery_test_mode == "mutate_only":
+                self._record_recovery_test_mutated(
+                    score_context=score_context,
+                    kv_cache=kv_cache,
+                    selected_block_ids=selected_block_ids,
+                    mutated_block_ids=test_mutated_block_ids,
+                )
+                return
+            if self.config.recovery_test_mode != "recover":
+                raise ValueError(
+                    "MPR recovery_test_mode must be 'recover' or "
+                    f"'mutate_only', got {self.config.recovery_test_mode!r}."
+                )
+        recovery_result = self._recovery_manager.materialize_blocks(
+            selected_block_ids=selected_block_ids,
+            kv_cache=kv_cache,
+            cpu_backup_store=self._cpu_backup_store,
+            layer_name=layer_name,
+        )
+        backup_stats = self._cpu_backup_store.stats()
+        if score_context.should_record:
+            self._record(
+                "recovery_materialized",
+                layer_name=layer_name,
+                layer_event_idx=score_context.layer_event_idx,
+                query_shape=self._shape_of(query),
+                window_query_shape=self._shape_of(score_context.window_query),
+                window_query_len=score_context.window_query_len,
+                kv_cache_shape=self._shape_of(kv_cache),
+                recovery_policy=self.config.recovery_policy,
+                recovery_topk=self.config.recovery_topk,
+                recovery_threshold=self.config.recovery_threshold,
+                recovery_test_mutate=(
+                    self.config.recovery_test_mutate
+                    if apply_test_mutation
+                    else "off"
+                ),
+                recovery_test_mutated_scope=(
+                    self._recovery_test_mutated_scope()
+                    if apply_test_mutation
+                    else "selected"
+                ),
+                recovery_test_mode=(
+                    self.config.recovery_test_mode
+                    if apply_test_mutation
+                    else "recover"
+                ),
+                recovery_test_mutated_block_ids=test_mutated_block_ids,
+                recovery_selected_block_ids=recovery_result.selected_block_ids,
+                recovered_block_ids=recovery_result.recovered_block_ids,
+                missing_backup_block_ids=(
+                    recovery_result.missing_backup_block_ids
+                ),
+                skipped_block_ids=recovery_result.skipped_block_ids,
+                recovered_bytes=recovery_result.recovered_bytes,
+                recovery_copy_wall_ms=(
+                    recovery_result.copy_wall_seconds * 1000.0
+                ),
+                cpu_backup_block_count=backup_stats.block_count,
+                cpu_backup_bytes=backup_stats.total_bytes,
+                **score_context.score_block_debug,
+            )
+
+    def _estimate_query_scores(
+        self,
+        *,
+        layer_name: str,
+        query: Any = None,
+        attn_metadata: Any = None,
+        should_record: bool | None = None,
+        layer_event_idx: int | None = None,
+        block_size_override: int | None = None,
+    ) -> QueryScoreContext | None:
+        """Estimate query-time digest scores and return reusable context."""
+        if should_record is None:
+            should_record, layer_event_idx = self._should_record_layer_event(
+                layer_name,
+                self._score_counts,
+            )
         if query is None:
             self._record_score_skip(
                 should_record,
@@ -352,7 +707,11 @@ class RecoverySidecar:
         # VLLM_MPR_WINDOW_SIZE. Shape: [num_q_heads, head_dim].
         window_query = torch.stack(tuple(window), dim=0).mean(dim=0)
 
-        block_size = self._block_size_for_layer(layer_name)
+        block_size = (
+            block_size_override
+            if block_size_override is not None
+            else self._block_size_for_layer(layer_name)
+        )
         request_context = self._request_block_context(
             attn_metadata=attn_metadata,
             block_size=block_size,
@@ -362,10 +721,8 @@ class RecoverySidecar:
             if request_context.has_block_table_context
             else None
         )
-        physical_block_ids, digest_min, digest_max = self._pack_layer_digests(
+        physical_block_ids = self._select_layer_digest_block_ids(
             layer_name,
-            device=window_query.device,
-            dtype=window_query.dtype,
             candidate_block_ids=candidate_block_ids,
         )
         if not physical_block_ids:
@@ -386,12 +743,54 @@ class RecoverySidecar:
             )
             return
 
-        score_result = self._scoring_backend.estimate(
-            query_window=window_query,
-            digest_min=digest_min,
-            digest_max=digest_max,
-            score_agg=self.config.score_agg,
-            metadata_page_size=block_size,
+        score_result = None
+        quest_packed_fast_path = False
+        quest_packed_fallback_reason = "backend_not_quest_cuda"
+        if self.config.scoring_backend == "quest_cuda" and hasattr(
+            self._scoring_backend,
+            "estimate_packed",
+        ):
+            packed, quest_packed_fallback_reason = (
+                self._try_get_quest_packed_prefix(
+                    layer_name=layer_name,
+                    physical_block_ids=physical_block_ids,
+                    block_size=block_size,
+                    device=window_query.device,
+                    dtype=window_query.dtype,
+                )
+            )
+            if packed is not None:
+                score_result = self._scoring_backend.estimate_packed(
+                    query_window=window_query,
+                    packed=packed,
+                    num_kv_heads=int(packed.metadata_data.shape[3]),
+                    score_agg=self.config.score_agg,
+                )
+                quest_packed_fast_path = True
+                quest_packed_fallback_reason = None
+
+        if score_result is None:
+            physical_block_ids, digest_min, digest_max = self._pack_layer_digests(
+                layer_name,
+                device=window_query.device,
+                dtype=window_query.dtype,
+                candidate_block_ids=candidate_block_ids,
+            )
+            score_result = self._scoring_backend.estimate(
+                query_window=window_query,
+                digest_min=digest_min,
+                digest_max=digest_max,
+                score_agg=self.config.score_agg,
+                metadata_page_size=block_size,
+            )
+            if self.config.scoring_backend != "quest_cuda":
+                quest_packed_fallback_reason = "backend_not_quest_cuda"
+            elif quest_packed_fallback_reason is None:
+                quest_packed_fallback_reason = "fallback_after_fast_path_miss"
+
+        score_packing_debug = self._score_packing_debug_fields(
+            quest_packed_fast_path=quest_packed_fast_path,
+            quest_packed_fallback_reason=quest_packed_fallback_reason,
         )
         scores = score_result.block_scores
         topk = min(self.config.topk, int(scores.numel()))
@@ -411,29 +810,155 @@ class RecoverySidecar:
             observed_digest_block_ids=physical_block_ids,
         )
 
-        if should_record:
-            self._record(
-                "score_estimated",
-                layer_name=layer_name,
-                layer_event_idx=layer_event_idx,
-                query_shape=self._shape_of(query),
-                window_query_shape=self._shape_of(window_query),
-                window_query_len=len(window),
-                num_digest_blocks=len(physical_block_ids),
-                score_count=int(scores.numel()),
-                score_agg=self.config.score_agg,
-                scoring_backend=score_result.scoring_backend,
-                digest_kind=self.config.digest_kind,
-                num_q_heads=score_result.num_q_heads,
-                num_kv_heads=score_result.num_kv_heads,
-                gqa_group_size=score_result.group_size,
-                score_granularity=self.config.score_granularity,
-                topk=topk,
-                topk_block_ids=topk_block_ids,
-                topk_scores=topk_score_values,
-                **head_debug,
-                **score_block_debug,
+        return QueryScoreContext(
+            layer_name=layer_name,
+            should_record=should_record,
+            layer_event_idx=layer_event_idx,
+            query=query,
+            window_query=window_query,
+            window_query_len=len(window),
+            request_context=request_context,
+            physical_block_ids=physical_block_ids,
+            score_result=score_result,
+            topk=topk,
+            topk_block_ids=topk_block_ids,
+            topk_scores=topk_score_values,
+            score_packing_debug=score_packing_debug,
+            head_debug=head_debug,
+            score_block_debug=score_block_debug,
+        )
+
+    def _record_score_estimated(self, score_context: QueryScoreContext) -> None:
+        """Record a score_estimated event from reusable score context."""
+        if not score_context.should_record:
+            return
+        score_result = score_context.score_result
+        self._record(
+            "score_estimated",
+            layer_name=score_context.layer_name,
+            layer_event_idx=score_context.layer_event_idx,
+            query_shape=self._shape_of(score_context.query),
+            window_query_shape=self._shape_of(score_context.window_query),
+            window_query_len=score_context.window_query_len,
+            num_digest_blocks=len(score_context.physical_block_ids),
+            score_count=int(score_result.block_scores.numel()),
+            score_agg=self.config.score_agg,
+            scoring_backend=score_result.scoring_backend,
+            digest_kind=self.config.digest_kind,
+            num_q_heads=score_result.num_q_heads,
+            num_kv_heads=score_result.num_kv_heads,
+            gqa_group_size=score_result.group_size,
+            score_granularity=self.config.score_granularity,
+            topk=score_context.topk,
+            topk_block_ids=score_context.topk_block_ids,
+            topk_scores=score_context.topk_scores,
+            **score_context.score_packing_debug,
+            **score_context.head_debug,
+            **score_context.score_block_debug,
+        )
+
+    def _record_recovery_test_mutated(
+        self,
+        *,
+        score_context: QueryScoreContext,
+        kv_cache: Any,
+        selected_block_ids: list[int],
+        mutated_block_ids: list[int],
+    ) -> None:
+        """Record validation-only mutation that intentionally skips recovery."""
+        if not score_context.should_record:
+            return
+        backup_stats = self._cpu_backup_store.stats()
+        self._record(
+            "recovery_test_mutated",
+            layer_name=score_context.layer_name,
+            layer_event_idx=score_context.layer_event_idx,
+            query_shape=self._shape_of(score_context.query),
+            window_query_shape=self._shape_of(score_context.window_query),
+            window_query_len=score_context.window_query_len,
+            kv_cache_shape=self._shape_of(kv_cache),
+            recovery_policy=self.config.recovery_policy,
+            recovery_topk=self.config.recovery_topk,
+            recovery_threshold=self.config.recovery_threshold,
+            recovery_test_mutate=self.config.recovery_test_mutate,
+            recovery_test_mutated_scope=self._recovery_test_mutated_scope(),
+            recovery_test_mode=self.config.recovery_test_mode,
+            recovery_selected_block_ids=selected_block_ids,
+            recovery_test_mutated_block_ids=mutated_block_ids,
+            cpu_backup_block_count=backup_stats.block_count,
+            cpu_backup_bytes=backup_stats.total_bytes,
+            **score_context.score_block_debug,
+        )
+
+    def _maybe_mutate_recovery_targets(
+        self,
+        *,
+        kv_cache: Any,
+        selected_block_ids: list[int],
+    ) -> list[int]:
+        """Apply optional M3 fault-injection mutation before recovery."""
+        if self.config.recovery_test_mutate == "off":
+            return []
+        if self.config.recovery_test_mutate not in ("zero_selected", "zero_all"):
+            raise ValueError(
+                "MPR recovery_test_mutate must be 'off', 'zero_selected', "
+                "or 'zero_all', "
+                f"got {self.config.recovery_test_mutate!r}."
             )
+        if not isinstance(kv_cache, torch.Tensor):
+            return []
+        if kv_cache.ndim != 5 or int(kv_cache.shape[0]) != 2:
+            return []
+
+        if self.config.recovery_test_mutate == "zero_all":
+            kv_cache.zero_()
+            return list(range(int(kv_cache.shape[1])))
+
+        mutated_block_ids: list[int] = []
+        num_blocks = int(kv_cache.shape[1])
+        for block_id in selected_block_ids:
+            block_id = int(block_id)
+            if block_id < 0 or block_id >= num_blocks:
+                continue
+            kv_cache[:, block_id].zero_()
+            mutated_block_ids.append(block_id)
+        return mutated_block_ids
+
+    def _recovery_test_mutated_scope(self) -> str:
+        """Return debug scope for validation-only recovery mutation."""
+        if self.config.recovery_test_mutate == "zero_all":
+            return "all_kv_cache"
+        return "selected"
+
+    def _record_recovery_skip(
+        self,
+        should_record: bool,
+        layer_name: str,
+        layer_event_idx: int | None,
+        reason: str,
+        *,
+        query: Any = None,
+        attn_metadata: Any = None,
+        kv_cache: Any = None,
+    ) -> None:
+        """Record a skipped recovery event when debug limits allow it."""
+        if not should_record:
+            return
+        self._record(
+            "recovery_skipped",
+            layer_name=layer_name,
+            layer_event_idx=layer_event_idx,
+            skipped_reason=reason,
+            query_shape=self._shape_of(query),
+            max_query_len=getattr(attn_metadata, "max_query_len", None),
+            num_actual_tokens=getattr(attn_metadata, "num_actual_tokens", None),
+            kv_cache_shape=self._shape_of(kv_cache),
+            recovery_policy=self.config.recovery_policy,
+            recovery_topk=self.config.recovery_topk,
+            recovery_threshold=self.config.recovery_threshold,
+            cpu_backup_enabled=self.config.cpu_backup_enabled,
+            scoring_enabled=self.config.scoring_enabled,
+        )
 
     def _record_score_skip(
         self,
@@ -836,6 +1361,17 @@ class RecoverySidecar:
                     digest,
                     layer_event_idx,
                 )
+                self._append_quest_metadata_digest(
+                    layer_name=layer_name,
+                    block_id=block_id,
+                    digest=digest,
+                )
+                self._maybe_backup_kv_block(
+                    layer_name=layer_name,
+                    block_id=block_id,
+                    kv_block=kv_cache[:, block_id],
+                    layer_event_idx=layer_event_idx,
+                )
                 created_block_ids.append(block_id)
                 if layer_name in self._layer_indices:
                     self._record(
@@ -853,6 +1389,139 @@ class RecoverySidecar:
                     )
 
         return created_block_ids
+
+    def _maybe_backup_kv_block(
+        self,
+        *,
+        layer_name: str,
+        block_id: int,
+        kv_block: torch.Tensor,
+        layer_event_idx: int | None,
+    ) -> None:
+        """Create the M2 semantic CPU fp16 backup for one full K/V block."""
+        if not self.config.cpu_backup_enabled:
+            return
+        result = self._cpu_backup_store.put(
+            layer_name=layer_name,
+            physical_block_id=block_id,
+            kv_block=kv_block,
+        )
+        stats = self._cpu_backup_store.stats()
+        if layer_name in self._layer_indices:
+            self._record(
+                "cpu_backup_created",
+                layer_name=layer_name,
+                layer_event_idx=layer_event_idx,
+                physical_block_id=block_id,
+                cpu_backup_shape=list(result.shape),
+                cpu_backup_dtype=str(result.dtype),
+                cpu_backup_bytes=result.num_bytes,
+                cpu_backup_copy_wall_ms=result.copy_wall_seconds * 1000.0,
+                cpu_backup_block_count=stats.block_count,
+                cpu_backup_total_bytes=stats.total_bytes,
+                cpu_backup_total_copy_wall_ms=(
+                    stats.total_copy_wall_seconds * 1000.0
+                ),
+            )
+        else:
+            self.counters["cpu_backup_created"] += 1
+
+    def _append_quest_metadata_digest(
+        self,
+        *,
+        layer_name: str,
+        block_id: int,
+        digest: KeyBlockDigest,
+    ) -> None:
+        """Append a newly created digest to the layer's Quest metadata store."""
+        if self.config.scoring_backend != "quest_cuda":
+            return
+        store = self._quest_metadata_stores.get(layer_name)
+        num_kv_heads = int(digest.digest_min.shape[0])
+        head_dim = int(digest.digest_min.shape[1])
+        if store is None:
+            store = QuestMetadataStore(
+                metadata_page_size=int(digest.block_size),
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                dtype=digest.digest_max.dtype,
+                device=digest.digest_max.device,
+            )
+            self._quest_metadata_stores[layer_name] = store
+        elif (
+            store.metadata_page_size != int(digest.block_size)
+            or store.num_kv_heads != num_kv_heads
+            or store.head_dim != head_dim
+            or store.dtype != digest.digest_max.dtype
+            or store.device != digest.digest_max.device
+        ):
+            raise AssertionError(
+                "MPR Quest metadata store shape/dtype/device mismatch for "
+                f"{layer_name}."
+            )
+
+        store.append_digest(
+            block_id=block_id,
+            digest_min=digest.digest_min,
+            digest_max=digest.digest_max,
+        )
+
+    def _select_layer_digest_block_ids(
+        self,
+        layer_name: str,
+        *,
+        candidate_block_ids: list[int] | None = None,
+    ) -> list[int]:
+        """Select existing layer digest block ids without stacking tensors."""
+        layer_digests = self._digest_cache.get(layer_name, {})
+        if not layer_digests:
+            return []
+        if candidate_block_ids is None:
+            return sorted(layer_digests)
+        return [block_id for block_id in candidate_block_ids if block_id in layer_digests]
+
+    def _try_get_quest_packed_prefix(
+        self,
+        *,
+        layer_name: str,
+        physical_block_ids: list[int],
+        block_size: int | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[PackedQuestDigestCache | None, str | None]:
+        """Return a persistent Quest metadata prefix view when safe."""
+        if not physical_block_ids:
+            return None, "no_digest_blocks"
+        if block_size is None or block_size <= 0:
+            return None, "missing_block_size"
+        store = self._quest_metadata_stores.get(layer_name)
+        if store is None:
+            return None, "missing_quest_metadata_store"
+        if store.metadata_page_size != block_size:
+            return None, "metadata_page_size_mismatch"
+        if store.device != device:
+            return None, "metadata_device_mismatch"
+        if store.dtype != dtype:
+            return None, "metadata_dtype_mismatch"
+        if not store.can_view_prefix(physical_block_ids):
+            return None, "non_prefix_score_candidates"
+        return store.view_prefix(len(physical_block_ids)), None
+
+    @staticmethod
+    def _score_packing_debug_fields(
+        *,
+        quest_packed_fast_path: bool,
+        quest_packed_fallback_reason: str | None,
+    ) -> dict[str, Any]:
+        """Build debug metadata for Quest packed-cache fast path usage."""
+        fields: dict[str, Any] = {
+            "quest_packed_fast_path": quest_packed_fast_path,
+        }
+        if quest_packed_fallback_reason is not None:
+            fields["quest_packed_fallback_reason"] = (
+                quest_packed_fallback_reason
+            )
+        return fields
 
     def _pack_layer_digests(
         self,
@@ -937,6 +1606,39 @@ class RecoverySidecar:
     def _num_digest_blocks(self) -> int:
         """Return the total number of cached block digests across layers."""
         return sum(len(layer_digests) for layer_digests in self._digest_cache.values())
+
+    @staticmethod
+    def _normalize_physical_block_ids(block_ids: Any) -> list[int]:
+        """Flatten a one-level block id container into sorted unique ids."""
+        if block_ids is None:
+            return []
+        # Tensor-like whole input, e.g. torch.tensor([1, 2, 3]) or a shaped
+        # block-id tensor. This is mostly defensive for direct sidecar callers;
+        # the current KVCacheManager hook passes a Python list.
+        if hasattr(block_ids, "detach"):
+            return sorted(
+                {
+                    int(block_id)
+                    for block_id in block_ids.detach().cpu().reshape(-1).tolist()
+                }
+            )
+        normalized: set[int] = set()
+        # General Python container path, e.g. [1, 2], ([1], [2]), or a mixed
+        # list containing tensors. This is the path used by the current
+        # KVCacheManager hook after flattening group-wise block ids.
+        for item in block_ids:
+            if item is None:
+                continue
+            if hasattr(item, "detach"):
+                normalized.update(
+                    int(block_id)
+                    for block_id in item.detach().cpu().reshape(-1).tolist()
+                )
+            elif isinstance(item, (list, tuple, set)):
+                normalized.update(int(block_id) for block_id in item)
+            else:
+                normalized.add(int(item))
+        return sorted(normalized)
 
     @staticmethod
     def _tensor_to_int_list(value: Any) -> list[int] | None:
