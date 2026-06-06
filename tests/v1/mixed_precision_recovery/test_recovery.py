@@ -34,6 +34,7 @@ def _make_recovery_sidecar(
             enabled=True,
             recent_tokens=0,
             cpu_backup_enabled=True,
+            backup_storage_mode="fp16_only",
             recovery_enabled=recovery_enabled,
             recovery_topk=1,
             recovery_policy=recovery_policy,

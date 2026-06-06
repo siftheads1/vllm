@@ -259,8 +259,26 @@ class RecoverySidecar:
             released_digest_entries=released_digest_entries,
             released_cpu_backup_entries=release_result.released_entries,
             released_cpu_backup_bytes=release_result.released_bytes,
+            released_cpu_backup_fp16_payload_bytes=(
+                release_result.fp16_payload_bytes
+            ),
+            released_cpu_backup_int8_payload_bytes=(
+                release_result.int8_payload_bytes
+            ),
+            released_cpu_backup_int8_scale_bytes=(
+                release_result.int8_scale_bytes
+            ),
+            released_cpu_backup_total_actual_bytes=(
+                release_result.total_actual_backup_bytes
+            ),
             cpu_backup_block_count=backup_stats.block_count,
             cpu_backup_bytes=backup_stats.total_bytes,
+            cpu_backup_fp16_payload_bytes=backup_stats.fp16_payload_bytes,
+            cpu_backup_int8_payload_bytes=backup_stats.int8_payload_bytes,
+            cpu_backup_int8_scale_bytes=backup_stats.int8_scale_bytes,
+            cpu_backup_total_actual_bytes=(
+                backup_stats.total_actual_backup_bytes
+            ),
             invalidated_quest_metadata_stores=invalidated_quest_metadata_stores,
         )
 
@@ -597,6 +615,12 @@ class RecoverySidecar:
                 ),
                 cpu_backup_block_count=backup_stats.block_count,
                 cpu_backup_bytes=backup_stats.total_bytes,
+                cpu_backup_fp16_payload_bytes=backup_stats.fp16_payload_bytes,
+                cpu_backup_int8_payload_bytes=backup_stats.int8_payload_bytes,
+                cpu_backup_int8_scale_bytes=backup_stats.int8_scale_bytes,
+                cpu_backup_total_actual_bytes=(
+                    backup_stats.total_actual_backup_bytes
+                ),
                 **score_context.score_block_debug,
             )
 
@@ -887,6 +911,12 @@ class RecoverySidecar:
             recovery_test_mutated_block_ids=mutated_block_ids,
             cpu_backup_block_count=backup_stats.block_count,
             cpu_backup_bytes=backup_stats.total_bytes,
+            cpu_backup_fp16_payload_bytes=backup_stats.fp16_payload_bytes,
+            cpu_backup_int8_payload_bytes=backup_stats.int8_payload_bytes,
+            cpu_backup_int8_scale_bytes=backup_stats.int8_scale_bytes,
+            cpu_backup_total_actual_bytes=(
+                backup_stats.total_actual_backup_bytes
+            ),
             **score_context.score_block_debug,
         )
 
@@ -1405,6 +1435,7 @@ class RecoverySidecar:
             layer_name=layer_name,
             physical_block_id=block_id,
             kv_block=kv_block,
+            backup_storage_mode=self.config.backup_storage_mode,
         )
         stats = self._cpu_backup_store.stats()
         if layer_name in self._layer_indices:
@@ -1416,9 +1447,25 @@ class RecoverySidecar:
                 cpu_backup_shape=list(result.shape),
                 cpu_backup_dtype=str(result.dtype),
                 cpu_backup_bytes=result.num_bytes,
+                cpu_backup_fp16_payload_bytes=result.fp16_payload_bytes,
+                cpu_backup_int8_payload_bytes=result.int8_payload_bytes,
+                cpu_backup_int8_scale_bytes=result.int8_scale_bytes,
+                cpu_backup_total_actual_bytes=(
+                    result.total_actual_backup_bytes
+                ),
                 cpu_backup_copy_wall_ms=result.copy_wall_seconds * 1000.0,
                 cpu_backup_block_count=stats.block_count,
                 cpu_backup_total_bytes=stats.total_bytes,
+                cpu_backup_total_fp16_payload_bytes=(
+                    stats.fp16_payload_bytes
+                ),
+                cpu_backup_total_int8_payload_bytes=(
+                    stats.int8_payload_bytes
+                ),
+                cpu_backup_total_int8_scale_bytes=stats.int8_scale_bytes,
+                cpu_backup_store_total_actual_bytes=(
+                    stats.total_actual_backup_bytes
+                ),
                 cpu_backup_total_copy_wall_ms=(
                     stats.total_copy_wall_seconds * 1000.0
                 ),

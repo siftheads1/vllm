@@ -438,6 +438,7 @@ Generation smoke:
 ```text
 VLLM_MPR_ENABLE=1
 VLLM_MPR_CPU_BACKUP=1
+VLLM_MPR_BACKUP_STORAGE_MODE=fp16_only
 VLLM_MPR_RECOVERY_ENABLE=1
 single request
 FlashAttention

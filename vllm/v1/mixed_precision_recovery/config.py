@@ -105,6 +105,16 @@ class MPRConfig:
                 "backup_storage_mode must be 'eager_fp16_int8' or "
                 f"'fp16_only', got {self.backup_storage_mode!r}."
             )
+        if (
+            self.cpu_backup_enabled
+            and not self.precision_tiering_enabled
+            and self.backup_storage_mode == "eager_fp16_int8"
+        ):
+            raise ValueError(
+                "backup_storage_mode='eager_fp16_int8' requires "
+                "precision_tiering_enabled=True when cpu_backup_enabled=True; "
+                "use backup_storage_mode='fp16_only' for M3 fp16 recovery."
+            )
         _validate_ratio("tier_fp16_ratio", self.tier_fp16_ratio)
         _validate_ratio("tier_int8_ratio", self.tier_int8_ratio)
         ratio_sum = self.tier_fp16_ratio + self.tier_int8_ratio

@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm.v1.mixed_precision_recovery.backup_codec import (
+    FP16_BACKUP_FORMAT,
+    INT8_BACKUP_FORMAT,
+    INT8BackupCodec,
+)
 from vllm.v1.mixed_precision_recovery.config import MPRConfig
 from vllm.v1.mixed_precision_recovery.cpu_backup import (
     CPUBackupKey,
@@ -120,10 +126,12 @@ def test_mpr_config_defaults_to_quest_style_digest_and_kv_head_scores():
 
 def test_mpr_config_parses_cpu_backup_flag(monkeypatch):
     monkeypatch.setenv("VLLM_MPR_CPU_BACKUP", "1")
+    monkeypatch.setenv("VLLM_MPR_BACKUP_STORAGE_MODE", "fp16_only")
 
     config = MPRConfig.from_env()
 
     assert config.cpu_backup_enabled
+    assert config.backup_storage_mode == "fp16_only"
 
 
 def test_mpr_config_parses_scoring_enable_flag(monkeypatch):
@@ -204,6 +212,15 @@ def test_mpr_config_rejects_invalid_backup_storage_mode(monkeypatch):
         MPRConfig.from_env()
 
 
+def test_mpr_config_rejects_eager_int8_backup_without_precision_tiering():
+    with pytest.raises(ValueError, match="precision_tiering_enabled=True"):
+        MPRConfig(
+            cpu_backup_enabled=True,
+            precision_tiering_enabled=False,
+            backup_storage_mode="eager_fp16_int8",
+        )
+
+
 def test_mpr_config_rejects_negative_tier_ratio(monkeypatch):
     monkeypatch.setenv("VLLM_MPR_TIER_FP16_RATIO", "-0.1")
 
@@ -273,10 +290,82 @@ def test_semantic_cpu_backup_store_copies_fp16_and_releases_by_gpu_block_id():
     assert store.stats().block_count == 0
 
 
+def test_semantic_cpu_backup_store_eagerly_stores_fp16_and_int8_payloads():
+    store = SemanticCPUBackupStore()
+    kv_block = torch.arange(16, dtype=torch.float32).reshape(2, 4, 1, 2)
+
+    result = store.put(
+        layer_name="model.layers.0.self_attn.attn",
+        physical_block_id=7,
+        kv_block=kv_block,
+        backup_storage_mode="eager_fp16_int8",
+    )
+
+    key = CPUBackupKey(
+        layer_name="model.layers.0.self_attn.attn",
+        physical_block_id=7,
+    )
+    backup = store.get(key)
+    fp16_payload = store.get_payload(key, FP16_BACKUP_FORMAT)
+    int8_payload = store.get_payload(key, INT8_BACKUP_FORMAT)
+    assert backup is not None
+    assert fp16_payload is not None
+    assert int8_payload is not None
+    assert backup is fp16_payload.tensor
+    assert backup.dtype == torch.float16
+    assert int8_payload.quantized.dtype == torch.int8
+    assert int8_payload.scale.dtype == torch.float32
+    materialized_int8 = INT8BackupCodec().materialize(
+        int8_payload,
+        target_dtype=torch.float32,
+        target_device="cpu",
+    )
+    int8_error = (materialized_int8 - fp16_payload.tensor.float()).abs()
+    int8_bound = int8_payload.scale.unsqueeze(-1) / 2
+    assert bool(torch.all(int8_error <= int8_bound + 1e-6))
+
+    fp16_bytes = fp16_payload.payload_nbytes
+    int8_bytes = (
+        int8_payload.quantized.numel()
+        * int8_payload.quantized.element_size()
+    )
+    scale_bytes = int8_payload.scale.numel() * int8_payload.scale.element_size()
+    total_bytes = fp16_bytes + int8_bytes + scale_bytes
+    assert result.num_bytes == fp16_bytes
+    assert result.fp16_payload_bytes == fp16_bytes
+    assert result.int8_payload_bytes == int8_bytes
+    assert result.int8_scale_bytes == scale_bytes
+    assert result.total_actual_backup_bytes == total_bytes
+
+    stats = store.stats()
+    assert stats.block_count == 1
+    assert stats.fp16_payload_bytes == fp16_bytes
+    assert stats.int8_payload_bytes == int8_bytes
+    assert stats.int8_scale_bytes == scale_bytes
+    assert stats.total_actual_backup_bytes == total_bytes
+    assert stats.total_bytes == total_bytes
+
+    release = store.release_blocks({7})
+    assert release.released_entries == 1
+    assert release.fp16_payload_bytes == fp16_bytes
+    assert release.int8_payload_bytes == int8_bytes
+    assert release.int8_scale_bytes == scale_bytes
+    assert release.total_actual_backup_bytes == total_bytes
+    assert release.released_bytes == total_bytes
+    assert store.get(key) is None
+    assert store.get_payload(key, INT8_BACKUP_FORMAT) is None
+    assert store.stats().block_count == 0
+    assert store.stats().total_actual_backup_bytes == 0
+
+
 def test_sidecar_creates_cpu_backup_when_full_block_digest_is_created():
     layer_name = "model.layers.0.self_attn.attn"
     sidecar = RecoverySidecar(
-        config=MPRConfig(enabled=True, cpu_backup_enabled=True)
+        config=MPRConfig(
+            enabled=True,
+            cpu_backup_enabled=True,
+            backup_storage_mode="fp16_only",
+        )
     )
     kv_cache = torch.arange(2 * 2 * 4 * 1 * 2, dtype=torch.float32).reshape(
         2,
@@ -302,11 +391,58 @@ def test_sidecar_creates_cpu_backup_when_full_block_digest_is_created():
     assert sidecar.counters["cpu_backup_created"] == 1
 
 
+def test_sidecar_cpu_backup_created_debug_reports_payload_bytes(tmp_path):
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = RecoverySidecar(
+        config=MPRConfig(
+            enabled=True,
+            debug_dir=str(tmp_path),
+            cpu_backup_enabled=True,
+            precision_tiering_enabled=True,
+            backup_storage_mode="eager_fp16_int8",
+        )
+    )
+    sidecar._layer_indices[layer_name] = 0
+
+    sidecar._maybe_backup_kv_block(
+        layer_name=layer_name,
+        block_id=3,
+        kv_block=torch.arange(16, dtype=torch.float32).reshape(2, 4, 1, 2),
+        layer_event_idx=1,
+    )
+    sidecar._debug_writer.close()
+
+    events = []
+    for path in tmp_path.glob("*.jsonl"):
+        with path.open(encoding="utf-8") as f:
+            events.extend(json.loads(line) for line in f if line.strip())
+    backup_events = [
+        event for event in events if event["event"] == "cpu_backup_created"
+    ]
+    assert len(backup_events) == 1
+    event = backup_events[0]
+    assert event["cpu_backup_fp16_payload_bytes"] > 0
+    assert event["cpu_backup_int8_payload_bytes"] > 0
+    assert event["cpu_backup_int8_scale_bytes"] > 0
+    assert event["cpu_backup_total_actual_bytes"] == (
+        event["cpu_backup_fp16_payload_bytes"]
+        + event["cpu_backup_int8_payload_bytes"]
+        + event["cpu_backup_int8_scale_bytes"]
+    )
+    assert event["cpu_backup_total_bytes"] == (
+        event["cpu_backup_store_total_actual_bytes"]
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_sidecar_cpu_backup_matches_cuda_kv_cache_block():
     layer_name = "model.layers.0.self_attn.attn"
     sidecar = RecoverySidecar(
-        config=MPRConfig(enabled=True, cpu_backup_enabled=True)
+        config=MPRConfig(
+            enabled=True,
+            cpu_backup_enabled=True,
+            backup_storage_mode="fp16_only",
+        )
     )
     kv_cache = torch.arange(
         2 * 2 * 4 * 1 * 2,
@@ -564,6 +700,7 @@ def test_sidecar_release_blocks_cleans_block_keyed_state():
         config=MPRConfig(
             enabled=True,
             cpu_backup_enabled=True,
+            backup_storage_mode="fp16_only",
             scoring_backend="quest_cuda",
         )
     )
@@ -596,6 +733,7 @@ def test_sidecar_release_blocks_cleans_block_keyed_state():
         layer_name=layer_name,
         physical_block_id=4,
         kv_block=torch.ones(2, 2, 1, 2),
+        backup_storage_mode="fp16_only",
     )
 
     sidecar.release_blocks([4], reason="test")

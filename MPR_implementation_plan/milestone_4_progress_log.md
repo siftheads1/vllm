@@ -212,3 +212,110 @@ result:
 result:
   88 passed, 2 skipped
 ```
+
+## 2026-06-06: Step 4.4 Payload-Aware CPU Backup Store
+
+Implemented payload-aware CPU backup storage for M4 precision tiering while
+preserving the M3 fp16 recovery contract.
+
+Updated:
+
+```text
+vllm/v1/mixed_precision_recovery/cpu_backup.py
+  SemanticCPUBackupStore now stores one payload entry per CPUBackupKey
+  get(key) still returns the fp16 CPU tensor for M3 recovery
+  get_payload(key, backup_format) returns fp16 or int8 logical payloads
+  put(..., backup_storage_mode=...) supports fp16_only and eager_fp16_int8
+  put/release/stats report fp16, int8, scale, and total actual byte counts
+
+vllm/v1/mixed_precision_recovery/config.py
+  rejects cpu_backup_enabled=true + precision_tiering_enabled=false +
+  backup_storage_mode=eager_fp16_int8
+
+vllm/v1/mixed_precision_recovery/sidecar.py
+  passes config.backup_storage_mode into CPU backup store puts
+  emits payload byte accounting on cpu_backup_created, blocks_released,
+  recovery_materialized, and recovery_test_mutated debug events
+
+scripts/mpr_validate_debug_jsonl.py
+  accepts optional payload byte fields on recovery debug events
+```
+
+Compatibility rule:
+
+```text
+Existing M3 fp16 recovery tests and smoke commands should set
+VLLM_MPR_BACKUP_STORAGE_MODE=fp16_only when VLLM_MPR_CPU_BACKUP=1 and
+VLLM_MPR_PRECISION_TIERING_ENABLE is not enabled.
+```
+
+Performance note:
+
+```text
+Step 4.4 intentionally keeps eager fp16+int8 backup creation as a synchronous
+reference path. In the current implementation, backup copy/quantization should
+be treated as blocking decode-side work. The eager int8 payload is derived from
+the already-created CPU fp16 payload, so it avoids a second GPU->CPU copy but
+still pays CPU quantization cost synchronously. Future optimization items are
+recorded in mpr_followup_backlog.md for Milestone 5, including lazy/on-the-fly
+int8 creation, GPU-side quantization, pinned/non_blocking copies, readiness
+tracking, and background quantization.
+```
+
+Validation added:
+
+```text
+config rejects eager fp16+int8 backup when tiering is disabled
+store eager mode keeps get(key) fp16-compatible and exposes int8 payload
+release removes all payload formats for a block
+stats/debug events report payload-format byte accounting
+M3 CPU backup/recovery tests explicitly use fp16_only storage mode
+```
+
+Validation run locally:
+
+```text
+python -m py_compile \
+  vllm/v1/mixed_precision_recovery/cpu_backup.py \
+  vllm/v1/mixed_precision_recovery/config.py \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  scripts/mpr_validate_debug_jsonl.py \
+  tests/v1/mixed_precision_recovery/test_scoring.py \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_backup_codec.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py
+
+result:
+  passed
+
+git diff --check
+
+result:
+  passed
+```
+
+Local validation not completed:
+
+```text
+python -m pytest \
+  tests/v1/mixed_precision_recovery/test_scoring.py \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_backup_codec.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py -q
+
+result:
+  not run in this Windows environment because pytest is not installed:
+  No module named pytest
+
+python import/runtime smoke:
+  not run in this Windows environment because the installed torch package is
+  incompatible with this vLLM checkout:
+  ImportError: cannot import name 'infer_schema' from 'torch.library'
+```
+
+Next step:
+
+```text
+Run the focused pytest command above in the target vLLM environment, then move
+to Step 4.5 Recovery Payload Provider.
+```

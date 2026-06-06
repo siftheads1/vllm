@@ -16,6 +16,14 @@ SUPPORTED_DIGEST_KINDS = {"arkvale", "raw_minmax"}
 SUPPORTED_SCORING_BACKENDS = {"torch_quest", "quest_cuda"}
 SUPPORTED_SCORE_GRANULARITIES = {"block", "kv_head", "query_head"}
 SUPPORTED_RECOVERY_POLICIES = {"topk_block", "threshold_block"}
+CPU_BACKUP_STAT_FIELDS = (
+    "cpu_backup_block_count",
+    "cpu_backup_bytes",
+    "cpu_backup_fp16_payload_bytes",
+    "cpu_backup_int8_payload_bytes",
+    "cpu_backup_int8_scale_bytes",
+    "cpu_backup_total_actual_bytes",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -624,7 +632,7 @@ def validate_recovery_materialized_event(event: dict[str, Any]) -> None:
                 "[2, num_blocks, block_size, num_kv_heads, head_dim]."
             )
 
-    for field in ("cpu_backup_block_count", "cpu_backup_bytes"):
+    for field in CPU_BACKUP_STAT_FIELDS:
         if event.get(field) is not None:
             require_int(event, field, minimum=0)
 
@@ -707,7 +715,7 @@ def validate_recovery_test_mutated_event(event: dict[str, Any]) -> None:
                 "[2, num_blocks, block_size, num_kv_heads, head_dim]."
             )
 
-    for field in ("cpu_backup_block_count", "cpu_backup_bytes"):
+    for field in CPU_BACKUP_STAT_FIELDS:
         if event.get(field) is not None:
             require_int(event, field, minimum=0)
 

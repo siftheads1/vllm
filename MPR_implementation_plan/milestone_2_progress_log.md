@@ -213,9 +213,10 @@ Update:
 
 ```text
 Added VLLM_MPR_SCORING_ENABLE, default true.
-Use VLLM_MPR_ENABLE=1, VLLM_MPR_CPU_BACKUP=1, and
-VLLM_MPR_SCORING_ENABLE=0 to measure step latency with digest/CPU backup copy
-enabled but query scoring disabled.
+Use VLLM_MPR_ENABLE=1, VLLM_MPR_CPU_BACKUP=1,
+VLLM_MPR_BACKUP_STORAGE_MODE=fp16_only, and VLLM_MPR_SCORING_ENABLE=0 to
+measure step latency with digest/CPU backup copy enabled but query scoring
+disabled.
 ```
 
 ## 2026-06-02: Pure CPU Copy Benchmark Script
