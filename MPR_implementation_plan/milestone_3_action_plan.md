@@ -525,7 +525,7 @@ Milestone 3 끝에서 다음 중 하나를 선택한다.
 
 | Decision | Condition |
 |---|---|
-| Proceed to Milestone 4 | fp16 block recovery materializes before attention and validation passes; next work is cleanup/optimization before mixed precision |
+| Proceed to Milestone 4 | fp16 block recovery materializes before attention and validation passes; next work is mixed-precision tiering |
 | Extend Milestone 3 | unit tests pass but generation smoke/debug recovery is incomplete |
 | Rework M2 backup layout | semantic CPU fp16 backup is insufficient or too slow for recovery |
 | Rework lifecycle/keying | physical block id reuse causes stale recovery risk |
@@ -541,6 +541,6 @@ At each decode step, can selected vLLM physical KV blocks be materialized from
 the MPR CPU fp16 backup into the GPU KV cache before attention?
 ```
 
-이 답이 안정적으로 나오면 Milestone 4에서 현재 recovery skeleton의 overhead를
-덜어내고 측정/구조를 정리한다. 그 다음 Milestone 5에서 score를 precision tier로
-매핑하고 lower-precision backup/materialization policy를 붙일 수 있다.
+이 답이 안정적으로 나오면 Milestone 4에서 score를 precision tier로 매핑하고
+lower-precision backup/materialization policy를 붙인다. 그 다음 Milestone 5에서
+현재 recovery skeleton의 overhead를 덜어내고 측정/구조를 정리한다.

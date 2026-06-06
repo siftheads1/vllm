@@ -109,6 +109,13 @@ def test_mpr_config_defaults_to_quest_style_digest_and_kv_head_scores():
     assert config.recovery_policy == "topk_block"
     assert config.recovery_threshold == 0.0
     assert config.recovery_test_mutate == "off"
+    assert not config.precision_tiering_enabled
+    assert config.precision_policy == "top_ratio"
+    assert config.tier_fp16_ratio == 0.25
+    assert config.tier_int8_ratio == 0.50
+    assert config.tier_high_threshold == 0.0
+    assert config.tier_low_threshold == 0.0
+    assert config.backup_storage_mode == "eager_fp16_int8"
 
 
 def test_mpr_config_parses_cpu_backup_flag(monkeypatch):
@@ -153,6 +160,71 @@ def test_mpr_config_accepts_threshold_recovery_policy(monkeypatch):
 
     assert config.recovery_policy == "threshold_block"
     assert config.recovery_threshold == -3.25
+
+
+def test_mpr_config_parses_top_ratio_precision_tiering(monkeypatch):
+    monkeypatch.setenv("VLLM_MPR_PRECISION_TIERING_ENABLE", "1")
+    monkeypatch.setenv("VLLM_MPR_PRECISION_POLICY", "top_ratio")
+    monkeypatch.setenv("VLLM_MPR_TIER_FP16_RATIO", "0.2")
+    monkeypatch.setenv("VLLM_MPR_TIER_INT8_RATIO", "0.6")
+    monkeypatch.setenv("VLLM_MPR_BACKUP_STORAGE_MODE", "fp16_only")
+
+    config = MPRConfig.from_env()
+
+    assert config.precision_tiering_enabled
+    assert config.precision_policy == "top_ratio"
+    assert config.tier_fp16_ratio == 0.2
+    assert config.tier_int8_ratio == 0.6
+    assert config.backup_storage_mode == "fp16_only"
+
+
+def test_mpr_config_parses_threshold_precision_tiering(monkeypatch):
+    monkeypatch.setenv("VLLM_MPR_PRECISION_POLICY", "threshold")
+    monkeypatch.setenv("VLLM_MPR_TIER_HIGH_THRESHOLD", "7.5")
+    monkeypatch.setenv("VLLM_MPR_TIER_LOW_THRESHOLD", "2.25")
+
+    config = MPRConfig.from_env()
+
+    assert config.precision_policy == "threshold"
+    assert config.tier_high_threshold == 7.5
+    assert config.tier_low_threshold == 2.25
+
+
+def test_mpr_config_rejects_invalid_precision_policy(monkeypatch):
+    monkeypatch.setenv("VLLM_MPR_PRECISION_POLICY", "ranked")
+
+    with pytest.raises(ValueError, match="VLLM_MPR_PRECISION_POLICY"):
+        MPRConfig.from_env()
+
+
+def test_mpr_config_rejects_invalid_backup_storage_mode(monkeypatch):
+    monkeypatch.setenv("VLLM_MPR_BACKUP_STORAGE_MODE", "int8_only")
+
+    with pytest.raises(ValueError, match="VLLM_MPR_BACKUP_STORAGE_MODE"):
+        MPRConfig.from_env()
+
+
+def test_mpr_config_rejects_negative_tier_ratio(monkeypatch):
+    monkeypatch.setenv("VLLM_MPR_TIER_FP16_RATIO", "-0.1")
+
+    with pytest.raises(ValueError, match="tier_fp16_ratio"):
+        MPRConfig.from_env()
+
+
+def test_mpr_config_rejects_tier_ratio_sum_above_one(monkeypatch):
+    monkeypatch.setenv("VLLM_MPR_TIER_FP16_RATIO", "0.7")
+    monkeypatch.setenv("VLLM_MPR_TIER_INT8_RATIO", "0.4")
+
+    with pytest.raises(ValueError, match="tier_fp16_ratio \\+ tier_int8_ratio"):
+        MPRConfig.from_env()
+
+
+def test_mpr_config_rejects_inverted_tier_thresholds(monkeypatch):
+    monkeypatch.setenv("VLLM_MPR_TIER_HIGH_THRESHOLD", "1.0")
+    monkeypatch.setenv("VLLM_MPR_TIER_LOW_THRESHOLD", "2.0")
+
+    with pytest.raises(ValueError, match="tier_high_threshold"):
+        MPRConfig.from_env()
 
 
 def test_mpr_config_accepts_quest_cuda_backend(monkeypatch):

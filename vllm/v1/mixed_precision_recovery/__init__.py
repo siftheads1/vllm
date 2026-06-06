@@ -4,6 +4,16 @@
 """Mixed-Precision Recovery sidecar scaffolding for vLLM v1."""
 
 from vllm.v1.mixed_precision_recovery.config import MPRConfig
+from vllm.v1.mixed_precision_recovery.backup_codec import (
+    BackupCodec,
+    FP16_BACKUP_FORMAT,
+    FP16BackupCodec,
+    FP16BackupPayload,
+    INT8_BACKUP_FORMAT,
+    INT8BackupCodec,
+    INT8BackupPayload,
+    PER_TOKEN_PER_KV_HEAD_SCALE,
+)
 from vllm.v1.mixed_precision_recovery.cpu_backup import (
     CPUBackupKey,
     CPUBackupPutResult,
@@ -21,6 +31,13 @@ from vllm.v1.mixed_precision_recovery.quest_packing import (
     PackedQuestDigestCache,
     QuestMetadataStore,
     pack_quest_metadata_cache,
+)
+from vllm.v1.mixed_precision_recovery.precision_policy import (
+    PrecisionPolicy,
+    PrecisionTier,
+    ThresholdPrecisionPolicy,
+    TierAssignment,
+    TopRatioPrecisionPolicy,
 )
 from vllm.v1.mixed_precision_recovery.recovery import (
     BlockRecoveryManager,
@@ -45,6 +62,14 @@ from vllm.v1.mixed_precision_recovery.sidecar import (
 
 __all__ = [
     "MPRConfig",
+    "BackupCodec",
+    "FP16_BACKUP_FORMAT",
+    "FP16BackupCodec",
+    "FP16BackupPayload",
+    "INT8_BACKUP_FORMAT",
+    "INT8BackupCodec",
+    "INT8BackupPayload",
+    "PER_TOKEN_PER_KV_HEAD_SCALE",
     "CPUBackupKey",
     "CPUBackupPutResult",
     "CPUBackupReleaseResult",
@@ -55,6 +80,11 @@ __all__ = [
     "RAW_MINMAX_DIGEST_KIND",
     "PackedQuestDigestCache",
     "QuestMetadataStore",
+    "PrecisionPolicy",
+    "PrecisionTier",
+    "ThresholdPrecisionPolicy",
+    "TierAssignment",
+    "TopRatioPrecisionPolicy",
     "BlockRecoveryManager",
     "RecoveryResult",
     "RecoverySidecar",

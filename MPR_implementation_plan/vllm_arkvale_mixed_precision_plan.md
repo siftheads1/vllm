@@ -171,18 +171,47 @@ Mixed-Precision Recovery sidecar
 - 기존 offload path와 충돌하지 않는다
 - output sanity check를 통과한다
 
-### Milestone 4: Recovery Cleanup and Optimization
+### Milestone 4: Mixed-Precision Recovery
 
 목표:
-- Milestone 3의 fp16 recovery semantic skeleton을 유지하면서 hot-path overhead를 줄인다
-- validation-only fault injection과 production recovery path를 더 명확히 분리한다
-- 현재 환경에서 불필요한 debug/scoring/recovery 비용을 덜어낸다
-- mixed precision으로 확장하기 전에 recovery/backup path의 비용 구조를 측정 가능하게 만든다
+- score를 precision tier로 매핑
+- high score page는 fp16, medium score page는 lower precision, low score page는 skip
+- transfer bytes와 GPU memory pressure를 줄인다
 
 성공 기준:
-- M3 semantic smoke는 계속 통과한다
+- M3 fp16 recovery semantic smoke는 계속 통과한다
+- score threshold가 precision tier 선택으로 이어진다
+- lower-precision backup/materialization policy가 적어도 하나 구현된다
+- baseline fp16 recovery 대비 transfer/storage bytes 감소를 측정할 수 있다
+
+초기 precision policy:
+
+```text
+score >= tau_high -> fp16 recovery
+score >= tau_low  -> int8/fp8 recovery
+otherwise         -> skip
+```
+
+처음에는 attention kernel이 mixed precision page를 직접 읽도록 만들지 않는다. 대신 다음 중 하나로 시작한다.
+
+1. CPU에서 lower precision으로 저장하고 GPU recovery 시 dequantize해서 기존 KV cache에 씀
+2. GPU에 별도 low-precision staging buffer를 만들고, attention 전 fp16으로 materialize
+3. vLLM의 existing FP8 KV cache support를 활용할 수 있는지 조사
+
+진짜 mixed-precision attention kernel은 마지막 단계로 미룬다.
+
+### Milestone 5: Recovery Cleanup and Optimization
+
+목표:
+- Milestone 4의 mixed-precision recovery skeleton을 유지하면서 hot-path overhead를 줄인다
+- validation-only fault injection과 production recovery path를 더 명확히 분리한다
+- 현재 환경에서 불필요한 debug/scoring/recovery 비용을 덜어낸다
+- recovery/backup path의 비용 구조를 측정 가능하게 만든다
+
+성공 기준:
+- M4 mixed-precision semantic smoke는 계속 통과한다
 - baseline 대비 decode overhead가 명확히 줄거나, 최소한 overhead breakdown이 분리된다
-- recover copy bytes, copy wall time, per-token recovered bytes를 smoke/benchmark에서 확인할 수 있다
+- recovered bytes, recovery copy wall time, per-token recovered bytes를 smoke/benchmark에서 확인할 수 있다
 - Sidecar가 scoring, recovery, debug, fault-injection 책임을 지금보다 명확히 나눈다
 
 우선순위:
@@ -212,31 +241,8 @@ Mixed-Precision Recovery sidecar
    - 필요 시 nsys/dmon 기반 PCIe traffic 관측 절차 문서화
 ```
 
-Milestone 4는 mixed precision 기능 추가가 아니라, M3 skeleton을 실제 다음 단계로
-가져갈 수 있게 만드는 cleanup/optimization milestone이다.
-
-### Milestone 5: Mixed-Precision Recovery
-
-목표:
-- score를 precision tier로 매핑
-- high score page는 fp16, medium score page는 lower precision, low score page는 skip
-- transfer bytes와 GPU memory pressure를 줄인다
-
-초기 precision policy:
-
-```text
-score >= tau_high -> fp16 recovery
-score >= tau_low  -> int8/fp8 recovery
-otherwise         -> skip
-```
-
-처음에는 attention kernel이 mixed precision page를 직접 읽도록 만들지 않는다. 대신 다음 중 하나로 시작한다.
-
-1. CPU에서 lower precision으로 저장하고 GPU recovery 시 dequantize해서 기존 KV cache에 씀
-2. GPU에 별도 low-precision staging buffer를 만들고, attention 전 fp16으로 materialize
-3. vLLM의 existing FP8 KV cache support를 활용할 수 있는지 조사
-
-진짜 mixed-precision attention kernel은 마지막 단계로 미룬다.
+Milestone 5는 새 mixed precision 기능을 넓히는 단계가 아니라, M4 skeleton을
+실제 다음 단계로 가져갈 수 있게 만드는 cleanup/optimization milestone이다.
 
 ## 7. Pivot Plan: InfiniGen 기반 Prototype
 

@@ -38,6 +38,11 @@ def _parse_float(name: str, default: float) -> float:
     return float(raw)
 
 
+def _validate_ratio(name: str, value: float) -> None:
+    if value < 0.0 or value > 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value}.")
+
+
 def _parse_optional_limit(name: str) -> int | None:
     value = _parse_int(name, -1, -1)
     return None if value < 0 else value
@@ -80,6 +85,39 @@ class MPRConfig:
     recovery_threshold: float = 0.0
     recovery_test_mutate: str = "off"
     recovery_test_mode: str = "recover"
+    precision_tiering_enabled: bool = False
+    precision_policy: str = "top_ratio"
+    tier_fp16_ratio: float = 0.25
+    tier_int8_ratio: float = 0.50
+    tier_high_threshold: float = 0.0
+    tier_low_threshold: float = 0.0
+    backup_storage_mode: str = "eager_fp16_int8"
+
+    def __post_init__(self) -> None:
+        """Validate MPR config values that depend on multiple fields."""
+        if self.precision_policy not in {"top_ratio", "threshold"}:
+            raise ValueError(
+                "precision_policy must be 'top_ratio' or 'threshold', got "
+                f"{self.precision_policy!r}."
+            )
+        if self.backup_storage_mode not in {"eager_fp16_int8", "fp16_only"}:
+            raise ValueError(
+                "backup_storage_mode must be 'eager_fp16_int8' or "
+                f"'fp16_only', got {self.backup_storage_mode!r}."
+            )
+        _validate_ratio("tier_fp16_ratio", self.tier_fp16_ratio)
+        _validate_ratio("tier_int8_ratio", self.tier_int8_ratio)
+        ratio_sum = self.tier_fp16_ratio + self.tier_int8_ratio
+        if ratio_sum > 1.0:
+            raise ValueError(
+                "tier_fp16_ratio + tier_int8_ratio must be <= 1, got "
+                f"{ratio_sum}."
+            )
+        if self.tier_high_threshold < self.tier_low_threshold:
+            raise ValueError(
+                "tier_high_threshold must be >= tier_low_threshold, got "
+                f"{self.tier_high_threshold} < {self.tier_low_threshold}."
+            )
 
     @classmethod
     def from_env(cls) -> "MPRConfig":
@@ -134,5 +172,35 @@ class MPRConfig:
                 "VLLM_MPR_RECOVERY_TEST_MODE",
                 "recover",
                 {"recover", "mutate_only"},
+            ),
+            precision_tiering_enabled=_parse_bool(
+                "VLLM_MPR_PRECISION_TIERING_ENABLE",
+                False,
+            ),
+            precision_policy=_parse_choice(
+                "VLLM_MPR_PRECISION_POLICY",
+                "top_ratio",
+                {"top_ratio", "threshold"},
+            ),
+            tier_fp16_ratio=_parse_float(
+                "VLLM_MPR_TIER_FP16_RATIO",
+                0.25,
+            ),
+            tier_int8_ratio=_parse_float(
+                "VLLM_MPR_TIER_INT8_RATIO",
+                0.50,
+            ),
+            tier_high_threshold=_parse_float(
+                "VLLM_MPR_TIER_HIGH_THRESHOLD",
+                0.0,
+            ),
+            tier_low_threshold=_parse_float(
+                "VLLM_MPR_TIER_LOW_THRESHOLD",
+                0.0,
+            ),
+            backup_storage_mode=_parse_choice(
+                "VLLM_MPR_BACKUP_STORAGE_MODE",
+                "eager_fp16_int8",
+                {"eager_fp16_int8", "fp16_only"},
             ),
         )

@@ -32,7 +32,7 @@ separate CPU backup copy cost from MPR write-observation overhead in future
   benchmarks
 ```
 
-## Milestone 4 / Recovery Cleanup and Optimization
+## Milestone 5 / Recovery Cleanup and Optimization
 
 ```text
 optimize BlockRecoveryManager.materialize_blocks(...): current M3 v0 copies one
