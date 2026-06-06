@@ -313,9 +313,30 @@ python import/runtime smoke:
   ImportError: cannot import name 'infer_schema' from 'torch.library'
 ```
 
-Next step:
+Target-server validation:
 
 ```text
-Run the focused pytest command above in the target vLLM environment, then move
-to Step 4.5 Recovery Payload Provider.
+Focused pytest:
+  tests/v1/mixed_precision_recovery/test_scoring.py
+  tests/v1/mixed_precision_recovery/test_recovery.py
+  tests/v1/mixed_precision_recovery/test_backup_codec.py
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py
+
+result:
+  passed
+
+M3 fp16-only recovery smoke:
+  passed after scripts/mpr_smoke_recovery_quality.py set
+  VLLM_MPR_BACKUP_STORAGE_MODE=fp16_only internally for its MPR child runs
+
+M4 eager fp16+int8 backup smoke:
+  passed; cpu_backup_created debug events reported nonzero
+  cpu_backup_int8_payload_bytes and cpu_backup_int8_scale_bytes
+```
+
+Step 4.4 completion:
+
+```text
+Step 4.4 is complete.
+Next step is Step 4.5 Recovery Payload Provider.
 ```
