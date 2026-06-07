@@ -36,20 +36,37 @@ def _make_recovery_sidecar(
     recovery_threshold: float = 0.0,
     recovery_test_mutate: str = "off",
     recovery_test_mode: str = "recover",
+    precision_tiering_enabled: bool = False,
+    precision_policy: str = "top_ratio",
+    tier_fp16_ratio: float = 0.25,
+    tier_int8_ratio: float = 0.50,
+    tier_high_threshold: float = 0.0,
+    tier_low_threshold: float = 0.0,
+    backup_storage_mode: str | None = None,
 ) -> RecoverySidecar:
     layer_name = "model.layers.0.self_attn.attn"
+    if backup_storage_mode is None:
+        backup_storage_mode = (
+            "eager_fp16_int8" if precision_tiering_enabled else "fp16_only"
+        )
     sidecar = RecoverySidecar(
         config=MPRConfig(
             enabled=True,
             recent_tokens=0,
             cpu_backup_enabled=True,
-            backup_storage_mode="fp16_only",
+            backup_storage_mode=backup_storage_mode,
             recovery_enabled=recovery_enabled,
             recovery_topk=1,
             recovery_policy=recovery_policy,
             recovery_threshold=recovery_threshold,
             recovery_test_mutate=recovery_test_mutate,
             recovery_test_mode=recovery_test_mode,
+            precision_tiering_enabled=precision_tiering_enabled,
+            precision_policy=precision_policy,
+            tier_fp16_ratio=tier_fp16_ratio,
+            tier_int8_ratio=tier_int8_ratio,
+            tier_high_threshold=tier_high_threshold,
+            tier_low_threshold=tier_low_threshold,
         )
     )
     sidecar._digest_cache[layer_name] = {
@@ -80,6 +97,28 @@ def _decode_metadata():
         num_reqs=1,
         seq_lens=torch.tensor([8]),
         block_table=torch.tensor([[0, 1]]),
+    )
+
+
+def _decode_metadata_three_blocks():
+    return SimpleNamespace(
+        max_query_len=1,
+        num_actual_tokens=1,
+        num_reqs=1,
+        seq_lens=torch.tensor([12]),
+        block_table=torch.tensor([[0, 1, 2]]),
+    )
+
+
+def _add_third_digest(sidecar: RecoverySidecar) -> None:
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar._digest_cache[layer_name][2] = BlockDigest(
+        digest_min=torch.zeros(1, 2),
+        digest_max=torch.full((1, 2), 2.0),
+        valid_token_count=4,
+        block_size=4,
+        layer_event_idx=0,
+        digest_kind="raw_minmax",
     )
 
 
@@ -515,6 +554,164 @@ def test_sidecar_recovery_entrypoint_does_not_apply_test_mutation():
     torch.testing.assert_close(kv_cache[:, 0], torch.full_like(kv_cache[:, 0], -5.0))
     torch.testing.assert_close(kv_cache[:, 1], torch.full_like(kv_cache[:, 1], -5.0))
     assert sidecar.counters["recovery_materialized"] == 1
+
+
+def test_sidecar_tiered_recovery_materializes_fp16_and_int8_tiers():
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = _make_recovery_sidecar(
+        precision_tiering_enabled=True,
+        precision_policy="top_ratio",
+        tier_fp16_ratio=0.20,
+        tier_int8_ratio=0.30,
+    )
+    _add_third_digest(sidecar)
+    kv_cache = torch.full((2, 3, 4, 1, 2), -5.0, dtype=torch.float32)
+    fp16_backup = torch.full((2, 4, 1, 2), 9.0)
+    int8_backup = torch.full((2, 4, 1, 2), 3.0)
+    sidecar._cpu_backup_store.put(
+        layer_name=layer_name,
+        physical_block_id=1,
+        kv_block=fp16_backup,
+        backup_storage_mode="eager_fp16_int8",
+    )
+    sidecar._cpu_backup_store.put(
+        layer_name=layer_name,
+        physical_block_id=2,
+        kv_block=int8_backup,
+        backup_storage_mode="eager_fp16_int8",
+    )
+
+    sidecar.recover_before_attention(
+        layer_name=layer_name,
+        query=torch.ones(1, 1, 2),
+        attn_metadata=_decode_metadata_three_blocks(),
+        kv_cache=kv_cache,
+        block_size=4,
+    )
+
+    torch.testing.assert_close(kv_cache[:, 0], torch.full_like(kv_cache[:, 0], -5.0))
+    torch.testing.assert_close(kv_cache[:, 1], fp16_backup)
+    torch.testing.assert_close(kv_cache[:, 2], int8_backup)
+    assert sidecar.counters["recovery_materialized"] == 1
+    assert sidecar.counters["recovery_test_mutated"] == 0
+
+
+def test_sidecar_tiered_recovery_supports_threshold_policy():
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = _make_recovery_sidecar(
+        precision_tiering_enabled=True,
+        precision_policy="threshold",
+        tier_high_threshold=6.0,
+        tier_low_threshold=3.0,
+    )
+    _add_third_digest(sidecar)
+    kv_cache = torch.full((2, 3, 4, 1, 2), -5.0, dtype=torch.float32)
+    fp16_backup = torch.full((2, 4, 1, 2), 7.0)
+    int8_backup = torch.full((2, 4, 1, 2), 2.0)
+    sidecar._cpu_backup_store.put(
+        layer_name=layer_name,
+        physical_block_id=1,
+        kv_block=fp16_backup,
+        backup_storage_mode="eager_fp16_int8",
+    )
+    sidecar._cpu_backup_store.put(
+        layer_name=layer_name,
+        physical_block_id=2,
+        kv_block=int8_backup,
+        backup_storage_mode="eager_fp16_int8",
+    )
+
+    sidecar.recover_before_attention(
+        layer_name=layer_name,
+        query=torch.ones(1, 1, 2),
+        attn_metadata=_decode_metadata_three_blocks(),
+        kv_cache=kv_cache,
+        block_size=4,
+    )
+
+    torch.testing.assert_close(kv_cache[:, 0], torch.full_like(kv_cache[:, 0], -5.0))
+    torch.testing.assert_close(kv_cache[:, 1], fp16_backup)
+    torch.testing.assert_close(kv_cache[:, 2], int8_backup)
+    assert sidecar.counters["recovery_materialized"] == 1
+
+
+def test_sidecar_tiered_recovery_rejects_missing_fp16_payload():
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = _make_recovery_sidecar(
+        precision_tiering_enabled=True,
+        precision_policy="top_ratio",
+        tier_fp16_ratio=0.50,
+        tier_int8_ratio=0.0,
+    )
+    kv_cache = torch.zeros(2, 2, 4, 1, 2, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="missing_fp16_block_ids"):
+        sidecar.recover_before_attention(
+            layer_name=layer_name,
+            query=torch.ones(1, 1, 2),
+            attn_metadata=_decode_metadata(),
+            kv_cache=kv_cache,
+            block_size=4,
+        )
+
+
+def test_sidecar_tiered_recovery_rejects_missing_int8_payload():
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = _make_recovery_sidecar(
+        precision_tiering_enabled=True,
+        precision_policy="top_ratio",
+        tier_fp16_ratio=0.50,
+        tier_int8_ratio=0.50,
+        backup_storage_mode="fp16_only",
+    )
+    kv_cache = torch.zeros(2, 2, 4, 1, 2, dtype=torch.float32)
+    sidecar._cpu_backup_store.put(
+        layer_name=layer_name,
+        physical_block_id=1,
+        kv_block=torch.ones(2, 4, 1, 2),
+        backup_storage_mode="fp16_only",
+    )
+    sidecar._cpu_backup_store.put(
+        layer_name=layer_name,
+        physical_block_id=0,
+        kv_block=torch.ones(2, 4, 1, 2),
+        backup_storage_mode="fp16_only",
+    )
+
+    with pytest.raises(ValueError, match="missing_int8_block_ids"):
+        sidecar.recover_before_attention(
+            layer_name=layer_name,
+            query=torch.ones(1, 1, 2),
+            attn_metadata=_decode_metadata(),
+            kv_cache=kv_cache,
+            block_size=4,
+        )
+
+
+def test_sidecar_tiered_test_mutation_uses_all_tier_ids():
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = _make_recovery_sidecar(
+        precision_tiering_enabled=True,
+        precision_policy="top_ratio",
+        tier_fp16_ratio=0.20,
+        tier_int8_ratio=0.30,
+        recovery_test_mutate="zero_selected",
+        recovery_test_mode="mutate_only",
+    )
+    _add_third_digest(sidecar)
+    kv_cache = torch.full((2, 3, 4, 1, 2), -5.0, dtype=torch.float32)
+
+    sidecar.recover_before_attention_with_test_mutation(
+        layer_name=layer_name,
+        query=torch.ones(1, 1, 2),
+        attn_metadata=_decode_metadata_three_blocks(),
+        kv_cache=kv_cache,
+        block_size=4,
+    )
+
+    torch.testing.assert_close(kv_cache, torch.zeros_like(kv_cache))
+    assert sidecar.counters["recovery_test_mutated"] == 1
+    assert sidecar.counters["recovery_materialized"] == 0
 
 
 def test_attention_mpr_hook_observes_query_when_recovery_disabled(monkeypatch):

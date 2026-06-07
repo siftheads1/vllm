@@ -514,3 +514,120 @@ Next step:
 ```text
 Step 4.7 Sidecar Integration and Debug Events.
 ```
+
+## 2026-06-07: Step 4.7 Sidecar Integration and Debug Events
+
+Wired the M4 tiered materialization path into the sidecar recovery path while
+preserving the M3 fp16-only path when precision tiering is disabled.
+
+Updated:
+
+```text
+vllm/v1/mixed_precision_recovery/sidecar.py
+  builds TopRatioPrecisionPolicy or ThresholdPrecisionPolicy from MPRConfig
+  assigns fp16/int8/skip tiers from the existing QueryScoreContext score result
+  fetches tier payloads through EagerRecoveryPayloadProvider
+  calls BlockRecoveryManager.materialize_tiered_payloads(...) when
+    precision_tiering_enabled=true
+  keeps the existing select_recovery_block_ids(...) + materialize_blocks(...)
+    path when precision_tiering_enabled=false
+
+scripts/mpr_validate_debug_jsonl.py
+  accepts M3 recovery_materialized events without tier fields
+  validates M4 tiered recovery fields when precision_tiering_enabled=true
+```
+
+Runtime behavior:
+
+```text
+precision_tiering_enabled=false:
+  existing M3 fp16 recovery behavior is unchanged
+
+precision_tiering_enabled=true:
+  score once
+  assign tiers from the score result
+  fetch eager fp16/int8 payloads
+  hard-fail with ValueError if any tier payload is missing
+  materialize fp16 and int8 tiers
+  leave skip tier blocks untouched
+```
+
+Debug JSONL additions for tiered recovery events:
+
+```text
+precision_tiering_enabled
+precision_policy
+tier_fp16_block_ids
+tier_int8_block_ids
+tier_skip_block_ids
+recovered_fp16_block_ids
+recovered_int8_block_ids
+missing_fp16_block_ids
+missing_int8_block_ids
+fp16_payload_bytes
+int8_payload_bytes
+effective_recovery_transfer_bytes
+```
+
+Validation-only mutation boundary:
+
+```text
+recover_before_attention(...) remains mutation-free
+recover_before_attention_with_test_mutation(...) remains the only path that can
+apply zero_selected or zero_all
+tiered zero_selected mutation uses the union of fp16, int8, and skip tier ids
+```
+
+Validation added:
+
+```text
+tests/v1/mixed_precision_recovery/test_recovery.py
+  tiering disabled still exercises the M3 fp16 path
+  tiering enabled materializes fp16 and int8 tiers and leaves skip untouched
+  top_ratio and threshold precision policies both route through sidecar
+  missing fp16 or int8 tier payloads raise ValueError
+  tiered validation-only mutation uses all tier ids and skips materialization
+
+tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py
+  accepts old M3 recovery_materialized events without tier fields
+  accepts M4 tiered recovery_materialized events with tier fields
+```
+
+Validation run locally:
+
+```text
+python -m py_compile \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  scripts/mpr_validate_debug_jsonl.py \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py
+
+result:
+  passed
+
+git diff --check
+
+result:
+  passed
+```
+
+Local validation not completed:
+
+```text
+python -m pytest \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_recovery_payload.py \
+  tests/v1/mixed_precision_recovery/test_backup_codec.py \
+  tests/v1/mixed_precision_recovery/test_precision_policy.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py -q
+
+result:
+  not run in this Windows environment because pytest is not installed:
+  No module named pytest
+```
+
+Next step:
+
+```text
+Step 4.8 Fault-Injection Tier Smoke.
+```

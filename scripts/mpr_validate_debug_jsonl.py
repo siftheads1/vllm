@@ -16,6 +16,7 @@ SUPPORTED_DIGEST_KINDS = {"arkvale", "raw_minmax"}
 SUPPORTED_SCORING_BACKENDS = {"torch_quest", "quest_cuda"}
 SUPPORTED_SCORE_GRANULARITIES = {"block", "kv_head", "query_head"}
 SUPPORTED_RECOVERY_POLICIES = {"topk_block", "threshold_block"}
+SUPPORTED_PRECISION_POLICIES = {"top_ratio", "threshold"}
 CPU_BACKUP_STAT_FIELDS = (
     "cpu_backup_block_count",
     "cpu_backup_bytes",
@@ -596,6 +597,14 @@ def validate_recovery_materialized_event(event: dict[str, Any]) -> None:
                 f"{event['_source']}: {field} must be a subset of "
                 "recovery_selected_block_ids."
             )
+    if event.get("precision_tiering_enabled") is True:
+        validate_tiered_recovery_fields(
+            event,
+            selected_block_ids=selected_block_ids,
+            recovered_block_ids=recovered_block_ids,
+            missing_backup_block_ids=missing_backup_block_ids,
+            skipped_block_ids=skipped_block_ids,
+        )
 
     recovered_bytes = require_int(event, "recovered_bytes", minimum=0)
     copy_wall_ms = event.get("recovery_copy_wall_ms")
@@ -647,6 +656,108 @@ def validate_recovery_materialized_event(event: dict[str, Any]) -> None:
     ):
         if event.get(field) is not None:
             require_int_list(event, field, minimum=0)
+
+
+def validate_tiered_recovery_fields(
+    event: dict[str, Any],
+    *,
+    selected_block_ids: list[int],
+    recovered_block_ids: list[int],
+    missing_backup_block_ids: list[int],
+    skipped_block_ids: list[int],
+) -> None:
+    """Validate M4 tier-specific recovery materialization metadata."""
+    precision_policy = event.get("precision_policy")
+    if precision_policy not in SUPPORTED_PRECISION_POLICIES:
+        raise AssertionError(
+            f"{event['_source']}: precision_policy must be one of "
+            f"{sorted(SUPPORTED_PRECISION_POLICIES)}, got "
+            f"{precision_policy!r}."
+        )
+
+    tier_fp16_block_ids = require_int_list(
+        event,
+        "tier_fp16_block_ids",
+        minimum=0,
+    )
+    tier_int8_block_ids = require_int_list(
+        event,
+        "tier_int8_block_ids",
+        minimum=0,
+    )
+    tier_skip_block_ids = require_int_list(
+        event,
+        "tier_skip_block_ids",
+        minimum=0,
+    )
+    recovered_fp16_block_ids = require_int_list(
+        event,
+        "recovered_fp16_block_ids",
+        minimum=0,
+    )
+    recovered_int8_block_ids = require_int_list(
+        event,
+        "recovered_int8_block_ids",
+        minimum=0,
+    )
+    missing_fp16_block_ids = require_int_list(
+        event,
+        "missing_fp16_block_ids",
+        minimum=0,
+    )
+    missing_int8_block_ids = require_int_list(
+        event,
+        "missing_int8_block_ids",
+        minimum=0,
+    )
+
+    selected_set = set(selected_block_ids)
+    recovered_set = set(recovered_block_ids)
+    missing_set = set(missing_backup_block_ids)
+    skipped_set = set(skipped_block_ids)
+    for field, block_ids in (
+        ("tier_fp16_block_ids", tier_fp16_block_ids),
+        ("tier_int8_block_ids", tier_int8_block_ids),
+        ("tier_skip_block_ids", tier_skip_block_ids),
+        ("recovered_fp16_block_ids", recovered_fp16_block_ids),
+        ("recovered_int8_block_ids", recovered_int8_block_ids),
+        ("missing_fp16_block_ids", missing_fp16_block_ids),
+        ("missing_int8_block_ids", missing_int8_block_ids),
+    ):
+        if not set(block_ids).issubset(selected_set):
+            raise AssertionError(
+                f"{event['_source']}: {field} must be a subset of "
+                "recovery_selected_block_ids."
+            )
+    if not set(recovered_fp16_block_ids).issubset(recovered_set):
+        raise AssertionError(
+            f"{event['_source']}: recovered_fp16_block_ids must be a subset "
+            "of recovered_block_ids."
+        )
+    if not set(recovered_int8_block_ids).issubset(recovered_set):
+        raise AssertionError(
+            f"{event['_source']}: recovered_int8_block_ids must be a subset "
+            "of recovered_block_ids."
+        )
+    if not set(missing_fp16_block_ids).issubset(missing_set):
+        raise AssertionError(
+            f"{event['_source']}: missing_fp16_block_ids must be a subset "
+            "of missing_backup_block_ids."
+        )
+    if not set(missing_int8_block_ids).issubset(missing_set):
+        raise AssertionError(
+            f"{event['_source']}: missing_int8_block_ids must be a subset "
+            "of missing_backup_block_ids."
+        )
+    if not set(tier_skip_block_ids).issubset(skipped_set):
+        raise AssertionError(
+            f"{event['_source']}: tier_skip_block_ids must be a subset of "
+            "skipped_block_ids."
+        )
+
+    require_int(event, "fp16_payload_bytes", minimum=0)
+    require_int(event, "int8_payload_bytes", minimum=0)
+    require_int(event, "effective_recovery_transfer_bytes", minimum=0)
 
 
 def validate_recovery_test_mutated_event(event: dict[str, Any]) -> None:

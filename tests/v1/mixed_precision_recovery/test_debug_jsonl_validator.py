@@ -293,6 +293,60 @@ def test_debug_jsonl_validator_accepts_recovery_materialized_event(tmp_path):
     validate_recovery_materialized_event(events[0])
 
 
+def test_debug_jsonl_validator_accepts_tiered_recovery_materialized_event(
+    tmp_path,
+):
+    path = tmp_path / "mpr.jsonl"
+    recovery_event = {
+        "event": "recovery_materialized",
+        "layer_name": "model.layers.0.self_attn.attn",
+        "layer_event_idx": 4,
+        "query_shape": [1, 4, 128],
+        "window_query_shape": [4, 128],
+        "window_query_len": 3,
+        "kv_cache_shape": [2, 16, 32, 2, 128],
+        "recovery_policy": "threshold_block",
+        "recovery_topk": 2,
+        "recovery_threshold": 1.5,
+        "recovery_test_mutate": "off",
+        "recovery_test_mode": "recover",
+        "recovery_selected_block_ids": [7, 8, 9],
+        "recovered_block_ids": [7, 8],
+        "missing_backup_block_ids": [],
+        "skipped_block_ids": [9],
+        "recovered_bytes": 32768,
+        "recovery_copy_wall_ms": 0.25,
+        "precision_tiering_enabled": True,
+        "precision_policy": "top_ratio",
+        "tier_fp16_block_ids": [7],
+        "tier_int8_block_ids": [8],
+        "tier_skip_block_ids": [9],
+        "recovered_fp16_block_ids": [7],
+        "recovered_int8_block_ids": [8],
+        "missing_fp16_block_ids": [],
+        "missing_int8_block_ids": [],
+        "fp16_payload_bytes": 16384,
+        "int8_payload_bytes": 10240,
+        "effective_recovery_transfer_bytes": 26624,
+        "cpu_backup_block_count": 5,
+        "cpu_backup_bytes": 81920,
+        "cpu_backup_fp16_payload_bytes": 65536,
+        "cpu_backup_int8_payload_bytes": 16384,
+        "cpu_backup_int8_scale_bytes": 4096,
+        "cpu_backup_total_actual_bytes": 86016,
+        "valid_block_ids": [7, 8, 9],
+        "finalized_block_ids": [7, 8],
+        "score_candidate_block_ids": [7, 8],
+        "observed_digest_block_ids": [7, 8],
+        "missing_digest_blocks": [],
+        "extra_digest_blocks": [],
+    }
+    path.write_text(json.dumps(recovery_event), encoding="utf-8")
+
+    events = load_jsonl([path])
+    validate_recovery_materialized_event(events[0])
+
+
 def test_debug_jsonl_validator_accepts_recovery_test_mutated_event(tmp_path):
     path = tmp_path / "mpr.jsonl"
     mutation_event = {

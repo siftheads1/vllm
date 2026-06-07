@@ -30,9 +30,20 @@ from vllm.v1.mixed_precision_recovery.quest_packing import (
     PackedQuestDigestCache,
     QuestMetadataStore,
 )
+from vllm.v1.mixed_precision_recovery.precision_policy import (
+    PrecisionPolicy,
+    ThresholdPrecisionPolicy,
+    TierAssignment,
+    TopRatioPrecisionPolicy,
+)
 from vllm.v1.mixed_precision_recovery.recovery import (
     BlockRecoveryManager,
     select_recovery_block_ids,
+)
+from vllm.v1.mixed_precision_recovery.recovery_payload import (
+    EagerRecoveryPayloadProvider,
+    RecoveryPayloadProvider,
+    TieredRecoveryPayloads,
 )
 from vllm.v1.mixed_precision_recovery.scoring import (
     DigestScoreResult,
@@ -139,6 +150,9 @@ class RecoverySidecar:
     _scoring_backend: DigestScoringBackend = field(init=False)
     _recovery_manager: BlockRecoveryManager = field(
         default_factory=BlockRecoveryManager
+    )
+    _recovery_payload_provider: RecoveryPayloadProvider = field(
+        default_factory=EagerRecoveryPayloadProvider
     )
 
     def __post_init__(self) -> None:
@@ -542,13 +556,19 @@ class RecoverySidecar:
             )
             return
 
-        selected_block_ids = select_recovery_block_ids(
-            score_result=score_context.score_result,
-            physical_block_ids=score_context.physical_block_ids,
-            policy=self.config.recovery_policy,
-            topk=self.config.recovery_topk,
-            threshold=self.config.recovery_threshold,
-        )
+        tier_assignment: TierAssignment | None = None
+        tiered_payloads: TieredRecoveryPayloads | None = None
+        if self.config.precision_tiering_enabled:
+            tier_assignment = self._assign_precision_tiers(score_context)
+            selected_block_ids = tier_assignment.all_block_ids
+        else:
+            selected_block_ids = select_recovery_block_ids(
+                score_result=score_context.score_result,
+                physical_block_ids=score_context.physical_block_ids,
+                policy=self.config.recovery_policy,
+                topk=self.config.recovery_topk,
+                threshold=self.config.recovery_threshold,
+            )
         test_mutated_block_ids = []
         if apply_test_mutation:
             test_mutated_block_ids = self._maybe_mutate_recovery_targets(
@@ -568,12 +588,27 @@ class RecoverySidecar:
                     "MPR recovery_test_mode must be 'recover' or "
                     f"'mutate_only', got {self.config.recovery_test_mode!r}."
                 )
-        recovery_result = self._recovery_manager.materialize_blocks(
-            selected_block_ids=selected_block_ids,
-            kv_cache=kv_cache,
-            cpu_backup_store=self._cpu_backup_store,
-            layer_name=layer_name,
-        )
+        if self.config.precision_tiering_enabled:
+            assert tier_assignment is not None
+            tiered_payloads = self._recovery_payload_provider.fetch(
+                assignment=tier_assignment,
+                cpu_backup_store=self._cpu_backup_store,
+                layer_name=layer_name,
+            )
+            self._raise_on_missing_tier_payloads(tiered_payloads)
+            recovery_result = (
+                self._recovery_manager.materialize_tiered_payloads(
+                    tiered_payloads=tiered_payloads,
+                    kv_cache=kv_cache,
+                )
+            )
+        else:
+            recovery_result = self._recovery_manager.materialize_blocks(
+                selected_block_ids=selected_block_ids,
+                kv_cache=kv_cache,
+                cpu_backup_store=self._cpu_backup_store,
+                layer_name=layer_name,
+            )
         backup_stats = self._cpu_backup_store.stats()
         if score_context.should_record:
             self._record(
@@ -613,6 +648,10 @@ class RecoverySidecar:
                 recovery_copy_wall_ms=(
                     recovery_result.copy_wall_seconds * 1000.0
                 ),
+                **self._tiered_recovery_debug_fields(
+                    tier_assignment=tier_assignment,
+                    recovery_result=recovery_result,
+                ),
                 cpu_backup_block_count=backup_stats.block_count,
                 cpu_backup_bytes=backup_stats.total_bytes,
                 cpu_backup_fp16_payload_bytes=backup_stats.fp16_payload_bytes,
@@ -623,6 +662,81 @@ class RecoverySidecar:
                 ),
                 **score_context.score_block_debug,
             )
+
+    def _build_precision_policy(self) -> PrecisionPolicy:
+        """Build the configured M4 score-to-tier policy."""
+        if self.config.precision_policy == "top_ratio":
+            return TopRatioPrecisionPolicy(
+                fp16_ratio=self.config.tier_fp16_ratio,
+                int8_ratio=self.config.tier_int8_ratio,
+            )
+        if self.config.precision_policy == "threshold":
+            return ThresholdPrecisionPolicy(
+                high_threshold=self.config.tier_high_threshold,
+                low_threshold=self.config.tier_low_threshold,
+            )
+        raise ValueError(
+            "MPR precision_policy must be 'top_ratio' or 'threshold', got "
+            f"{self.config.precision_policy!r}."
+        )
+
+    def _assign_precision_tiers(
+        self,
+        score_context: QueryScoreContext,
+    ) -> TierAssignment:
+        """Assign score candidates to precision tiers without rescoring."""
+        policy = self._build_precision_policy()
+        return policy.assign_tiers(
+            block_scores=score_context.score_result.block_scores,
+            physical_block_ids=score_context.physical_block_ids,
+        )
+
+    def _raise_on_missing_tier_payloads(
+        self,
+        tiered_payloads: TieredRecoveryPayloads,
+    ) -> None:
+        """Fail fast when eager tiered recovery cannot fetch a tier payload."""
+        if (
+            not tiered_payloads.missing_fp16_block_ids
+            and not tiered_payloads.missing_int8_block_ids
+        ):
+            return
+        raise ValueError(
+            "MPR tiered recovery expected all selected tier payloads to "
+            "exist for the eager provider, got "
+            f"missing_fp16_block_ids={tiered_payloads.missing_fp16_block_ids}, "
+            f"missing_int8_block_ids={tiered_payloads.missing_int8_block_ids}."
+        )
+
+    def _tiered_recovery_debug_fields(
+        self,
+        *,
+        tier_assignment: TierAssignment | None,
+        recovery_result: Any,
+    ) -> dict[str, Any]:
+        """Return M4 tier debug fields only when tiering is active."""
+        if tier_assignment is None:
+            return {}
+        return {
+            "precision_tiering_enabled": True,
+            "precision_policy": self.config.precision_policy,
+            "tier_fp16_block_ids": tier_assignment.fp16_block_ids,
+            "tier_int8_block_ids": tier_assignment.int8_block_ids,
+            "tier_skip_block_ids": tier_assignment.skipped_block_ids,
+            "recovered_fp16_block_ids": (
+                recovery_result.recovered_fp16_block_ids
+            ),
+            "recovered_int8_block_ids": (
+                recovery_result.recovered_int8_block_ids
+            ),
+            "missing_fp16_block_ids": recovery_result.missing_fp16_block_ids,
+            "missing_int8_block_ids": recovery_result.missing_int8_block_ids,
+            "fp16_payload_bytes": recovery_result.fp16_payload_bytes,
+            "int8_payload_bytes": recovery_result.int8_payload_bytes,
+            "effective_recovery_transfer_bytes": (
+                recovery_result.effective_recovery_transfer_bytes
+            ),
+        }
 
     def _estimate_query_scores(
         self,
