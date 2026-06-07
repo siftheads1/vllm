@@ -340,3 +340,81 @@ Step 4.4 completion:
 Step 4.4 is complete.
 Next step is Step 4.5 Recovery Payload Provider.
 ```
+
+## 2026-06-07: Step 4.5 Recovery Payload Provider
+
+Implemented a provider boundary between precision tier assignment and CPU backup
+storage.
+
+Added:
+
+```text
+vllm/v1/mixed_precision_recovery/recovery_payload.py
+  RecoveryPayloadProvider protocol
+  FP16RecoveryPayloadEntry
+  INT8RecoveryPayloadEntry
+  TieredRecoveryPayloads
+  EagerRecoveryPayloadProvider
+```
+
+Provider behavior:
+
+```text
+fp16 tier -> fetch CPUBackupStore fp16 payload by CPUBackupKey
+int8 tier -> fetch CPUBackupStore int8 payload by CPUBackupKey
+skip tier -> preserve skipped ids without querying CPUBackupStore
+missing payloads -> report missing_fp16_block_ids or missing_int8_block_ids
+```
+
+Compatibility boundary:
+
+```text
+precision policy code still does not import or query CPUBackupStore
+recovery materialization is not changed yet
+the M3 fp16 recovery path is preserved
+```
+
+Validation:
+
+```text
+tests/v1/mixed_precision_recovery/test_recovery_payload.py
+  covers fp16/int8 payload group fetch
+  covers missing fp16 and missing int8 payload reporting
+  covers skip tier avoiding payload fetches
+```
+
+Validation run locally:
+
+```text
+python -m py_compile \
+  vllm/v1/mixed_precision_recovery/recovery_payload.py \
+  tests/v1/mixed_precision_recovery/test_recovery_payload.py
+
+result:
+  passed
+
+git diff --check
+
+result:
+  passed
+```
+
+Local validation not completed:
+
+```text
+python -m pytest tests/v1/mixed_precision_recovery/test_recovery_payload.py -q
+
+result:
+  not run in this Windows environment because pytest is not installed:
+  No module named pytest
+
+manual import/runtime test:
+  not run in this Windows environment because torch is not installed:
+  No module named 'torch'
+```
+
+Next step:
+
+```text
+Step 4.6 Tiered Materialization.
+```

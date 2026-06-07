@@ -39,6 +39,13 @@ from vllm.v1.mixed_precision_recovery.precision_policy import (
     TierAssignment,
     TopRatioPrecisionPolicy,
 )
+from vllm.v1.mixed_precision_recovery.recovery_payload import (
+    EagerRecoveryPayloadProvider,
+    FP16RecoveryPayloadEntry,
+    INT8RecoveryPayloadEntry,
+    RecoveryPayloadProvider,
+    TieredRecoveryPayloads,
+)
 from vllm.v1.mixed_precision_recovery.recovery import (
     BlockRecoveryManager,
     RecoveryResult,
@@ -85,6 +92,11 @@ __all__ = [
     "ThresholdPrecisionPolicy",
     "TierAssignment",
     "TopRatioPrecisionPolicy",
+    "EagerRecoveryPayloadProvider",
+    "FP16RecoveryPayloadEntry",
+    "INT8RecoveryPayloadEntry",
+    "RecoveryPayloadProvider",
+    "TieredRecoveryPayloads",
     "BlockRecoveryManager",
     "RecoveryResult",
     "RecoverySidecar",
