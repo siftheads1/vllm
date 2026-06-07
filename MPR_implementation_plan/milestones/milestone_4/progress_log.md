@@ -509,6 +509,22 @@ result:
   No module named pytest
 ```
 
+Target-server validation:
+
+```text
+Focused M4 regression pytest completed successfully:
+
+python -m pytest \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_recovery_payload.py \
+  tests/v1/mixed_precision_recovery/test_backup_codec.py \
+  tests/v1/mixed_precision_recovery/test_precision_policy.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py -q
+
+result:
+  passed
+```
+
 Next step:
 
 ```text
