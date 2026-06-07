@@ -5,7 +5,7 @@
 Milestone 3 starts from the approved action plan:
 
 ```text
-MPR_implementation_plan/milestone_3_action_plan.md
+MPR_implementation_plan/milestones/milestone_3/action_plan.md
 ```
 
 Current M3 target:

@@ -127,7 +127,7 @@ Mixed-Precision Recovery sidecar
 - ArkVale kernel을 그대로 쓸 수 있는지, 아니면 PyTorch prototype이 먼저 필요한지 판단
 
 산출물:
-- `vllm_integration_notes.md`
+- `integration/vllm_integration_notes.md`
 - hook 후보 파일/함수 목록
 
 ### Milestone 1: Score-Only Prototype

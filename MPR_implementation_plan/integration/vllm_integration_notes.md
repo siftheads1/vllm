@@ -471,5 +471,5 @@ ArkVale-style scoring/backend remains future work
 Detailed completion record:
 
 ```text
-MPR_implementation_plan/milestone_1_results.md
+MPR_implementation_plan/milestones/milestone_1/results.md
 ```

@@ -460,11 +460,11 @@ Completion:
 Milestone 1 완료 시 다음 문서를 업데이트한다.
 
 ```text
-vllm_integration_notes.md
-milestone_1_results.md
+../../integration/vllm_integration_notes.md
+results.md
 ```
 
-`milestone_1_results.md`에는 다음을 남긴다.
+`results.md`에는 다음을 남긴다.
 
 ```text
 implemented hooks

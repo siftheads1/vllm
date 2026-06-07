@@ -32,13 +32,13 @@ code changes should target `/workspace/vllm`.
   - `unified_attention_with_output`
 - Confirmed CPU KV backup layout is not needed until Milestone 2.
 - Wrote:
-  - `/workspace/vllm_arkvale_mixed_precision_plan.md`
-  - `/workspace/milestone_0_action_plan.md`
-  - `/workspace/vllm_integration_notes.md`
+  - `MPR_implementation_plan/project_plan.md`
+  - `MPR_implementation_plan/milestones/milestone_0/action_plan.md`
+  - `MPR_implementation_plan/integration/vllm_integration_notes.md`
 
 ### Milestone 1 Planning
 
-- Wrote `/workspace/milestone_1_action_plan.md`.
+- Wrote `MPR_implementation_plan/milestones/milestone_1/action_plan.md`.
 - Clarified that `MPR` means `Mixed-Precision Recovery`.
 - Clarified initial page/block assumption:
 
@@ -92,7 +92,7 @@ editable target: /workspace/vllm
 - Added Step 1.0 baseline notes:
 
 ```text
-/workspace/milestone_1_step_1_0_baseline.md
+MPR_implementation_plan/milestones/milestone_1/reports/step_1_0_baseline.md
 ```
 
 - User ran the baseline and got a valid generation:
@@ -1031,7 +1031,7 @@ Remaining scope caveat:
 Created report:
 
 ```text
-/home/han/KV_cache_quant/proposed_method_develop/vllm/MPR_implementation_plan/milestone_1_step_1_7_arkvale_kernel_compatibility_report.md
+MPR_implementation_plan/milestones/milestone_1/reports/step_1_7_arkvale_kernel_compatibility_report.md
 ```
 
 Summary:
@@ -1069,13 +1069,13 @@ Open Step 1.7 decisions before adapter design:
 Created Quest scoring reference report:
 
 ```text
-/home/han/KV_cache_quant/proposed_method_develop/vllm/MPR_implementation_plan/reference_quest_scoring_report.md
+MPR_implementation_plan/references/reference_quest_scoring_report.md
 ```
 
 Created DiffKV scoring reference report:
 
 ```text
-/home/han/KV_cache_quant/proposed_method_develop/vllm/MPR_implementation_plan/reference_diffkv_scoring_report.md
+MPR_implementation_plan/references/reference_diffkv_scoring_report.md
 ```
 
 Current interpretation:
@@ -1098,7 +1098,7 @@ possible attention-mass oracle/calibration signal.
 Created implementation report:
 
 ```text
-/home/han/KV_cache_quant/proposed_method_develop/vllm/MPR_implementation_plan/milestone_1_step_1_7_modular_scoring_implementation_report.md
+MPR_implementation_plan/milestones/milestone_1/reports/step_1_7_modular_scoring_implementation_report.md
 ```
 
 Implemented the first modular scoring pass:
@@ -1250,7 +1250,7 @@ The target vLLM environment should run the focused MPR pytest suite.
 Created detailed Quest estimate kernel report:
 
 ```text
-/home/han/KV_cache_quant/proposed_method_develop/vllm/MPR_implementation_plan/milestone_1_step_1_7_quest_estimate_kernel_analysis_report.md
+MPR_implementation_plan/milestones/milestone_1/reports/step_1_7_quest_estimate_kernel_analysis_report.md
 ```
 
 Key conclusion:
@@ -1478,7 +1478,7 @@ Do not optimize this before profiling. Candidate follow-ups after profiling:
 Created Quest kernel dependency slicing report:
 
 ```text
-/home/han/KV_cache_quant/proposed_method_develop/vllm/MPR_implementation_plan/milestone_1_step_1_7_quest_kernel_dependency_slicing_report.md
+MPR_implementation_plan/milestones/milestone_1/reports/step_1_7_quest_kernel_dependency_slicing_report.md
 ```
 
 Key conclusion:

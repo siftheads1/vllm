@@ -33,7 +33,7 @@ querying block ids or importing mixed_precision_recovery.
 Follow-up optimization and cleanup items are tracked in:
 
 ```text
-MPR_implementation_plan/mpr_followup_backlog.md
+MPR_implementation_plan/backlog.md
 ```
 
 ## 2026-06-02: M2 CPU Backup Prototype Implemented

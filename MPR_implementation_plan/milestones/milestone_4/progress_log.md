@@ -257,7 +257,7 @@ reference path. In the current implementation, backup copy/quantization should
 be treated as blocking decode-side work. The eager int8 payload is derived from
 the already-created CPU fp16 payload, so it avoids a second GPU->CPU copy but
 still pays CPU quantization cost synchronously. Future optimization items are
-recorded in mpr_followup_backlog.md for Milestone 5, including lazy/on-the-fly
+recorded in ../../backlog.md for Milestone 5, including lazy/on-the-fly
 int8 creation, GPU-side quantization, pinned/non_blocking copies, readiness
 tracking, and background quantization.
 ```

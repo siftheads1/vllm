@@ -244,7 +244,7 @@ Milestone 0 끝에서 다음 중 하나를 결정한다.
 최종 산출물:
 
 ```text
-vllm_integration_notes.md
+../../integration/vllm_integration_notes.md
 target backend decision
 hook list
 metadata mapping diagram

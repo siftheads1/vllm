@@ -460,9 +460,9 @@ single-request smoke completes when CUDA is available
 When M3 is complete, update:
 
 ```text
-milestone_3_progress_log.md
-vllm_integration_notes.md
-milestone_1_results.md or a new milestone_3_results.md if useful
+progress_log.md
+../../integration/vllm_integration_notes.md
+../milestone_1/results.md or a new results.md if useful
 ```
 
 Record:
