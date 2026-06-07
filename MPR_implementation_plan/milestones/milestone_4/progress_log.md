@@ -418,3 +418,99 @@ Next step:
 ```text
 Step 4.6 Tiered Materialization.
 ```
+
+## 2026-06-07: Step 4.6 Tiered Materialization
+
+Implemented the minimal tiered materialization primitive without wiring it into
+the sidecar runtime path.
+
+Updated:
+
+```text
+vllm/v1/mixed_precision_recovery/recovery.py
+  RecoveryResult keeps the existing M3 fields and adds tier-specific metadata
+  BlockRecoveryManager.materialize_tiered_payloads(...)
+  fp16 payload materialization via FP16BackupCodec
+  int8 payload materialization/dequantization via INT8BackupCodec
+```
+
+Tiered materialization behavior:
+
+```text
+fp16 payload entries -> materialize to target dtype/device and copy into
+  kv_cache[:, physical_block_id]
+int8 payload entries -> dequantize/materialize to target dtype/device and copy
+  into kv_cache[:, physical_block_id]
+skip tier ids -> record as skipped and leave target blocks untouched
+missing fp16/int8 payload ids -> report by tier and in the M3-compatible
+  missing_backup_block_ids field
+out-of-range or shape-mismatched payload targets -> raise ValueError because
+  they indicate a broken materialization contract, not a normal skip tier
+```
+
+Missing payload note:
+
+```text
+missing_fp16_block_ids and missing_int8_block_ids describe provider/store
+availability, not target materialization failure.
+
+For the current EagerRecoveryPayloadProvider, missing int8 payloads usually mean
+the CPU backup store was populated without int8 payloads, for example
+backup_storage_mode=fp16_only. Step 4.7 sidecar integration should decide
+whether eager provider + non-empty int8 tier + missing int8 payload is a hard
+configuration/contract error.
+```
+
+Compatibility boundary:
+
+```text
+BlockRecoveryManager.materialize_blocks(...) still uses CPUBackupStore.get(...)
+sidecar recovery still calls the M3 fp16-only materialize_blocks(...) path
+debug JSONL schema is not changed in this step
+```
+
+Validation added:
+
+```text
+tests/v1/mixed_precision_recovery/test_recovery.py
+  tiered fp16 materialization into target block
+  tiered int8 materialization/dequantization with bounded error
+  skip tier leaves target block unchanged
+  missing fp16/int8 payload ids are reported by tier
+  out-of-range and shape-mismatched payload targets raise ValueError
+```
+
+Validation run locally:
+
+```text
+python -m py_compile \
+  vllm/v1/mixed_precision_recovery/recovery.py \
+  tests/v1/mixed_precision_recovery/test_recovery.py
+
+result:
+  passed
+
+git diff --check
+
+result:
+  passed
+```
+
+Local validation not completed:
+
+```text
+python -m pytest \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_recovery_payload.py \
+  tests/v1/mixed_precision_recovery/test_backup_codec.py -q
+
+result:
+  not run in this Windows environment because pytest is not installed:
+  No module named pytest
+```
+
+Next step:
+
+```text
+Step 4.7 Sidecar Integration and Debug Events.
+```

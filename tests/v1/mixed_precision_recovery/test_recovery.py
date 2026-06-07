@@ -6,11 +6,20 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.v1.mixed_precision_recovery.backup_codec import (
+    FP16BackupCodec,
+    INT8BackupCodec,
+)
 from vllm.v1.mixed_precision_recovery.config import MPRConfig
 from vllm.v1.mixed_precision_recovery.cpu_backup import SemanticCPUBackupStore
 from vllm.v1.mixed_precision_recovery.recovery import (
     BlockRecoveryManager,
     select_recovery_block_ids,
+)
+from vllm.v1.mixed_precision_recovery.recovery_payload import (
+    FP16RecoveryPayloadEntry,
+    INT8RecoveryPayloadEntry,
+    TieredRecoveryPayloads,
 )
 from vllm.v1.mixed_precision_recovery.sidecar import BlockDigest, RecoverySidecar
 from vllm.model_executor.layers.attention import attention as attention_module
@@ -178,6 +187,132 @@ def test_block_recovery_skips_shape_mismatch_without_mutating_target():
     assert result.missing_backup_block_ids == []
     assert result.skipped_block_ids == [1]
     torch.testing.assert_close(kv_cache, torch.ones_like(kv_cache))
+
+
+def test_block_recovery_materializes_tiered_fp16_and_int8_payloads():
+    kv_cache = torch.zeros(2, 4, 4, 1, 2, dtype=torch.float32)
+    fp16_source = torch.arange(16, dtype=torch.float32).reshape(2, 4, 1, 2)
+    int8_source = torch.linspace(-3.0, 3.0, 16).reshape(2, 4, 1, 2)
+    fp16_payload = FP16BackupCodec().encode(fp16_source)
+    int8_payload = INT8BackupCodec().encode(int8_source)
+    before_skip = kv_cache[:, 3].clone()
+
+    result = BlockRecoveryManager().materialize_tiered_payloads(
+        tiered_payloads=TieredRecoveryPayloads(
+            fp16_payloads=[
+                FP16RecoveryPayloadEntry(
+                    physical_block_id=1,
+                    payload=fp16_payload,
+                )
+            ],
+            int8_payloads=[
+                INT8RecoveryPayloadEntry(
+                    physical_block_id=2,
+                    payload=int8_payload,
+                )
+            ],
+            skipped_block_ids=[3],
+            missing_fp16_block_ids=[],
+            missing_int8_block_ids=[],
+        ),
+        kv_cache=kv_cache,
+    )
+
+    assert result.selected_block_ids == [1, 2, 3]
+    assert result.recovered_block_ids == [1, 2]
+    assert result.recovered_fp16_block_ids == [1]
+    assert result.recovered_int8_block_ids == [2]
+    assert result.missing_backup_block_ids == []
+    assert result.skipped_block_ids == [3]
+    assert result.tier_skipped_block_ids == [3]
+    assert result.fp16_payload_bytes == fp16_payload.payload_nbytes
+    assert result.int8_payload_bytes == int8_payload.payload_nbytes
+    assert result.effective_recovery_transfer_bytes == (
+        fp16_payload.payload_nbytes + int8_payload.payload_nbytes
+    )
+    assert result.recovered_bytes == (
+        kv_cache[:, 1].numel() * kv_cache.element_size()
+        + kv_cache[:, 2].numel() * kv_cache.element_size()
+    )
+    torch.testing.assert_close(kv_cache[:, 1], fp16_source.to(torch.float16).float())
+    int8_error = (kv_cache[:, 2] - int8_source).abs()
+    assert bool(torch.all(int8_error <= int8_payload.scale.unsqueeze(-1) / 2 + 1e-6))
+    torch.testing.assert_close(kv_cache[:, 3], before_skip)
+
+
+def test_block_recovery_tiered_reports_missing_payloads():
+    kv_cache = torch.zeros(2, 2, 4, 1, 2, dtype=torch.float32)
+
+    result = BlockRecoveryManager().materialize_tiered_payloads(
+        tiered_payloads=TieredRecoveryPayloads(
+            fp16_payloads=[],
+            int8_payloads=[],
+            skipped_block_ids=[],
+            missing_fp16_block_ids=[1],
+            missing_int8_block_ids=[2],
+        ),
+        kv_cache=kv_cache,
+    )
+
+    assert result.selected_block_ids == [1, 2]
+    assert result.recovered_block_ids == []
+    assert result.missing_backup_block_ids == [1, 2]
+    assert result.missing_fp16_block_ids == [1]
+    assert result.missing_int8_block_ids == [2]
+    assert result.skipped_block_ids == []
+    assert result.recovered_bytes == 0
+    assert result.effective_recovery_transfer_bytes == 0
+    torch.testing.assert_close(kv_cache, torch.zeros_like(kv_cache))
+
+
+def test_block_recovery_tiered_rejects_shape_mismatched_payload_target():
+    kv_cache = torch.ones(2, 2, 4, 1, 2, dtype=torch.float32)
+    bad_shape_payload = FP16BackupCodec().encode(torch.zeros(2, 3, 1, 2))
+    before = kv_cache.clone()
+
+    with pytest.raises(ValueError, match="payload shape does not match"):
+        BlockRecoveryManager().materialize_tiered_payloads(
+            tiered_payloads=TieredRecoveryPayloads(
+                fp16_payloads=[
+                    FP16RecoveryPayloadEntry(
+                        physical_block_id=1,
+                        payload=bad_shape_payload,
+                    )
+                ],
+                int8_payloads=[],
+                skipped_block_ids=[],
+                missing_fp16_block_ids=[],
+                missing_int8_block_ids=[],
+            ),
+            kv_cache=kv_cache,
+        )
+
+    torch.testing.assert_close(kv_cache, before)
+
+
+def test_block_recovery_tiered_rejects_out_of_range_payload_target():
+    kv_cache = torch.ones(2, 2, 4, 1, 2, dtype=torch.float32)
+    out_of_range_payload = INT8BackupCodec().encode(torch.zeros(2, 4, 1, 2))
+    before = kv_cache.clone()
+
+    with pytest.raises(ValueError, match="outside kv_cache block range"):
+        BlockRecoveryManager().materialize_tiered_payloads(
+            tiered_payloads=TieredRecoveryPayloads(
+                fp16_payloads=[],
+                int8_payloads=[
+                    INT8RecoveryPayloadEntry(
+                        physical_block_id=5,
+                        payload=out_of_range_payload,
+                    )
+                ],
+                skipped_block_ids=[],
+                missing_fp16_block_ids=[],
+                missing_int8_block_ids=[],
+            ),
+            kv_cache=kv_cache,
+        )
+
+    torch.testing.assert_close(kv_cache, before)
 
 
 def test_block_recovery_recover_uses_threshold_policy():
