@@ -344,3 +344,69 @@ Status:
 ```text
 Step 4.5.5 complete
 ```
+
+## 2026-06-09: Step 4.5.7 INT4 Smoke via Existing Scripts
+
+Extended the existing M4 smoke scripts with opt-in INT4 ratio support while
+preserving existing two-part fp16/int8 defaults.
+
+Implemented:
+
+```text
+scripts/mpr_smoke_tiered_recovery.py accepts both FP16:INT8 and
+  FP16:INT8:INT4 ratio entries
+scripts/mpr_smoke_tiered_degraded_residency.py reuses the extended ratio parser
+existing two-part ratios imply INT4=0 and keep eager_fp16_int8 storage
+ratios with INT4 > 0 use eager_fp16_int8_int4 storage and set
+  VLLM_MPR_TIER_INT4_RATIO
+ratios with INT4 > 0 pass --require-tiered-int4-recovery to the debug JSONL
+  validator
+smoke summaries now report tier/recovered/missing INT4 counts and INT4
+  payload/scale bytes
+INT4 opt-in smoke assertions require non-empty INT4 tier/recovery evidence and
+  positive INT4 byte accounting
+Step 4.5.7 action plan text now documents the existing-script extension
+  approach instead of a new script
+```
+
+Validation attempted in the current Windows environment:
+
+```text
+python -m py_compile \
+  scripts/mpr_smoke_tiered_recovery.py \
+  scripts/mpr_smoke_tiered_degraded_residency.py \
+  scripts/mpr_validate_debug_jsonl.py
+
+result:
+  passed
+
+python -c "<validate smoke ratio parser and INT4 env selection>"
+
+result:
+  passed
+
+git diff --check
+
+result:
+  passed
+```
+
+Validation still needed in the Linux vLLM runtime environment:
+
+```text
+python -m pytest tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py -q
+
+WORK_DIR=/tmp/mpr_m45_int4_recovery_$(date +%Y%m%d_%H%M%S)
+python scripts/mpr_smoke_tiered_recovery.py \
+  --work-dir "$WORK_DIR" \
+  --tier-ratios 1.00:0.00:0.00,0.50:0.25:0.25,0.25:0.25:0.50,0.00:0.50:0.50,0.00:0.00:1.00 \
+  --summary-json "$WORK_DIR/summary.json" \
+  --text-preview-chars 500
+
+WORK_DIR=/tmp/mpr_m45_int4_degraded_$(date +%Y%m%d_%H%M%S)
+python scripts/mpr_smoke_tiered_degraded_residency.py \
+  --work-dir "$WORK_DIR" \
+  --tier-ratios 0.25:0.25:0.25,0.25:0.25:0.10,0.25:0.10:0.25,0.10:0.25:0.25 \
+  --summary-json "$WORK_DIR/summary.json" \
+  --text-preview-chars 500
+```

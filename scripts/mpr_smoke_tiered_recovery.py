@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run an M4 tiered recovery ratio sweep smoke.
+"""Run an M4/M4.5 tiered recovery ratio sweep smoke.
 
 This smoke runs one MPR-off baseline, then runs tiered MPR recovery across
-FP16/INT8 top-ratio compositions. It is intended to validate fp16/int8 recovery
-path coverage, debug JSONL shape, and byte accounting while printing generated
-outputs for inspection.
+FP16/INT8 and opt-in FP16/INT8/INT4 top-ratio compositions. It is intended to
+validate tiered recovery path coverage, debug JSONL shape, and byte accounting
+while printing generated outputs for inspection.
 
 Skip-tier correctness under degraded/missing residency is intentionally out of
 scope for this script and remains a Step 4.9 responsibility.
@@ -51,25 +51,35 @@ SKIP_ACCOUNTING_RATIO = "0.25:0.50"
 class TierRatio:
     fp16: float
     int8: float
+    int4: float = 0.0
 
     @property
     def skip(self) -> float:
-        return 1.0 - self.fp16 - self.int8
+        return 1.0 - self.fp16 - self.int8 - self.int4
+
+    @property
+    def has_int4(self) -> bool:
+        return self.int4 > 0.0
 
     @property
     def label(self) -> str:
         fp16 = f"{self.fp16:.2f}".replace(".", "p")
         int8 = f"{self.int8:.2f}".replace(".", "p")
+        if self.has_int4:
+            int4 = f"{self.int4:.2f}".replace(".", "p")
+            return f"fp16_{fp16}_int8_{int8}_int4_{int4}"
         return f"fp16_{fp16}_int8_{int8}"
 
     @property
     def display(self) -> str:
+        if self.has_int4:
+            return f"{self.fp16:.2f}:{self.int8:.2f}:{self.int4:.2f}"
         return f"{self.fp16:.2f}:{self.int8:.2f}"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the MPR M4 tiered recovery ratio sweep smoke."
+        description="Run the MPR M4/M4.5 tiered recovery ratio sweep smoke."
     )
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
     parser.add_argument(
@@ -108,8 +118,10 @@ def parse_args() -> argparse.Namespace:
         "--tier-ratios",
         default=",".join(DEFAULT_TIER_RATIOS),
         help=(
-            "Comma-separated FP16:INT8 ratio pairs. Defaults to a no-skip "
-            "sweep: " + ",".join(DEFAULT_TIER_RATIOS) + "."
+            "Comma-separated FP16:INT8 or FP16:INT8:INT4 ratios. Existing "
+            "two-part ratios imply INT4=0. Defaults to a no-skip M4 sweep: "
+            + ",".join(DEFAULT_TIER_RATIOS)
+            + "."
         ),
     )
     parser.add_argument(
@@ -117,7 +129,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             f"Also run {SKIP_ACCOUNTING_RATIO}; this checks skip assignment "
-            "and accounting only, not degraded skip correctness."
+            "and accounting only, not degraded skip correctness. The added "
+            "ratio uses INT4=0."
         ),
     )
     parser.add_argument(
@@ -155,24 +168,29 @@ def parse_tier_ratios(ratio_text: str, *, include_skip_ratio: bool) -> list[Tier
     ratios: list[TierRatio] = []
     for item in ratio_items:
         try:
-            fp16_text, int8_text = item.split(":", maxsplit=1)
+            parts = item.split(":")
+            if len(parts) not in (2, 3):
+                raise ValueError
+            fp16_text, int8_text = parts[:2]
             fp16 = float(fp16_text)
             int8 = float(int8_text)
+            int4 = float(parts[2]) if len(parts) == 3 else 0.0
         except ValueError as exc:
             raise ValueError(
-                "Tier ratios must be comma-separated FP16:INT8 pairs, got "
-                f"{item!r}."
+                "Tier ratios must be comma-separated FP16:INT8 or "
+                f"FP16:INT8:INT4 entries, got {item!r}."
             ) from exc
-        if fp16 < 0.0 or int8 < 0.0:
+        if fp16 < 0.0 or int8 < 0.0 or int4 < 0.0:
             raise ValueError(f"Tier ratios must be non-negative, got {item!r}.")
-        if fp16 > 1.0 or int8 > 1.0:
+        if fp16 > 1.0 or int8 > 1.0 or int4 > 1.0:
             raise ValueError(f"Tier ratios must be <= 1.0, got {item!r}.")
-        if fp16 + int8 > 1.0 + 1e-9:
+        ratio_sum = fp16 + int8 + int4
+        if ratio_sum > 1.0 + 1e-9:
             raise ValueError(
                 f"Tier ratio sum must be <= 1.0, got {item!r} "
-                f"(sum={fp16 + int8:.6f})."
+                f"(sum={ratio_sum:.6f})."
             )
-        ratios.append(TierRatio(fp16=fp16, int8=int8))
+        ratios.append(TierRatio(fp16=fp16, int8=int8, int4=int4))
     return ratios
 
 
@@ -195,7 +213,9 @@ def ratio_env(
         {
             "VLLM_MPR_ENABLE": "1",
             "VLLM_MPR_CPU_BACKUP": "1",
-            "VLLM_MPR_BACKUP_STORAGE_MODE": "eager_fp16_int8",
+            "VLLM_MPR_BACKUP_STORAGE_MODE": (
+                "eager_fp16_int8_int4" if ratio.has_int4 else "eager_fp16_int8"
+            ),
             "VLLM_MPR_SCORING_ENABLE": "1",
             "VLLM_MPR_RECOVERY_ENABLE": "1",
             "VLLM_MPR_RECOVERY_POLICY": "threshold_block",
@@ -205,6 +225,7 @@ def ratio_env(
             "VLLM_MPR_PRECISION_POLICY": "top_ratio",
             "VLLM_MPR_TIER_FP16_RATIO": str(ratio.fp16),
             "VLLM_MPR_TIER_INT8_RATIO": str(ratio.int8),
+            "VLLM_MPR_TIER_INT4_RATIO": str(ratio.int4),
             "VLLM_MPR_RECOVERY_TEST_MUTATE": "zero_selected",
             "VLLM_MPR_RECOVERY_TEST_MODE": "recover",
             "VLLM_MPR_RECENT_TOKENS": str(args.recent_tokens),
@@ -233,6 +254,7 @@ def prepare_debug_dir(debug_dir: Path) -> None:
 def run_jsonl_validator(
     *,
     args: argparse.Namespace,
+    ratio: TierRatio,
     debug_dir: Path,
     log_path: Path,
 ) -> None:
@@ -254,6 +276,8 @@ def run_jsonl_validator(
         "--show",
         "5",
     ]
+    if ratio.has_int4:
+        cmd.append("--require-tiered-int4-recovery")
     with log_path.open("w", encoding="utf-8") as log_file:
         try:
             subprocess.run(
@@ -316,10 +340,12 @@ def summarize_tiered_events(
 
     missing_fp16_count = sum_list_lengths(tiered_events, "missing_fp16_block_ids")
     missing_int8_count = sum_list_lengths(tiered_events, "missing_int8_block_ids")
-    if missing_fp16_count or missing_int8_count:
+    missing_int4_count = sum_list_lengths(tiered_events, "missing_int4_block_ids")
+    if missing_fp16_count or missing_int8_count or missing_int4_count:
         raise AssertionError(
             f"{ratio.display}: missing tier payloads observed "
-            f"(fp16={missing_fp16_count}, int8={missing_int8_count})."
+            f"(fp16={missing_fp16_count}, int8={missing_int8_count}, "
+            f"int4={missing_int4_count})."
         )
 
     effective_bytes = sum_ints(tiered_events, "effective_recovery_transfer_bytes")
@@ -331,9 +357,13 @@ def summarize_tiered_events(
 
     tier_fp16_count = sum_list_lengths(tiered_events, "tier_fp16_block_ids")
     tier_int8_count = sum_list_lengths(tiered_events, "tier_int8_block_ids")
+    tier_int4_count = sum_list_lengths(tiered_events, "tier_int4_block_ids")
     tier_skip_count = sum_list_lengths(tiered_events, "tier_skip_block_ids")
     recovered_fp16_count = sum_list_lengths(tiered_events, "recovered_fp16_block_ids")
     recovered_int8_count = sum_list_lengths(tiered_events, "recovered_int8_block_ids")
+    recovered_int4_count = sum_list_lengths(tiered_events, "recovered_int4_block_ids")
+    int4_payload_bytes = sum_ints(tiered_events, "int4_payload_bytes")
+    int4_scale_bytes = sum_ints(tiered_events, "int4_scale_bytes")
     if ratio.skip <= 1e-9 and tier_skip_count != 0:
         raise AssertionError(
             f"{ratio.display}: no-skip ratio unexpectedly produced "
@@ -354,6 +384,17 @@ def summarize_tiered_events(
             f"{ratio.display}: int8 ratio > 0 but no int8 tier/recovery "
             "ids appeared."
         )
+    if ratio.int4 > 0.0 and (tier_int4_count <= 0 or recovered_int4_count <= 0):
+        raise AssertionError(
+            f"{ratio.display}: int4 ratio > 0 but no int4 tier/recovery "
+            "ids appeared."
+        )
+    if ratio.int4 > 0.0 and (int4_payload_bytes <= 0 or int4_scale_bytes <= 0):
+        raise AssertionError(
+            f"{ratio.display}: int4 ratio > 0 but INT4 byte accounting was "
+            f"not positive (payload={int4_payload_bytes}, "
+            f"scale={int4_scale_bytes})."
+        )
 
     return {
         "tiered_recovery_event_count": len(tiered_events),
@@ -362,13 +403,18 @@ def summarize_tiered_events(
         ),
         "tier_fp16_count": tier_fp16_count,
         "tier_int8_count": tier_int8_count,
+        "tier_int4_count": tier_int4_count,
         "tier_skip_count": tier_skip_count,
         "recovered_fp16_count": recovered_fp16_count,
         "recovered_int8_count": recovered_int8_count,
+        "recovered_int4_count": recovered_int4_count,
         "missing_fp16_count": missing_fp16_count,
         "missing_int8_count": missing_int8_count,
+        "missing_int4_count": missing_int4_count,
         "fp16_payload_bytes": sum_ints(tiered_events, "fp16_payload_bytes"),
         "int8_payload_bytes": sum_ints(tiered_events, "int8_payload_bytes"),
+        "int4_payload_bytes": int4_payload_bytes,
+        "int4_scale_bytes": int4_scale_bytes,
         "effective_recovery_transfer_bytes": effective_bytes,
         "recovered_bytes": sum_ints(tiered_events, "recovered_bytes"),
     }
@@ -398,17 +444,21 @@ def print_run_summary(
         "  tier_counts: "
         f"fp16={summary['tier_fp16_count']}, "
         f"int8={summary['tier_int8_count']}, "
+        f"int4={summary['tier_int4_count']}, "
         f"skip={summary['tier_skip_count']}"
     )
     print(
         "  recovered_counts: "
         f"fp16={summary['recovered_fp16_count']}, "
-        f"int8={summary['recovered_int8_count']}"
+        f"int8={summary['recovered_int8_count']}, "
+        f"int4={summary['recovered_int4_count']}"
     )
     print(
         "  bytes: "
         f"fp16_payload={summary['fp16_payload_bytes']}, "
         f"int8_payload={summary['int8_payload_bytes']}, "
+        f"int4_payload={summary['int4_payload_bytes']}, "
+        f"int4_scale={summary['int4_scale_bytes']}, "
         f"effective_transfer={summary['effective_recovery_transfer_bytes']}"
     )
     print(f"  log_path: {summary['log_path']}")
@@ -470,7 +520,12 @@ def main() -> None:
         generated_text = extract_generated_text(log_path)
 
         events = load_jsonl_events(debug_dir)
-        run_jsonl_validator(args=args, debug_dir=debug_dir, log_path=validator_log)
+        run_jsonl_validator(
+            args=args,
+            ratio=ratio,
+            debug_dir=debug_dir,
+            log_path=validator_log,
+        )
         event_summary = summarize_tiered_events(ratio=ratio, events=events)
         mismatch = first_mismatch_index(baseline_ids, generated_ids)
         text_prefix = common_text_prefix_len(baseline_text, generated_text)
@@ -479,6 +534,7 @@ def main() -> None:
             "ratio": ratio.display,
             "fp16_ratio": ratio.fp16,
             "int8_ratio": ratio.int8,
+            "int4_ratio": ratio.int4,
             "skip_ratio": ratio.skip,
             "generated_token_count": len(generated_ids),
             "generated_token_ids": generated_ids,

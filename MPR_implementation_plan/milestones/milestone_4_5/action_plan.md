@@ -370,15 +370,26 @@ skip-unrecovered requirement still rejects recovered skip ids
 
 ## Step 4.5.7: INT4 Ratio Sweep Smoke
 
-Add or extend smoke coverage for fp16/int8/int4 ratio compositions.
+Extend existing M4 smoke coverage for opt-in fp16/int8/int4 ratio
+compositions while preserving existing fp16/int8 defaults.
 
-Recommended new script:
+Updated existing scripts:
 
 ```text
-scripts/mpr_smoke_tiered_int4_recovery.py
+scripts/mpr_smoke_tiered_recovery.py
+scripts/mpr_smoke_tiered_degraded_residency.py
 ```
 
-Default no-skip ratio sweep:
+Ratio CLI:
+
+```text
+existing FP16:INT8 ratios remain valid and imply INT4=0
+new FP16:INT8:INT4 ratios enable M4.5 INT4 smoke validation
+ratios with INT4 > 0 use eager_fp16_int8_int4 backup storage
+ratios with INT4 > 0 pass --require-tiered-int4-recovery to the JSONL validator
+```
+
+M4.5 opt-in no-skip ratio sweep:
 
 ```text
 1.00:0.00:0.00
@@ -388,7 +399,7 @@ Default no-skip ratio sweep:
 0.00:0.00:1.00
 ```
 
-Default degraded-residency ratio sweep:
+M4.5 opt-in degraded-residency ratio sweep:
 
 ```text
 0.25:0.25:0.25
@@ -401,8 +412,6 @@ Script options:
 
 ```text
 --tier-ratios
---degraded-tier-ratios
---run-degraded
 --show-full-text
 --text-preview-chars
 --summary-json
@@ -480,7 +489,8 @@ python -m py_compile \
   vllm/v1/mixed_precision_recovery/recovery.py \
   vllm/v1/mixed_precision_recovery/sidecar.py \
   scripts/mpr_validate_debug_jsonl.py \
-  scripts/mpr_smoke_tiered_int4_recovery.py
+  scripts/mpr_smoke_tiered_recovery.py \
+  scripts/mpr_smoke_tiered_degraded_residency.py
 ```
 
 Focused pytest:
@@ -498,21 +508,23 @@ python -m pytest \
 Runtime smoke:
 
 ```text
-WORK_DIR=/tmp/mpr_m45_int4_$(date +%Y%m%d_%H%M%S) bash -lc \
-  'python scripts/mpr_smoke_tiered_int4_recovery.py \
+WORK_DIR=/tmp/mpr_m45_int4_recovery_$(date +%Y%m%d_%H%M%S) bash -lc \
+  'python scripts/mpr_smoke_tiered_recovery.py \
     --work-dir "$WORK_DIR" \
+    --tier-ratios 1.00:0.00:0.00,0.50:0.25:0.25,0.25:0.25:0.50,0.00:0.50:0.50,0.00:0.00:1.00 \
     --summary-json "$WORK_DIR/summary.json" \
     --text-preview-chars 500'
 ```
 
-Runtime smoke with full text:
+Runtime degraded skip smoke:
 
 ```text
-WORK_DIR=/tmp/mpr_m45_int4_$(date +%Y%m%d_%H%M%S) bash -lc \
-  'python scripts/mpr_smoke_tiered_int4_recovery.py \
+WORK_DIR=/tmp/mpr_m45_int4_degraded_$(date +%Y%m%d_%H%M%S) bash -lc \
+  'python scripts/mpr_smoke_tiered_degraded_residency.py \
     --work-dir "$WORK_DIR" \
+    --tier-ratios 0.25:0.25:0.25,0.25:0.25:0.10,0.25:0.10:0.25,0.10:0.25:0.25 \
     --summary-json "$WORK_DIR/summary.json" \
-    --show-full-text'
+    --text-preview-chars 500'
 ```
 
 ## Decision Gate

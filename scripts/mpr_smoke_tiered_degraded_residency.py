@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run an M4 degraded-residency skip-tier ratio sweep smoke.
+"""Run an M4/M4.5 degraded-residency skip-tier ratio sweep smoke.
 
 This smoke uses validation-only ``zero_selected`` mutation to simulate old KV
-blocks being degraded before tiered recovery. FP16/INT8 tiers are materialized
-from CPU backup payloads, while skip-tier blocks must remain degraded and
-unrecovered. Output differences are reported for inspection only.
+blocks being degraded before tiered recovery. FP16/INT8 and opt-in INT4 tiers
+are materialized from CPU backup payloads, while skip-tier blocks must remain
+degraded and unrecovered. Output differences are reported for inspection only.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ DEFAULT_DEGRADED_TIER_RATIOS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the MPR M4 degraded-residency skip-tier smoke."
+        description="Run the MPR M4/M4.5 degraded-residency skip-tier smoke."
     )
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
     parser.add_argument(
@@ -94,8 +94,9 @@ def parse_args() -> argparse.Namespace:
         "--tier-ratios",
         default=",".join(DEFAULT_DEGRADED_TIER_RATIOS),
         help=(
-            "Comma-separated FP16:INT8 ratio pairs. Every ratio must leave "
-            "room for skip tier. Defaults to "
+            "Comma-separated FP16:INT8 or FP16:INT8:INT4 ratios. Existing "
+            "two-part ratios imply INT4=0. Every ratio must leave room for "
+            "skip tier. Defaults to "
             + ",".join(DEFAULT_DEGRADED_TIER_RATIOS)
             + "."
         ),
@@ -130,7 +131,7 @@ def parse_degraded_ratios(ratio_text: str) -> list[TierRatio]:
     for ratio in ratios:
         if ratio.skip <= 1e-9:
             raise ValueError(
-                "Step 4.9 degraded-residency ratios must leave skip tier "
+                "Degraded-residency ratios must leave skip tier "
                 f"capacity, got {ratio.display}."
             )
     return ratios
@@ -147,7 +148,9 @@ def degraded_env(
         {
             "VLLM_MPR_ENABLE": "1",
             "VLLM_MPR_CPU_BACKUP": "1",
-            "VLLM_MPR_BACKUP_STORAGE_MODE": "eager_fp16_int8",
+            "VLLM_MPR_BACKUP_STORAGE_MODE": (
+                "eager_fp16_int8_int4" if ratio.has_int4 else "eager_fp16_int8"
+            ),
             "VLLM_MPR_SCORING_ENABLE": "1",
             "VLLM_MPR_RECOVERY_ENABLE": "1",
             "VLLM_MPR_RECOVERY_POLICY": "threshold_block",
@@ -157,6 +160,7 @@ def degraded_env(
             "VLLM_MPR_PRECISION_POLICY": "top_ratio",
             "VLLM_MPR_TIER_FP16_RATIO": str(ratio.fp16),
             "VLLM_MPR_TIER_INT8_RATIO": str(ratio.int8),
+            "VLLM_MPR_TIER_INT4_RATIO": str(ratio.int4),
             "VLLM_MPR_RECOVERY_TEST_MUTATE": "zero_selected",
             "VLLM_MPR_RECOVERY_TEST_MODE": "recover",
             "VLLM_MPR_RECENT_TOKENS": str(args.recent_tokens),
@@ -171,6 +175,7 @@ def degraded_env(
 def run_jsonl_validator(
     *,
     args: argparse.Namespace,
+    ratio: TierRatio,
     debug_dir: Path,
     log_path: Path,
 ) -> None:
@@ -193,6 +198,8 @@ def run_jsonl_validator(
         "--show",
         "5",
     ]
+    if ratio.has_int4:
+        cmd.append("--require-tiered-int4-recovery")
     with log_path.open("w", encoding="utf-8") as log_file:
         try:
             subprocess.run(
@@ -233,10 +240,12 @@ def summarize_degraded_events(
 
     missing_fp16_count = sum_list_lengths(tiered_events, "missing_fp16_block_ids")
     missing_int8_count = sum_list_lengths(tiered_events, "missing_int8_block_ids")
-    if missing_fp16_count or missing_int8_count:
+    missing_int4_count = sum_list_lengths(tiered_events, "missing_int4_block_ids")
+    if missing_fp16_count or missing_int8_count or missing_int4_count:
         raise AssertionError(
             f"{ratio.display}: missing tier payloads observed "
-            f"(fp16={missing_fp16_count}, int8={missing_int8_count})."
+            f"(fp16={missing_fp16_count}, int8={missing_int8_count}, "
+            f"int4={missing_int4_count})."
         )
 
     effective_bytes = sum_ints(tiered_events, "effective_recovery_transfer_bytes")
@@ -248,9 +257,13 @@ def summarize_degraded_events(
 
     tier_fp16_count = sum_list_lengths(tiered_events, "tier_fp16_block_ids")
     tier_int8_count = sum_list_lengths(tiered_events, "tier_int8_block_ids")
+    tier_int4_count = sum_list_lengths(tiered_events, "tier_int4_block_ids")
     tier_skip_count = sum_list_lengths(tiered_events, "tier_skip_block_ids")
     recovered_fp16_count = sum_list_lengths(tiered_events, "recovered_fp16_block_ids")
     recovered_int8_count = sum_list_lengths(tiered_events, "recovered_int8_block_ids")
+    recovered_int4_count = sum_list_lengths(tiered_events, "recovered_int4_block_ids")
+    int4_payload_bytes = sum_ints(tiered_events, "int4_payload_bytes")
+    int4_scale_bytes = sum_ints(tiered_events, "int4_scale_bytes")
     mutated_count = sum_list_lengths(tiered_events, "recovery_test_mutated_block_ids")
     if mutated_count <= 0:
         raise AssertionError(f"{ratio.display}: no degraded block ids observed.")
@@ -266,6 +279,17 @@ def summarize_degraded_events(
     if ratio.int8 > 0.0 and recovered_int8_count <= 0:
         raise AssertionError(
             f"{ratio.display}: int8 ratio > 0 but no recovered int8 ids appeared."
+        )
+    if ratio.int4 > 0.0 and (tier_int4_count <= 0 or recovered_int4_count <= 0):
+        raise AssertionError(
+            f"{ratio.display}: int4 ratio > 0 but no int4 tier/recovery "
+            "ids appeared."
+        )
+    if ratio.int4 > 0.0 and (int4_payload_bytes <= 0 or int4_scale_bytes <= 0):
+        raise AssertionError(
+            f"{ratio.display}: int4 ratio > 0 but INT4 byte accounting was "
+            f"not positive (payload={int4_payload_bytes}, "
+            f"scale={int4_scale_bytes})."
         )
 
     skip_validating_event_count = 0
@@ -300,14 +324,19 @@ def summarize_degraded_events(
         "mutated_block_count": mutated_count,
         "tier_fp16_count": tier_fp16_count,
         "tier_int8_count": tier_int8_count,
+        "tier_int4_count": tier_int4_count,
         "tier_skip_count": tier_skip_count,
         "recovered_fp16_count": recovered_fp16_count,
         "recovered_int8_count": recovered_int8_count,
+        "recovered_int4_count": recovered_int4_count,
         "unrecovered_skip_count": tier_skip_count,
         "missing_fp16_count": missing_fp16_count,
         "missing_int8_count": missing_int8_count,
+        "missing_int4_count": missing_int4_count,
         "fp16_payload_bytes": sum_ints(tiered_events, "fp16_payload_bytes"),
         "int8_payload_bytes": sum_ints(tiered_events, "int8_payload_bytes"),
+        "int4_payload_bytes": int4_payload_bytes,
+        "int4_scale_bytes": int4_scale_bytes,
         "effective_recovery_transfer_bytes": effective_bytes,
         "recovered_bytes": sum_ints(tiered_events, "recovered_bytes"),
     }
@@ -338,18 +367,22 @@ def print_run_summary(
         "  tier_counts: "
         f"fp16={summary['tier_fp16_count']}, "
         f"int8={summary['tier_int8_count']}, "
+        f"int4={summary['tier_int4_count']}, "
         f"skip={summary['tier_skip_count']}"
     )
     print(
         "  recovered_counts: "
         f"fp16={summary['recovered_fp16_count']}, "
         f"int8={summary['recovered_int8_count']}, "
+        f"int4={summary['recovered_int4_count']}, "
         f"unrecovered_skip={summary['unrecovered_skip_count']}"
     )
     print(
         "  bytes: "
         f"fp16_payload={summary['fp16_payload_bytes']}, "
         f"int8_payload={summary['int8_payload_bytes']}, "
+        f"int4_payload={summary['int4_payload_bytes']}, "
+        f"int4_scale={summary['int4_scale_bytes']}, "
         f"effective_transfer={summary['effective_recovery_transfer_bytes']}"
     )
     print(f"  log_path: {summary['log_path']}")
@@ -408,7 +441,12 @@ def main() -> None:
         generated_text = extract_generated_text(log_path)
 
         events = load_jsonl_events(debug_dir)
-        run_jsonl_validator(args=args, debug_dir=debug_dir, log_path=validator_log)
+        run_jsonl_validator(
+            args=args,
+            ratio=ratio,
+            debug_dir=debug_dir,
+            log_path=validator_log,
+        )
         event_summary = summarize_degraded_events(ratio=ratio, events=events)
         mismatch = first_mismatch_index(baseline_ids, generated_ids)
         text_prefix = common_text_prefix_len(baseline_text, generated_text)
@@ -417,6 +455,7 @@ def main() -> None:
             "ratio": ratio.display,
             "fp16_ratio": ratio.fp16,
             "int8_ratio": ratio.int8,
+            "int4_ratio": ratio.int4,
             "skip_ratio": ratio.skip,
             "generated_token_count": len(generated_ids),
             "generated_token_ids": generated_ids,
