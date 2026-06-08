@@ -243,15 +243,31 @@ result:
   passed
 ```
 
-Validation not completed in this environment:
+Focused validation completed in the Linux vLLM runtime environment:
 
 ```text
-python -m pytest ... failed before running tests because pytest is not
-installed in the available Windows Python.
+python -m pytest \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py -q
 
-direct import smoke failed because torch is not installed in the available
-Windows Python.
+result:
+  passed
 
-Focused pytest validation remains pending in the existing torch/vLLM runtime
-environment used by prior MPR validation.
+python -m pytest \
+  tests/v1/mixed_precision_recovery/test_backup_codec.py \
+  tests/v1/mixed_precision_recovery/test_recovery_payload.py \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py \
+  -q
+
+result:
+  passed
+```
+
+Environment note:
+
+```text
+The Windows Python available to this coding session does not have pytest or
+torch installed, so only py_compile and git diff --check were run locally here.
+The focused pytest commands above were run and reported passing in the
+Linux/vLLM runtime environment.
 ```
