@@ -116,11 +116,33 @@ def _decode_metadata_three_blocks():
     )
 
 
+def _decode_metadata_four_blocks():
+    return SimpleNamespace(
+        max_query_len=1,
+        num_actual_tokens=1,
+        num_reqs=1,
+        seq_lens=torch.tensor([16]),
+        block_table=torch.tensor([[0, 1, 2, 3]]),
+    )
+
+
 def _add_third_digest(sidecar: RecoverySidecar) -> None:
     layer_name = "model.layers.0.self_attn.attn"
     sidecar._digest_cache[layer_name][2] = BlockDigest(
         digest_min=torch.zeros(1, 2),
         digest_max=torch.full((1, 2), 2.0),
+        valid_token_count=4,
+        block_size=4,
+        layer_event_idx=0,
+        digest_kind="raw_minmax",
+    )
+
+
+def _add_fourth_digest(sidecar: RecoverySidecar) -> None:
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar._digest_cache[layer_name][3] = BlockDigest(
+        digest_min=torch.zeros(1, 2),
+        digest_max=torch.full((1, 2), 0.5),
         valid_token_count=4,
         block_size=4,
         layer_event_idx=0,
@@ -725,6 +747,119 @@ def test_sidecar_tiered_recovery_leaves_mutated_skip_tier_degraded():
     assert sidecar.counters["recovery_test_mutated"] == 0
 
 
+def test_sidecar_tiered_recovery_restores_int4_and_leaves_skip_degraded():
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = _make_recovery_sidecar(
+        precision_tiering_enabled=True,
+        precision_policy="top_ratio",
+        tier_fp16_ratio=0.25,
+        tier_int8_ratio=0.25,
+        tier_int4_ratio=0.25,
+        backup_storage_mode="eager_fp16_int8_int4",
+        recovery_test_mutate="zero_selected",
+        recovery_test_mode="recover",
+    )
+    _add_third_digest(sidecar)
+    _add_fourth_digest(sidecar)
+    kv_cache = torch.full((2, 4, 4, 1, 2), -5.0, dtype=torch.float32)
+    int4_backup = torch.full((2, 4, 1, 2), 2.0)
+    fp16_backup = torch.full((2, 4, 1, 2), 9.0)
+    int8_backup = torch.full((2, 4, 1, 2), 3.0)
+    skip_backup = torch.full((2, 4, 1, 2), 7.0)
+    sidecar._cpu_backup_store.put(
+        layer_name=layer_name,
+        physical_block_id=0,
+        kv_block=int4_backup,
+        backup_storage_mode="eager_fp16_int8_int4",
+    )
+    sidecar._cpu_backup_store.put(
+        layer_name=layer_name,
+        physical_block_id=1,
+        kv_block=fp16_backup,
+        backup_storage_mode="eager_fp16_int8_int4",
+    )
+    sidecar._cpu_backup_store.put(
+        layer_name=layer_name,
+        physical_block_id=2,
+        kv_block=int8_backup,
+        backup_storage_mode="eager_fp16_int8_int4",
+    )
+    sidecar._cpu_backup_store.put(
+        layer_name=layer_name,
+        physical_block_id=3,
+        kv_block=skip_backup,
+        backup_storage_mode="eager_fp16_int8_int4",
+    )
+
+    sidecar.recover_before_attention_with_test_mutation(
+        layer_name=layer_name,
+        query=torch.ones(1, 1, 2),
+        attn_metadata=_decode_metadata_four_blocks(),
+        kv_cache=kv_cache,
+        block_size=4,
+    )
+
+    torch.testing.assert_close(kv_cache[:, 0], int4_backup)
+    torch.testing.assert_close(kv_cache[:, 1], fp16_backup)
+    torch.testing.assert_close(kv_cache[:, 2], int8_backup)
+    torch.testing.assert_close(kv_cache[:, 3], torch.zeros_like(kv_cache[:, 3]))
+    assert sidecar.counters["recovery_materialized"] == 1
+    assert sidecar.counters["recovery_test_mutated"] == 0
+
+
+def test_sidecar_tiered_recovery_zero_selected_mutates_all_tier_ids(monkeypatch):
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = _make_recovery_sidecar(
+        precision_tiering_enabled=True,
+        precision_policy="top_ratio",
+        tier_fp16_ratio=0.25,
+        tier_int8_ratio=0.25,
+        tier_int4_ratio=0.25,
+        backup_storage_mode="eager_fp16_int8_int4",
+        recovery_test_mutate="zero_selected",
+        recovery_test_mode="recover",
+    )
+    _add_third_digest(sidecar)
+    _add_fourth_digest(sidecar)
+    kv_cache = torch.full((2, 4, 4, 1, 2), -5.0, dtype=torch.float32)
+    for block_id in range(4):
+        sidecar._cpu_backup_store.put(
+            layer_name=layer_name,
+            physical_block_id=block_id,
+            kv_block=torch.full((2, 4, 1, 2), float(block_id + 1)),
+            backup_storage_mode="eager_fp16_int8_int4",
+        )
+
+    mutation_calls = []
+    original_mutate = sidecar._maybe_mutate_recovery_targets
+
+    def spy_mutate_recovery_targets(**kwargs):
+        mutated_block_ids = original_mutate(**kwargs)
+        mutation_calls.append(
+            (
+                [int(block_id) for block_id in kwargs["selected_block_ids"]],
+                mutated_block_ids,
+            )
+        )
+        return mutated_block_ids
+
+    monkeypatch.setattr(
+        sidecar,
+        "_maybe_mutate_recovery_targets",
+        spy_mutate_recovery_targets,
+    )
+
+    sidecar.recover_before_attention_with_test_mutation(
+        layer_name=layer_name,
+        query=torch.ones(1, 1, 2),
+        attn_metadata=_decode_metadata_four_blocks(),
+        kv_cache=kv_cache,
+        block_size=4,
+    )
+
+    assert mutation_calls == [([1, 2, 0, 3], [1, 2, 0, 3])]
+
+
 def test_sidecar_tiered_recovery_supports_threshold_policy():
     layer_name = "model.layers.0.self_attn.attn"
     sidecar = _make_recovery_sidecar(
@@ -762,6 +897,39 @@ def test_sidecar_tiered_recovery_supports_threshold_policy():
     torch.testing.assert_close(kv_cache[:, 0], torch.full_like(kv_cache[:, 0], -5.0))
     torch.testing.assert_close(kv_cache[:, 1], fp16_backup)
     torch.testing.assert_close(kv_cache[:, 2], int8_backup)
+    assert sidecar.counters["recovery_materialized"] == 1
+
+
+def test_sidecar_m3_recovery_ignores_int4_tier_config_when_tiering_disabled():
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = _make_recovery_sidecar(
+        precision_tiering_enabled=False,
+        precision_policy="top_ratio",
+        tier_fp16_ratio=0.0,
+        tier_int8_ratio=0.0,
+        tier_int4_ratio=1.0,
+        recovery_policy="topk_block",
+        backup_storage_mode="fp16_only",
+    )
+    kv_cache = torch.full((2, 2, 4, 1, 2), -5.0, dtype=torch.float32)
+    backup = torch.full((2, 4, 1, 2), 11.0)
+    sidecar._cpu_backup_store.put(
+        layer_name=layer_name,
+        physical_block_id=1,
+        kv_block=backup,
+        backup_storage_mode="fp16_only",
+    )
+
+    sidecar.recover_before_attention(
+        layer_name=layer_name,
+        query=torch.ones(1, 1, 2),
+        attn_metadata=_decode_metadata(),
+        kv_cache=kv_cache,
+        block_size=4,
+    )
+
+    torch.testing.assert_close(kv_cache[:, 0], torch.full_like(kv_cache[:, 0], -5.0))
+    torch.testing.assert_close(kv_cache[:, 1], backup)
     assert sidecar.counters["recovery_materialized"] == 1
 
 

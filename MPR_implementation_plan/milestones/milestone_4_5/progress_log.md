@@ -271,3 +271,60 @@ torch installed, so only py_compile and git diff --check were run locally here.
 The focused pytest commands above were run and reported passing in the
 Linux/vLLM runtime environment.
 ```
+
+## 2026-06-08: Step 4.5.5 Sidecar Integration and Validation Fault Injection
+
+Implemented INT4-aware sidecar validation coverage for the tiered recovery
+runtime path.
+
+Implemented:
+
+```text
+added a four-block sidecar test fixture for deterministic fp16/int8/int4/skip
+  top-ratio assignment
+added zero_selected + recover coverage where fp16/int8/int4 blocks are restored
+  and the skip-tier block remains degraded
+added a regression test showing precision_tiering_enabled=false preserves the
+  M3 fp16 recovery path even when INT4 tier config is nonzero
+added INT4 CPU backup byte fields to recovery_test_mutated debug events
+updated the recovery_test_mutated validator fixture to include INT4 byte fields
+```
+
+Validation attempted in the current Windows environment:
+
+```text
+python -m py_compile \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py \
+  scripts/mpr_validate_debug_jsonl.py
+
+result:
+  passed
+
+python -c "<validate recovery_test_mutated fixture via mpr_validate_debug_jsonl>"
+
+result:
+  passed
+
+git diff --check
+
+result:
+  passed
+```
+
+Validation still needed in the Linux vLLM runtime environment:
+
+```text
+python -m pytest tests/v1/mixed_precision_recovery/test_recovery.py -q
+
+python -m pytest \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py -q
+
+python -m pytest \
+  tests/v1/mixed_precision_recovery/test_backup_codec.py \
+  tests/v1/mixed_precision_recovery/test_recovery_payload.py \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py \
+  -q
+```

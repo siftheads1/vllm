@@ -1049,6 +1049,8 @@ class RecoverySidecar:
             cpu_backup_fp16_payload_bytes=backup_stats.fp16_payload_bytes,
             cpu_backup_int8_payload_bytes=backup_stats.int8_payload_bytes,
             cpu_backup_int8_scale_bytes=backup_stats.int8_scale_bytes,
+            cpu_backup_int4_payload_bytes=backup_stats.int4_payload_bytes,
+            cpu_backup_int4_scale_bytes=backup_stats.int4_scale_bytes,
             cpu_backup_total_actual_bytes=(
                 backup_stats.total_actual_backup_bytes
             ),
