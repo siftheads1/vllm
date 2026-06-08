@@ -313,13 +313,20 @@ result:
   passed
 ```
 
-Validation still needed in the Linux vLLM runtime environment:
+Focused validation completed in the Linux vLLM runtime environment on
+2026-06-09:
 
 ```text
 python -m pytest tests/v1/mixed_precision_recovery/test_recovery.py -q
 
+result:
+  passed
+
 python -m pytest \
   tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py -q
+
+result:
+  passed
 
 python -m pytest \
   tests/v1/mixed_precision_recovery/test_backup_codec.py \
@@ -327,4 +334,13 @@ python -m pytest \
   tests/v1/mixed_precision_recovery/test_recovery.py \
   tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py \
   -q
+
+result:
+  passed
+```
+
+Status:
+
+```text
+Step 4.5.5 complete
 ```

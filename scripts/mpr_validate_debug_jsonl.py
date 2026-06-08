@@ -93,6 +93,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--require-tiered-int4-recovery",
+        action="store_true",
+        help=(
+            "Require at least one tiered recovery event with recovered INT4 "
+            "blocks and positive INT4 byte accounting."
+        ),
+    )
+    parser.add_argument(
         "--show",
         type=int,
         default=10,
@@ -1009,6 +1017,57 @@ def validate_tiered_skip_unrecovered_requirement(
     )
 
 
+def validate_tiered_int4_recovery_requirement(
+    recovery_events: list[dict[str, Any]],
+) -> None:
+    """Require run-level evidence of recovered INT4 tier blocks."""
+    for event in recovery_events:
+        if event.get("precision_tiering_enabled") is not True:
+            continue
+        if event.get("tier_int4_block_ids") is None:
+            continue
+        tier_int4_block_ids = set(
+            require_int_list(event, "tier_int4_block_ids", minimum=0)
+        )
+        if not tier_int4_block_ids:
+            continue
+
+        missing_int4_block_ids = require_int_list(
+            event,
+            "missing_int4_block_ids",
+            minimum=0,
+        )
+        if missing_int4_block_ids:
+            continue
+
+        recovered_int4_block_ids = set(
+            require_int_list(event, "recovered_int4_block_ids", minimum=0)
+        )
+        recovered_block_ids = set(
+            require_int_list(event, "recovered_block_ids", minimum=0)
+        )
+        if not tier_int4_block_ids.issubset(recovered_int4_block_ids):
+            continue
+        if not tier_int4_block_ids.issubset(recovered_block_ids):
+            continue
+        if require_int(event, "int4_payload_bytes", minimum=0) <= 0:
+            continue
+        if require_int(event, "int4_scale_bytes", minimum=0) <= 0:
+            continue
+        if require_int(
+            event,
+            "effective_recovery_transfer_bytes",
+            minimum=0,
+        ) <= 0:
+            continue
+        return
+
+    raise AssertionError(
+        "Expected at least one tiered recovery event with recovered INT4 "
+        "blocks and positive INT4 byte accounting."
+    )
+
+
 def validate_digest_observe_matches(
     digest_events: list[dict[str, Any]],
     observe_events: list[dict[str, Any]],
@@ -1264,6 +1323,8 @@ def main() -> None:
         )
     if args.require_tiered_skip_unrecovered:
         validate_tiered_skip_unrecovered_requirement(recovery_events)
+    if args.require_tiered_int4_recovery:
+        validate_tiered_int4_recovery_requirement(recovery_events)
 
     validate_digest_observe_matches(
         digest_events,
