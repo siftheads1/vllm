@@ -300,7 +300,9 @@ if TYPE_CHECKING:
     VLLM_MPR_PRECISION_POLICY: str = "top_ratio"
     VLLM_MPR_TIER_FP16_RATIO: float = 0.25
     VLLM_MPR_TIER_INT8_RATIO: float = 0.50
+    VLLM_MPR_TIER_INT4_RATIO: float = 0.0
     VLLM_MPR_TIER_HIGH_THRESHOLD: float = 0.0
+    VLLM_MPR_TIER_MID_THRESHOLD: float = 0.0
     VLLM_MPR_TIER_LOW_THRESHOLD: float = 0.0
     VLLM_MPR_BACKUP_STORAGE_MODE: str = "eager_fp16_int8"
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -2056,16 +2058,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_MPR_PRECISION_POLICY",
         "top_ratio",
     ).lower(),
-    # Top-ratio policy fractions for fp16 and int8 recovery tiers.
+    # Top-ratio policy fractions for fp16, int8, and int4 recovery tiers.
     "VLLM_MPR_TIER_FP16_RATIO": lambda: float(
         os.getenv("VLLM_MPR_TIER_FP16_RATIO", "0.25")
     ),
     "VLLM_MPR_TIER_INT8_RATIO": lambda: float(
         os.getenv("VLLM_MPR_TIER_INT8_RATIO", "0.50")
     ),
-    # Threshold policy score cutoffs for fp16 and int8 recovery tiers.
+    "VLLM_MPR_TIER_INT4_RATIO": lambda: float(
+        os.getenv("VLLM_MPR_TIER_INT4_RATIO", "0.0")
+    ),
+    # Threshold policy score cutoffs for fp16, int8, and int4 recovery tiers.
     "VLLM_MPR_TIER_HIGH_THRESHOLD": lambda: float(
         os.getenv("VLLM_MPR_TIER_HIGH_THRESHOLD", "0.0")
+    ),
+    "VLLM_MPR_TIER_MID_THRESHOLD": lambda: float(
+        os.getenv("VLLM_MPR_TIER_MID_THRESHOLD", "0.0")
     ),
     "VLLM_MPR_TIER_LOW_THRESHOLD": lambda: float(
         os.getenv("VLLM_MPR_TIER_LOW_THRESHOLD", "0.0")
@@ -2254,7 +2262,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_MPR_PRECISION_POLICY",
         "VLLM_MPR_TIER_FP16_RATIO",
         "VLLM_MPR_TIER_INT8_RATIO",
+        "VLLM_MPR_TIER_INT4_RATIO",
         "VLLM_MPR_TIER_HIGH_THRESHOLD",
+        "VLLM_MPR_TIER_MID_THRESHOLD",
         "VLLM_MPR_TIER_LOW_THRESHOLD",
         "VLLM_MPR_BACKUP_STORAGE_MODE",
         "LOCAL_RANK",

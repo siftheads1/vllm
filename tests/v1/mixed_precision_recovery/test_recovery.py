@@ -40,7 +40,9 @@ def _make_recovery_sidecar(
     precision_policy: str = "top_ratio",
     tier_fp16_ratio: float = 0.25,
     tier_int8_ratio: float = 0.50,
+    tier_int4_ratio: float = 0.0,
     tier_high_threshold: float = 0.0,
+    tier_mid_threshold: float = 0.0,
     tier_low_threshold: float = 0.0,
     backup_storage_mode: str | None = None,
 ) -> RecoverySidecar:
@@ -65,7 +67,9 @@ def _make_recovery_sidecar(
             precision_policy=precision_policy,
             tier_fp16_ratio=tier_fp16_ratio,
             tier_int8_ratio=tier_int8_ratio,
+            tier_int4_ratio=tier_int4_ratio,
             tier_high_threshold=tier_high_threshold,
+            tier_mid_threshold=tier_mid_threshold,
             tier_low_threshold=tier_low_threshold,
         )
     )
@@ -644,6 +648,7 @@ def test_sidecar_tiered_recovery_supports_threshold_policy():
         precision_tiering_enabled=True,
         precision_policy="threshold",
         tier_high_threshold=6.0,
+        tier_mid_threshold=3.0,
         tier_low_threshold=3.0,
     )
     _add_third_digest(sidecar)
@@ -675,6 +680,26 @@ def test_sidecar_tiered_recovery_supports_threshold_policy():
     torch.testing.assert_close(kv_cache[:, 1], fp16_backup)
     torch.testing.assert_close(kv_cache[:, 2], int8_backup)
     assert sidecar.counters["recovery_materialized"] == 1
+
+
+def test_sidecar_tiered_recovery_rejects_unsupported_int4_assignment():
+    sidecar = _make_recovery_sidecar(
+        precision_tiering_enabled=True,
+        precision_policy="top_ratio",
+        tier_fp16_ratio=0.50,
+        tier_int8_ratio=0.0,
+        tier_int4_ratio=0.50,
+    )
+    kv_cache = torch.zeros(2, 2, 4, 1, 2, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="INT4 backup payload"):
+        sidecar.recover_before_attention(
+            layer_name="model.layers.0.self_attn.attn",
+            query=torch.ones(1, 1, 2),
+            attn_metadata=_decode_metadata(),
+            kv_cache=kv_cache,
+            block_size=4,
+        )
 
 
 def test_sidecar_tiered_recovery_rejects_missing_fp16_payload():

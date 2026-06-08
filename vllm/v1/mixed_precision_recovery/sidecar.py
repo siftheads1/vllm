@@ -590,6 +590,7 @@ class RecoverySidecar:
                 )
         if self.config.precision_tiering_enabled:
             assert tier_assignment is not None
+            self._raise_on_unsupported_int4_assignment(tier_assignment)
             tiered_payloads = self._recovery_payload_provider.fetch(
                 assignment=tier_assignment,
                 cpu_backup_store=self._cpu_backup_store,
@@ -669,10 +670,12 @@ class RecoverySidecar:
             return TopRatioPrecisionPolicy(
                 fp16_ratio=self.config.tier_fp16_ratio,
                 int8_ratio=self.config.tier_int8_ratio,
+                int4_ratio=self.config.tier_int4_ratio,
             )
         if self.config.precision_policy == "threshold":
             return ThresholdPrecisionPolicy(
                 high_threshold=self.config.tier_high_threshold,
+                mid_threshold=self.config.tier_mid_threshold,
                 low_threshold=self.config.tier_low_threshold,
             )
         raise ValueError(
@@ -689,6 +692,19 @@ class RecoverySidecar:
         return policy.assign_tiers(
             block_scores=score_context.score_result.block_scores,
             physical_block_ids=score_context.physical_block_ids,
+        )
+
+    def _raise_on_unsupported_int4_assignment(
+        self,
+        tier_assignment: TierAssignment,
+    ) -> None:
+        """Reject INT4 runtime recovery until the INT4 payload path exists."""
+        if not tier_assignment.int4_block_ids:
+            return
+        raise ValueError(
+            "MPR INT4 tier assignment requires INT4 backup payload and "
+            "materialization support from a later M4.5 step, got "
+            f"int4_block_ids={tier_assignment.int4_block_ids}."
         )
 
     def _raise_on_missing_tier_payloads(
@@ -722,6 +738,7 @@ class RecoverySidecar:
             "precision_policy": self.config.precision_policy,
             "tier_fp16_block_ids": tier_assignment.fp16_block_ids,
             "tier_int8_block_ids": tier_assignment.int8_block_ids,
+            "tier_int4_block_ids": tier_assignment.int4_block_ids,
             "tier_skip_block_ids": tier_assignment.skipped_block_ids,
             "recovered_fp16_block_ids": (
                 recovery_result.recovered_fp16_block_ids

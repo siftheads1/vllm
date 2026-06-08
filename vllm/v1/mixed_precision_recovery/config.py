@@ -89,7 +89,9 @@ class MPRConfig:
     precision_policy: str = "top_ratio"
     tier_fp16_ratio: float = 0.25
     tier_int8_ratio: float = 0.50
+    tier_int4_ratio: float = 0.0
     tier_high_threshold: float = 0.0
+    tier_mid_threshold: float = 0.0
     tier_low_threshold: float = 0.0
     backup_storage_mode: str = "eager_fp16_int8"
 
@@ -117,16 +119,26 @@ class MPRConfig:
             )
         _validate_ratio("tier_fp16_ratio", self.tier_fp16_ratio)
         _validate_ratio("tier_int8_ratio", self.tier_int8_ratio)
-        ratio_sum = self.tier_fp16_ratio + self.tier_int8_ratio
+        _validate_ratio("tier_int4_ratio", self.tier_int4_ratio)
+        ratio_sum = (
+            self.tier_fp16_ratio
+            + self.tier_int8_ratio
+            + self.tier_int4_ratio
+        )
         if ratio_sum > 1.0:
             raise ValueError(
-                "tier_fp16_ratio + tier_int8_ratio must be <= 1, got "
-                f"{ratio_sum}."
+                "tier_fp16_ratio + tier_int8_ratio + tier_int4_ratio must "
+                f"be <= 1, got {ratio_sum}."
             )
-        if self.tier_high_threshold < self.tier_low_threshold:
+        if self.tier_high_threshold < self.tier_mid_threshold:
             raise ValueError(
-                "tier_high_threshold must be >= tier_low_threshold, got "
-                f"{self.tier_high_threshold} < {self.tier_low_threshold}."
+                "tier_high_threshold must be >= tier_mid_threshold, got "
+                f"{self.tier_high_threshold} < {self.tier_mid_threshold}."
+            )
+        if self.tier_mid_threshold < self.tier_low_threshold:
+            raise ValueError(
+                "tier_mid_threshold must be >= tier_low_threshold, got "
+                f"{self.tier_mid_threshold} < {self.tier_low_threshold}."
             )
 
     @classmethod
@@ -200,8 +212,16 @@ class MPRConfig:
                 "VLLM_MPR_TIER_INT8_RATIO",
                 0.50,
             ),
+            tier_int4_ratio=_parse_float(
+                "VLLM_MPR_TIER_INT4_RATIO",
+                0.0,
+            ),
             tier_high_threshold=_parse_float(
                 "VLLM_MPR_TIER_HIGH_THRESHOLD",
+                0.0,
+            ),
+            tier_mid_threshold=_parse_float(
+                "VLLM_MPR_TIER_MID_THRESHOLD",
                 0.0,
             ),
             tier_low_threshold=_parse_float(

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
 
@@ -18,6 +18,7 @@ class PrecisionTier(str, Enum):
 
     FP16 = "fp16"
     INT8 = "int8"
+    INT4 = "int4"
     SKIP = "skip"
 
 
@@ -28,6 +29,7 @@ class TierAssignment:
     fp16_block_ids: list[int]
     int8_block_ids: list[int]
     skipped_block_ids: list[int]
+    int4_block_ids: list[int] = field(default_factory=list)
 
     @property
     def all_block_ids(self) -> list[int]:
@@ -35,6 +37,7 @@ class TierAssignment:
         return [
             *self.fp16_block_ids,
             *self.int8_block_ids,
+            *self.int4_block_ids,
             *self.skipped_block_ids,
         ]
 
@@ -53,24 +56,26 @@ class PrecisionPolicy(Protocol):
 
 @dataclass(frozen=True)
 class TopRatioPrecisionPolicy:
-    """Assign highest-scoring blocks to fp16/int8 tiers by ratio.
+    """Assign highest-scoring blocks to fp16/int8/int4 tiers by ratio.
 
     Scores are sorted descending with a stable tie-break, so equal scores keep
     their original candidate order. Tier counts use ceil rounding and are
-    clamped so fp16 plus int8 never exceeds the candidate count. Any remaining
-    candidates are assigned to the skip tier.
+    clamped so fp16 plus int8 plus int4 never exceeds the candidate count. Any
+    remaining candidates are assigned to the skip tier.
     """
 
     fp16_ratio: float
     int8_ratio: float
+    int4_ratio: float = 0.0
 
     def __post_init__(self) -> None:
         _validate_ratio("fp16_ratio", self.fp16_ratio)
         _validate_ratio("int8_ratio", self.int8_ratio)
-        ratio_sum = self.fp16_ratio + self.int8_ratio
+        _validate_ratio("int4_ratio", self.int4_ratio)
+        ratio_sum = self.fp16_ratio + self.int8_ratio + self.int4_ratio
         if ratio_sum > 1.0:
             raise ValueError(
-                "fp16_ratio + int8_ratio must be <= 1, got "
+                "fp16_ratio + int8_ratio + int4_ratio must be <= 1, got "
                 f"{ratio_sum}."
             )
 
@@ -84,7 +89,12 @@ class TopRatioPrecisionPolicy:
         _validate_policy_inputs(block_scores, physical_block_ids)
         num_candidates = int(block_scores.numel())
         if num_candidates == 0:
-            return TierAssignment([], [], [])
+            return TierAssignment(
+                fp16_block_ids=[],
+                int8_block_ids=[],
+                int4_block_ids=[],
+                skipped_block_ids=[],
+            )
 
         ordered_indices = torch.argsort(
             block_scores,
@@ -103,12 +113,18 @@ class TopRatioPrecisionPolicy:
             remaining_count,
             math.ceil(num_candidates * self.int8_ratio),
         )
+        remaining_count -= int8_count
+        int4_count = min(
+            remaining_count,
+            math.ceil(num_candidates * self.int4_ratio),
+        )
+        int4_start = fp16_count + int8_count
+        skip_start = int4_start + int4_count
         assignment = TierAssignment(
             fp16_block_ids=ordered_block_ids[:fp16_count],
-            int8_block_ids=ordered_block_ids[
-                fp16_count:fp16_count + int8_count
-            ],
-            skipped_block_ids=ordered_block_ids[fp16_count + int8_count:],
+            int8_block_ids=ordered_block_ids[fp16_count:int4_start],
+            int4_block_ids=ordered_block_ids[int4_start:skip_start],
+            skipped_block_ids=ordered_block_ids[skip_start:],
         )
         _validate_assignment(assignment, physical_block_ids)
         return assignment
@@ -116,16 +132,22 @@ class TopRatioPrecisionPolicy:
 
 @dataclass(frozen=True)
 class ThresholdPrecisionPolicy:
-    """Assign blocks to fp16/int8/skip tiers by score thresholds."""
+    """Assign blocks to fp16/int8/int4/skip tiers by score thresholds."""
 
     high_threshold: float
+    mid_threshold: float
     low_threshold: float
 
     def __post_init__(self) -> None:
-        if self.high_threshold < self.low_threshold:
+        if self.high_threshold < self.mid_threshold:
             raise ValueError(
-                "high_threshold must be >= low_threshold, got "
-                f"{self.high_threshold} < {self.low_threshold}."
+                "high_threshold must be >= mid_threshold, got "
+                f"{self.high_threshold} < {self.mid_threshold}."
+            )
+        if self.mid_threshold < self.low_threshold:
+            raise ValueError(
+                "mid_threshold must be >= low_threshold, got "
+                f"{self.mid_threshold} < {self.low_threshold}."
             )
 
     def assign_tiers(
@@ -138,6 +160,7 @@ class ThresholdPrecisionPolicy:
         _validate_policy_inputs(block_scores, physical_block_ids)
         fp16_block_ids: list[int] = []
         int8_block_ids: list[int] = []
+        int4_block_ids: list[int] = []
         skipped_block_ids: list[int] = []
 
         for index, score in enumerate(block_scores.detach().cpu()):
@@ -145,14 +168,17 @@ class ThresholdPrecisionPolicy:
             score_value = float(score)
             if score_value >= self.high_threshold:
                 fp16_block_ids.append(block_id)
-            elif score_value >= self.low_threshold:
+            elif score_value >= self.mid_threshold:
                 int8_block_ids.append(block_id)
+            elif score_value >= self.low_threshold:
+                int4_block_ids.append(block_id)
             else:
                 skipped_block_ids.append(block_id)
 
         assignment = TierAssignment(
             fp16_block_ids=fp16_block_ids,
             int8_block_ids=int8_block_ids,
+            int4_block_ids=int4_block_ids,
             skipped_block_ids=skipped_block_ids,
         )
         _validate_assignment(assignment, physical_block_ids)

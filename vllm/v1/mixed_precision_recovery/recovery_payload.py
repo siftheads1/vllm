@@ -92,6 +92,13 @@ class EagerRecoveryPayloadProvider:
         layer_name: str,
     ) -> TieredRecoveryPayloads:
         """Return available payloads and tier-specific missing ids."""
+        if assignment.int4_block_ids:
+            raise ValueError(
+                "MPR INT4 tier assignment requires INT4 backup payload "
+                "support from a later M4.5 step, got int4_block_ids="
+                f"{assignment.int4_block_ids}."
+            )
+
         fp16_payloads: list[FP16RecoveryPayloadEntry] = []
         int8_payloads: list[INT8RecoveryPayloadEntry] = []
         missing_fp16_block_ids: list[int] = []

@@ -119,7 +119,9 @@ def test_mpr_config_defaults_to_quest_style_digest_and_kv_head_scores():
     assert config.precision_policy == "top_ratio"
     assert config.tier_fp16_ratio == 0.25
     assert config.tier_int8_ratio == 0.50
+    assert config.tier_int4_ratio == 0.0
     assert config.tier_high_threshold == 0.0
+    assert config.tier_mid_threshold == 0.0
     assert config.tier_low_threshold == 0.0
     assert config.backup_storage_mode == "eager_fp16_int8"
 
@@ -175,6 +177,7 @@ def test_mpr_config_parses_top_ratio_precision_tiering(monkeypatch):
     monkeypatch.setenv("VLLM_MPR_PRECISION_POLICY", "top_ratio")
     monkeypatch.setenv("VLLM_MPR_TIER_FP16_RATIO", "0.2")
     monkeypatch.setenv("VLLM_MPR_TIER_INT8_RATIO", "0.6")
+    monkeypatch.setenv("VLLM_MPR_TIER_INT4_RATIO", "0.1")
     monkeypatch.setenv("VLLM_MPR_BACKUP_STORAGE_MODE", "fp16_only")
 
     config = MPRConfig.from_env()
@@ -183,18 +186,21 @@ def test_mpr_config_parses_top_ratio_precision_tiering(monkeypatch):
     assert config.precision_policy == "top_ratio"
     assert config.tier_fp16_ratio == 0.2
     assert config.tier_int8_ratio == 0.6
+    assert config.tier_int4_ratio == 0.1
     assert config.backup_storage_mode == "fp16_only"
 
 
 def test_mpr_config_parses_threshold_precision_tiering(monkeypatch):
     monkeypatch.setenv("VLLM_MPR_PRECISION_POLICY", "threshold")
     monkeypatch.setenv("VLLM_MPR_TIER_HIGH_THRESHOLD", "7.5")
+    monkeypatch.setenv("VLLM_MPR_TIER_MID_THRESHOLD", "4.5")
     monkeypatch.setenv("VLLM_MPR_TIER_LOW_THRESHOLD", "2.25")
 
     config = MPRConfig.from_env()
 
     assert config.precision_policy == "threshold"
     assert config.tier_high_threshold == 7.5
+    assert config.tier_mid_threshold == 4.5
     assert config.tier_low_threshold == 2.25
 
 
@@ -228,9 +234,17 @@ def test_mpr_config_rejects_negative_tier_ratio(monkeypatch):
         MPRConfig.from_env()
 
 
+def test_mpr_config_rejects_invalid_int4_tier_ratio(monkeypatch):
+    monkeypatch.setenv("VLLM_MPR_TIER_INT4_RATIO", "1.1")
+
+    with pytest.raises(ValueError, match="tier_int4_ratio"):
+        MPRConfig.from_env()
+
+
 def test_mpr_config_rejects_tier_ratio_sum_above_one(monkeypatch):
     monkeypatch.setenv("VLLM_MPR_TIER_FP16_RATIO", "0.7")
-    monkeypatch.setenv("VLLM_MPR_TIER_INT8_RATIO", "0.4")
+    monkeypatch.setenv("VLLM_MPR_TIER_INT8_RATIO", "0.2")
+    monkeypatch.setenv("VLLM_MPR_TIER_INT4_RATIO", "0.2")
 
     with pytest.raises(ValueError, match="tier_fp16_ratio \\+ tier_int8_ratio"):
         MPRConfig.from_env()
@@ -238,9 +252,18 @@ def test_mpr_config_rejects_tier_ratio_sum_above_one(monkeypatch):
 
 def test_mpr_config_rejects_inverted_tier_thresholds(monkeypatch):
     monkeypatch.setenv("VLLM_MPR_TIER_HIGH_THRESHOLD", "1.0")
-    monkeypatch.setenv("VLLM_MPR_TIER_LOW_THRESHOLD", "2.0")
+    monkeypatch.setenv("VLLM_MPR_TIER_MID_THRESHOLD", "2.0")
 
     with pytest.raises(ValueError, match="tier_high_threshold"):
+        MPRConfig.from_env()
+
+
+def test_mpr_config_rejects_inverted_mid_low_tier_thresholds(monkeypatch):
+    monkeypatch.setenv("VLLM_MPR_TIER_HIGH_THRESHOLD", "3.0")
+    monkeypatch.setenv("VLLM_MPR_TIER_MID_THRESHOLD", "1.0")
+    monkeypatch.setenv("VLLM_MPR_TIER_LOW_THRESHOLD", "2.0")
+
+    with pytest.raises(ValueError, match="tier_mid_threshold"):
         MPRConfig.from_env()
 
 

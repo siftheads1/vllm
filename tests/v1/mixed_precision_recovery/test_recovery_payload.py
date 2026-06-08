@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from vllm.v1.mixed_precision_recovery.backup_codec import (
@@ -89,6 +90,22 @@ def test_eager_provider_reports_missing_payloads_by_tier():
     assert result.missing_fp16_block_ids == [4]
     assert result.missing_int8_block_ids == [1]
     assert result.skipped_block_ids == []
+
+
+def test_eager_provider_rejects_unsupported_int4_assignment():
+    assignment = TierAssignment(
+        fp16_block_ids=[],
+        int8_block_ids=[],
+        int4_block_ids=[7],
+        skipped_block_ids=[],
+    )
+
+    with pytest.raises(ValueError, match="INT4 backup payload"):
+        EagerRecoveryPayloadProvider().fetch(
+            assignment=assignment,
+            cpu_backup_store=SemanticCPUBackupStore(),
+            layer_name=LAYER_NAME,
+        )
 
 
 def test_eager_provider_does_not_fetch_skip_tier_payloads():
