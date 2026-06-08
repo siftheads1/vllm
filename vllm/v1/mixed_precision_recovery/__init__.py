@@ -46,6 +46,7 @@ from vllm.v1.mixed_precision_recovery.recovery_payload import (
     EagerRecoveryPayloadProvider,
     FP16RecoveryPayloadEntry,
     INT8RecoveryPayloadEntry,
+    INT4RecoveryPayloadEntry,
     RecoveryPayloadProvider,
     TieredRecoveryPayloads,
 )
@@ -101,6 +102,7 @@ __all__ = [
     "EagerRecoveryPayloadProvider",
     "FP16RecoveryPayloadEntry",
     "INT8RecoveryPayloadEntry",
+    "INT4RecoveryPayloadEntry",
     "RecoveryPayloadProvider",
     "TieredRecoveryPayloads",
     "BlockRecoveryManager",

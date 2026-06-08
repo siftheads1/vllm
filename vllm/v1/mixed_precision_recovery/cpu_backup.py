@@ -18,6 +18,9 @@ from vllm.v1.mixed_precision_recovery.backup_codec import (
     INT8_BACKUP_FORMAT,
     INT8BackupCodec,
     INT8BackupPayload,
+    INT4_BACKUP_FORMAT,
+    INT4BackupCodec,
+    INT4BackupPayload,
 )
 
 
@@ -48,6 +51,8 @@ class CPUBackupPutResult:
     fp16_payload_bytes: int
     int8_payload_bytes: int
     int8_scale_bytes: int
+    int4_payload_bytes: int
+    int4_scale_bytes: int
     total_actual_backup_bytes: int
     copy_wall_seconds: float
 
@@ -61,6 +66,8 @@ class CPUBackupReleaseResult:
     fp16_payload_bytes: int
     int8_payload_bytes: int
     int8_scale_bytes: int
+    int4_payload_bytes: int
+    int4_scale_bytes: int
     total_actual_backup_bytes: int
 
 
@@ -76,6 +83,8 @@ class CPUBackupStats:
     fp16_payload_bytes: int
     int8_payload_bytes: int
     int8_scale_bytes: int
+    int4_payload_bytes: int
+    int4_scale_bytes: int
     total_actual_backup_bytes: int
 
 
@@ -85,6 +94,7 @@ class _CPUBackupEntry:
 
     fp16_payload: FP16BackupPayload
     int8_payload: INT8BackupPayload | None = None
+    int4_payload: INT4BackupPayload | None = None
 
     @property
     def fp16_payload_bytes(self) -> int:
@@ -103,11 +113,25 @@ class _CPUBackupEntry:
         return _tensor_nbytes(self.int8_payload.scale)
 
     @property
+    def int4_payload_bytes(self) -> int:
+        if self.int4_payload is None:
+            return 0
+        return _tensor_nbytes(self.int4_payload.packed)
+
+    @property
+    def int4_scale_bytes(self) -> int:
+        if self.int4_payload is None:
+            return 0
+        return _tensor_nbytes(self.int4_payload.scale)
+
+    @property
     def total_actual_backup_bytes(self) -> int:
         return (
             self.fp16_payload_bytes
             + self.int8_payload_bytes
             + self.int8_scale_bytes
+            + self.int4_payload_bytes
+            + self.int4_scale_bytes
         )
 
 
@@ -134,7 +158,7 @@ class CPUBackupStore(Protocol):
         self,
         key: CPUBackupKey,
         backup_format: str,
-    ) -> FP16BackupPayload | INT8BackupPayload | None:
+    ) -> FP16BackupPayload | INT8BackupPayload | INT4BackupPayload | None:
         ...
 
     def release_blocks(
@@ -155,11 +179,14 @@ class SemanticCPUBackupStore:
         self._fp16_payload_bytes = 0
         self._int8_payload_bytes = 0
         self._int8_scale_bytes = 0
+        self._int4_payload_bytes = 0
+        self._int4_scale_bytes = 0
         self._put_count = 0
         self._release_count = 0
         self._total_copy_wall_seconds = 0.0
         self._fp16_codec = FP16BackupCodec()
         self._int8_codec = INT8BackupCodec()
+        self._int4_codec = INT4BackupCodec()
 
     def put(
         self,
@@ -186,12 +213,21 @@ class SemanticCPUBackupStore:
         fp16_payload = self._fp16_codec.encode(kv_block)
         int8_payload = (
             self._int8_codec.encode(fp16_payload.tensor)
-            if backup_storage_mode == "eager_fp16_int8"
+            if backup_storage_mode in {
+                "eager_fp16_int8",
+                "eager_fp16_int8_int4",
+            }
+            else None
+        )
+        int4_payload = (
+            self._int4_codec.encode(fp16_payload.tensor)
+            if backup_storage_mode == "eager_fp16_int8_int4"
             else None
         )
         entry = _CPUBackupEntry(
             fp16_payload=fp16_payload,
             int8_payload=int8_payload,
+            int4_payload=int4_payload,
         )
         elapsed = time.perf_counter() - start
 
@@ -211,6 +247,8 @@ class SemanticCPUBackupStore:
             fp16_payload_bytes=entry.fp16_payload_bytes,
             int8_payload_bytes=entry.int8_payload_bytes,
             int8_scale_bytes=entry.int8_scale_bytes,
+            int4_payload_bytes=entry.int4_payload_bytes,
+            int4_scale_bytes=entry.int4_scale_bytes,
             total_actual_backup_bytes=entry.total_actual_backup_bytes,
             copy_wall_seconds=elapsed,
         )
@@ -226,11 +264,15 @@ class SemanticCPUBackupStore:
         self,
         key: CPUBackupKey,
         backup_format: str,
-    ) -> FP16BackupPayload | INT8BackupPayload | None:
+    ) -> FP16BackupPayload | INT8BackupPayload | INT4BackupPayload | None:
         """Return a precision-specific logical payload by key, if present."""
-        if backup_format not in {FP16_BACKUP_FORMAT, INT8_BACKUP_FORMAT}:
+        if backup_format not in {
+            FP16_BACKUP_FORMAT,
+            INT8_BACKUP_FORMAT,
+            INT4_BACKUP_FORMAT,
+        }:
             raise ValueError(
-                "backup_format must be 'fp16' or 'int8', got "
+                "backup_format must be 'fp16', 'int8', or 'int4', got "
                 f"{backup_format!r}."
             )
         entry = self._entries.get(key)
@@ -238,7 +280,9 @@ class SemanticCPUBackupStore:
             return None
         if backup_format == FP16_BACKUP_FORMAT:
             return entry.fp16_payload
-        return entry.int8_payload
+        if backup_format == INT8_BACKUP_FORMAT:
+            return entry.int8_payload
+        return entry.int4_payload
 
     def release_blocks(
         self,
@@ -252,12 +296,16 @@ class SemanticCPUBackupStore:
                 fp16_payload_bytes=0,
                 int8_payload_bytes=0,
                 int8_scale_bytes=0,
+                int4_payload_bytes=0,
+                int4_scale_bytes=0,
                 total_actual_backup_bytes=0,
             )
         released_entries = 0
         released_fp16_payload_bytes = 0
         released_int8_payload_bytes = 0
         released_int8_scale_bytes = 0
+        released_int4_payload_bytes = 0
+        released_int4_scale_bytes = 0
         for key in list(self._entries):
             if key.physical_block_id not in physical_block_ids:
                 continue
@@ -267,6 +315,8 @@ class SemanticCPUBackupStore:
             released_fp16_payload_bytes += entry.fp16_payload_bytes
             released_int8_payload_bytes += entry.int8_payload_bytes
             released_int8_scale_bytes += entry.int8_scale_bytes
+            released_int4_payload_bytes += entry.int4_payload_bytes
+            released_int4_scale_bytes += entry.int4_scale_bytes
             # This prototype store releases ownership by dropping Python
             # references and letting the PyTorch CPU allocator reuse/free the
             # storage. If allocation/free overhead or host-memory reuse becomes
@@ -279,6 +329,8 @@ class SemanticCPUBackupStore:
             released_fp16_payload_bytes
             + released_int8_payload_bytes
             + released_int8_scale_bytes
+            + released_int4_payload_bytes
+            + released_int4_scale_bytes
         )
         return CPUBackupReleaseResult(
             released_entries=released_entries,
@@ -286,6 +338,8 @@ class SemanticCPUBackupStore:
             fp16_payload_bytes=released_fp16_payload_bytes,
             int8_payload_bytes=released_int8_payload_bytes,
             int8_scale_bytes=released_int8_scale_bytes,
+            int4_payload_bytes=released_int4_payload_bytes,
+            int4_scale_bytes=released_int4_scale_bytes,
             total_actual_backup_bytes=released_actual_bytes,
         )
 
@@ -301,6 +355,8 @@ class SemanticCPUBackupStore:
             fp16_payload_bytes=self._fp16_payload_bytes,
             int8_payload_bytes=self._int8_payload_bytes,
             int8_scale_bytes=self._int8_scale_bytes,
+            int4_payload_bytes=self._int4_payload_bytes,
+            int4_scale_bytes=self._int4_scale_bytes,
             total_actual_backup_bytes=total_actual_bytes,
         )
 
@@ -308,17 +364,23 @@ class SemanticCPUBackupStore:
         self._fp16_payload_bytes += entry.fp16_payload_bytes
         self._int8_payload_bytes += entry.int8_payload_bytes
         self._int8_scale_bytes += entry.int8_scale_bytes
+        self._int4_payload_bytes += entry.int4_payload_bytes
+        self._int4_scale_bytes += entry.int4_scale_bytes
 
     def _subtract_entry_bytes(self, entry: _CPUBackupEntry) -> None:
         self._fp16_payload_bytes -= entry.fp16_payload_bytes
         self._int8_payload_bytes -= entry.int8_payload_bytes
         self._int8_scale_bytes -= entry.int8_scale_bytes
+        self._int4_payload_bytes -= entry.int4_payload_bytes
+        self._int4_scale_bytes -= entry.int4_scale_bytes
 
     def _total_actual_backup_bytes(self) -> int:
         return (
             self._fp16_payload_bytes
             + self._int8_payload_bytes
             + self._int8_scale_bytes
+            + self._int4_payload_bytes
+            + self._int4_scale_bytes
         )
 
 
@@ -327,8 +389,13 @@ def _tensor_nbytes(tensor: torch.Tensor) -> int:
 
 
 def _validate_backup_storage_mode(backup_storage_mode: str) -> None:
-    if backup_storage_mode not in {"fp16_only", "eager_fp16_int8"}:
+    if backup_storage_mode not in {
+        "fp16_only",
+        "eager_fp16_int8",
+        "eager_fp16_int8_int4",
+    }:
         raise ValueError(
-            "backup_storage_mode must be 'fp16_only' or 'eager_fp16_int8', "
+            "backup_storage_mode must be 'fp16_only', 'eager_fp16_int8', "
+            "or 'eager_fp16_int8_int4', "
             f"got {backup_storage_mode!r}."
         )

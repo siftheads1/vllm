@@ -254,9 +254,11 @@ def test_block_recovery_materializes_tiered_fp16_and_int8_payloads():
                     payload=int8_payload,
                 )
             ],
+            int4_payloads=[],
             skipped_block_ids=[3],
             missing_fp16_block_ids=[],
             missing_int8_block_ids=[],
+            missing_int4_block_ids=[],
         ),
         kv_cache=kv_cache,
     )
@@ -290,9 +292,11 @@ def test_block_recovery_tiered_reports_missing_payloads():
         tiered_payloads=TieredRecoveryPayloads(
             fp16_payloads=[],
             int8_payloads=[],
+            int4_payloads=[],
             skipped_block_ids=[],
             missing_fp16_block_ids=[1],
             missing_int8_block_ids=[2],
+            missing_int4_block_ids=[],
         ),
         kv_cache=kv_cache,
     )
@@ -323,9 +327,11 @@ def test_block_recovery_tiered_rejects_shape_mismatched_payload_target():
                     )
                 ],
                 int8_payloads=[],
+                int4_payloads=[],
                 skipped_block_ids=[],
                 missing_fp16_block_ids=[],
                 missing_int8_block_ids=[],
+                missing_int4_block_ids=[],
             ),
             kv_cache=kv_cache,
         )
@@ -348,9 +354,11 @@ def test_block_recovery_tiered_rejects_out_of_range_payload_target():
                         payload=out_of_range_payload,
                     )
                 ],
+                int4_payloads=[],
                 skipped_block_ids=[],
                 missing_fp16_block_ids=[],
                 missing_int8_block_ids=[],
+                missing_int4_block_ids=[],
             ),
             kv_cache=kv_cache,
         )

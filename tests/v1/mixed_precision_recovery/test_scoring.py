@@ -11,6 +11,8 @@ from vllm.v1.mixed_precision_recovery.backup_codec import (
     FP16_BACKUP_FORMAT,
     INT8_BACKUP_FORMAT,
     INT8BackupCodec,
+    INT4_BACKUP_FORMAT,
+    INT4BackupCodec,
 )
 from vllm.v1.mixed_precision_recovery.config import MPRConfig
 from vllm.v1.mixed_precision_recovery.cpu_backup import (
@@ -190,6 +192,14 @@ def test_mpr_config_parses_top_ratio_precision_tiering(monkeypatch):
     assert config.backup_storage_mode == "fp16_only"
 
 
+def test_mpr_config_accepts_eager_int4_backup_storage_mode(monkeypatch):
+    monkeypatch.setenv("VLLM_MPR_BACKUP_STORAGE_MODE", "eager_fp16_int8_int4")
+
+    config = MPRConfig.from_env()
+
+    assert config.backup_storage_mode == "eager_fp16_int8_int4"
+
+
 def test_mpr_config_parses_threshold_precision_tiering(monkeypatch):
     monkeypatch.setenv("VLLM_MPR_PRECISION_POLICY", "threshold")
     monkeypatch.setenv("VLLM_MPR_TIER_HIGH_THRESHOLD", "7.5")
@@ -218,12 +228,18 @@ def test_mpr_config_rejects_invalid_backup_storage_mode(monkeypatch):
         MPRConfig.from_env()
 
 
-def test_mpr_config_rejects_eager_int8_backup_without_precision_tiering():
+@pytest.mark.parametrize(
+    "backup_storage_mode",
+    ["eager_fp16_int8", "eager_fp16_int8_int4"],
+)
+def test_mpr_config_rejects_eager_low_precision_backup_without_tiering(
+    backup_storage_mode: str,
+):
     with pytest.raises(ValueError, match="precision_tiering_enabled=True"):
         MPRConfig(
             cpu_backup_enabled=True,
             precision_tiering_enabled=False,
-            backup_storage_mode="eager_fp16_int8",
+            backup_storage_mode=backup_storage_mode,
         )
 
 
@@ -379,6 +395,109 @@ def test_semantic_cpu_backup_store_eagerly_stores_fp16_and_int8_payloads():
     assert store.get_payload(key, INT8_BACKUP_FORMAT) is None
     assert store.stats().block_count == 0
     assert store.stats().total_actual_backup_bytes == 0
+
+
+def test_semantic_cpu_backup_store_eagerly_stores_int4_payloads():
+    store = SemanticCPUBackupStore()
+    kv_block = torch.arange(16, dtype=torch.float32).reshape(2, 4, 1, 2)
+
+    result = store.put(
+        layer_name="model.layers.0.self_attn.attn",
+        physical_block_id=7,
+        kv_block=kv_block,
+        backup_storage_mode="eager_fp16_int8_int4",
+    )
+
+    key = CPUBackupKey(
+        layer_name="model.layers.0.self_attn.attn",
+        physical_block_id=7,
+    )
+    fp16_payload = store.get_payload(key, FP16_BACKUP_FORMAT)
+    int8_payload = store.get_payload(key, INT8_BACKUP_FORMAT)
+    int4_payload = store.get_payload(key, INT4_BACKUP_FORMAT)
+    assert fp16_payload is not None
+    assert int8_payload is not None
+    assert int4_payload is not None
+    assert int4_payload.packed.dtype == torch.uint8
+    assert int4_payload.scale.dtype == torch.float32
+
+    materialized_int4 = INT4BackupCodec().materialize(
+        int4_payload,
+        target_dtype=torch.float32,
+        target_device="cpu",
+    )
+    int4_error = (materialized_int4 - fp16_payload.tensor.float()).abs()
+    int4_bound = int4_payload.scale.unsqueeze(-1) / 2
+    assert bool(torch.all(int4_error <= int4_bound + 1e-6))
+
+    fp16_bytes = fp16_payload.payload_nbytes
+    int8_bytes = (
+        int8_payload.quantized.numel()
+        * int8_payload.quantized.element_size()
+    )
+    int8_scale_bytes = (
+        int8_payload.scale.numel() * int8_payload.scale.element_size()
+    )
+    int4_bytes = (
+        int4_payload.packed.numel() * int4_payload.packed.element_size()
+    )
+    int4_scale_bytes = (
+        int4_payload.scale.numel() * int4_payload.scale.element_size()
+    )
+    total_bytes = (
+        fp16_bytes
+        + int8_bytes
+        + int8_scale_bytes
+        + int4_bytes
+        + int4_scale_bytes
+    )
+    assert result.num_bytes == fp16_bytes
+    assert result.int4_payload_bytes == int4_bytes
+    assert result.int4_scale_bytes == int4_scale_bytes
+    assert result.total_actual_backup_bytes == total_bytes
+
+    stats = store.stats()
+    assert stats.int4_payload_bytes == int4_bytes
+    assert stats.int4_scale_bytes == int4_scale_bytes
+    assert stats.total_actual_backup_bytes == total_bytes
+
+    release = store.release_blocks({7})
+    assert release.int4_payload_bytes == int4_bytes
+    assert release.int4_scale_bytes == int4_scale_bytes
+    assert release.total_actual_backup_bytes == total_bytes
+    assert store.get_payload(key, INT4_BACKUP_FORMAT) is None
+    assert store.stats().total_actual_backup_bytes == 0
+
+
+def test_semantic_cpu_backup_store_only_creates_int4_for_int4_storage_mode():
+    store = SemanticCPUBackupStore()
+    kv_block = torch.arange(16, dtype=torch.float32).reshape(2, 4, 1, 2)
+
+    store.put(
+        layer_name="model.layers.0.self_attn.attn",
+        physical_block_id=1,
+        kv_block=kv_block,
+        backup_storage_mode="fp16_only",
+    )
+    store.put(
+        layer_name="model.layers.0.self_attn.attn",
+        physical_block_id=2,
+        kv_block=kv_block,
+        backup_storage_mode="eager_fp16_int8",
+    )
+
+    fp16_key = CPUBackupKey(
+        layer_name="model.layers.0.self_attn.attn",
+        physical_block_id=1,
+    )
+    int8_key = CPUBackupKey(
+        layer_name="model.layers.0.self_attn.attn",
+        physical_block_id=2,
+    )
+    assert store.get_payload(fp16_key, INT8_BACKUP_FORMAT) is None
+    assert store.get_payload(fp16_key, INT4_BACKUP_FORMAT) is None
+    assert store.get_payload(int8_key, INT8_BACKUP_FORMAT) is not None
+    assert store.get_payload(int8_key, INT4_BACKUP_FORMAT) is None
 
 
 def test_sidecar_creates_cpu_backup_when_full_block_digest_is_created():

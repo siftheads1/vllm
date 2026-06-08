@@ -45,11 +45,14 @@ class RecoveryResult:
     copy_wall_seconds: float
     recovered_fp16_block_ids: list[int] = field(default_factory=list)
     recovered_int8_block_ids: list[int] = field(default_factory=list)
+    recovered_int4_block_ids: list[int] = field(default_factory=list)
     missing_fp16_block_ids: list[int] = field(default_factory=list)
     missing_int8_block_ids: list[int] = field(default_factory=list)
+    missing_int4_block_ids: list[int] = field(default_factory=list)
     tier_skipped_block_ids: list[int] = field(default_factory=list)
     fp16_payload_bytes: int = 0
     int8_payload_bytes: int = 0
+    int4_payload_bytes: int = 0
     effective_recovery_transfer_bytes: int = 0
 
 
@@ -206,6 +209,11 @@ class BlockRecoveryManager:
 
         recovered_fp16_block_ids: list[int] = []
         recovered_int8_block_ids: list[int] = []
+        if tiered_payloads.int4_payloads:
+            raise ValueError(
+                "MPR tiered int4 recovery materialization requires "
+                "Step 4.5.4 support."
+            )
         skipped_block_ids = [
             int(block_id) for block_id in tiered_payloads.skipped_block_ids
         ]
@@ -246,6 +254,9 @@ class BlockRecoveryManager:
         missing_int8_block_ids = [
             int(block_id) for block_id in tiered_payloads.missing_int8_block_ids
         ]
+        missing_int4_block_ids = [
+            int(block_id) for block_id in tiered_payloads.missing_int4_block_ids
+        ]
         # Missing payload ids are provider/store availability results, not
         # target materialization failures. For the current eager provider,
         # missing int8 usually means the store was not populated with int8
@@ -258,12 +269,15 @@ class BlockRecoveryManager:
         missing_backup_block_ids = [
             *missing_fp16_block_ids,
             *missing_int8_block_ids,
+            *missing_int4_block_ids,
         ]
         selected_block_ids = [
             *tiered_payloads.fp16_block_ids,
             *tiered_payloads.int8_block_ids,
+            *tiered_payloads.int4_block_ids,
             *missing_fp16_block_ids,
             *missing_int8_block_ids,
+            *missing_int4_block_ids,
             *tiered_payloads.skipped_block_ids,
         ]
 
@@ -278,6 +292,7 @@ class BlockRecoveryManager:
             recovered_int8_block_ids=recovered_int8_block_ids,
             missing_fp16_block_ids=missing_fp16_block_ids,
             missing_int8_block_ids=missing_int8_block_ids,
+            missing_int4_block_ids=missing_int4_block_ids,
             tier_skipped_block_ids=[
                 int(block_id) for block_id in tiered_payloads.skipped_block_ids
             ],

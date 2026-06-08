@@ -102,18 +102,23 @@ class MPRConfig:
                 "precision_policy must be 'top_ratio' or 'threshold', got "
                 f"{self.precision_policy!r}."
             )
-        if self.backup_storage_mode not in {"eager_fp16_int8", "fp16_only"}:
+        if self.backup_storage_mode not in {
+            "eager_fp16_int8",
+            "eager_fp16_int8_int4",
+            "fp16_only",
+        }:
             raise ValueError(
-                "backup_storage_mode must be 'eager_fp16_int8' or "
-                f"'fp16_only', got {self.backup_storage_mode!r}."
+                "backup_storage_mode must be 'eager_fp16_int8', "
+                "'eager_fp16_int8_int4', or 'fp16_only', got "
+                f"{self.backup_storage_mode!r}."
             )
         if (
             self.cpu_backup_enabled
             and not self.precision_tiering_enabled
-            and self.backup_storage_mode == "eager_fp16_int8"
+            and self.backup_storage_mode != "fp16_only"
         ):
             raise ValueError(
-                "backup_storage_mode='eager_fp16_int8' requires "
+                f"backup_storage_mode={self.backup_storage_mode!r} requires "
                 "precision_tiering_enabled=True when cpu_backup_enabled=True; "
                 "use backup_storage_mode='fp16_only' for M3 fp16 recovery."
             )
@@ -231,6 +236,6 @@ class MPRConfig:
             backup_storage_mode=_parse_choice(
                 "VLLM_MPR_BACKUP_STORAGE_MODE",
                 "eager_fp16_int8",
-                {"eager_fp16_int8", "fp16_only"},
+                {"eager_fp16_int8", "eager_fp16_int8_int4", "fp16_only"},
             ),
         )

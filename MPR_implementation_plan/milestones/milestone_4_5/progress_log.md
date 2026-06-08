@@ -104,3 +104,86 @@ CPUBackupStore integration remains Step 4.5.3
 runtime recovery integration remains later M4.5 steps
 user completed Step 4.5.2 focused tests
 ```
+
+## 2026-06-08: Step 4.5.3 CPU Backup Store and Payload Provider Integration
+
+Completed the INT4 CPU backup store and eager recovery payload provider
+integration step.
+
+Confirmed decisions:
+
+```text
+INT4 backup storage is eager for M4.5
+add backup_storage_mode=eager_fp16_int8_int4
+keep eager_fp16_int8 as the default storage mode
+top_ratio remains the main M4.5 runtime smoke policy
+threshold INT4 has config/policy surfaces but dedicated threshold tuning and
+  threshold-specific smoke tests are deferred
+runtime INT4 materialization remains Step 4.5.4/4.5.5
+```
+
+Implemented:
+
+```text
+MPRConfig accepts VLLM_MPR_BACKUP_STORAGE_MODE=eager_fp16_int8_int4
+eager low-precision backup modes require precision_tiering_enabled=True when
+  cpu_backup_enabled=True
+SemanticCPUBackupStore can create fp16 + int8 + int4 payloads when
+  backup_storage_mode=eager_fp16_int8_int4
+CPU backup put/release/stats split INT4 packed payload bytes and INT4 scale
+  bytes
+CPUBackupStore.get_payload(..., "int4") returns INT4BackupPayload when present
+EagerRecoveryPayloadProvider fetches int4 tier payloads and reports
+  missing_int4_block_ids independently from fp16/int8 missing payloads
+TieredRecoveryPayloads carries int4 payload entries and byte accounting
+BlockRecoveryManager still rejects non-empty int4 materialization payloads until
+  Step 4.5.4
+```
+
+Validation run locally:
+
+```text
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m py_compile \
+  vllm/v1/mixed_precision_recovery/config.py \
+  vllm/v1/mixed_precision_recovery/cpu_backup.py \
+  vllm/v1/mixed_precision_recovery/recovery_payload.py \
+  vllm/v1/mixed_precision_recovery/recovery.py \
+  vllm/v1/mixed_precision_recovery/__init__.py
+
+result:
+  passed
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_scoring.py \
+  tests/v1/mixed_precision_recovery/test_backup_codec.py \
+  tests/v1/mixed_precision_recovery/test_recovery_payload.py -q
+
+result:
+  67 passed, 2 skipped
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_recovery.py -q
+
+result:
+  28 passed
+
+git diff --check
+
+result:
+  passed
+```
+
+Environment note:
+
+```text
+python -m pytest from the base Python 3.12 environment is blocked before MPR
+tests run by an existing NumPy 2.3.5 / SciPy-sklearn binary compatibility
+ImportError while loading tests/conftest.py. The focused tests above were run in
+the existing vLLM 20260528 conda environment used by prior MPR validation.
+```
+
+Next step:
+
+```text
+Step 4.5.4 Recovery Materialization and Debug Events
+```

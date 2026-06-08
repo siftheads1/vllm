@@ -13,6 +13,8 @@ from vllm.v1.mixed_precision_recovery.backup_codec import (
     FP16BackupPayload,
     INT8_BACKUP_FORMAT,
     INT8BackupPayload,
+    INT4_BACKUP_FORMAT,
+    INT4BackupPayload,
 )
 from vllm.v1.mixed_precision_recovery.cpu_backup import (
     CPUBackupKey,
@@ -38,14 +40,24 @@ class INT8RecoveryPayloadEntry:
 
 
 @dataclass(frozen=True)
+class INT4RecoveryPayloadEntry:
+    """One int4 recovery payload bound to a physical KV block id."""
+
+    physical_block_id: int
+    payload: INT4BackupPayload
+
+
+@dataclass(frozen=True)
 class TieredRecoveryPayloads:
     """Payload fetch result for one precision-tier assignment."""
 
     fp16_payloads: list[FP16RecoveryPayloadEntry]
     int8_payloads: list[INT8RecoveryPayloadEntry]
+    int4_payloads: list[INT4RecoveryPayloadEntry]
     skipped_block_ids: list[int]
     missing_fp16_block_ids: list[int]
     missing_int8_block_ids: list[int]
+    missing_int4_block_ids: list[int]
 
     @property
     def fp16_block_ids(self) -> list[int]:
@@ -58,6 +70,11 @@ class TieredRecoveryPayloads:
         return [entry.physical_block_id for entry in self.int8_payloads]
 
     @property
+    def int4_block_ids(self) -> list[int]:
+        """Return block ids with available int4 payloads."""
+        return [entry.physical_block_id for entry in self.int4_payloads]
+
+    @property
     def fp16_payload_bytes(self) -> int:
         """Return total logical fp16 payload bytes fetched."""
         return sum(entry.payload.payload_nbytes for entry in self.fp16_payloads)
@@ -66,6 +83,11 @@ class TieredRecoveryPayloads:
     def int8_payload_bytes(self) -> int:
         """Return total logical int8 quantized-plus-scale bytes fetched."""
         return sum(entry.payload.payload_nbytes for entry in self.int8_payloads)
+
+    @property
+    def int4_payload_bytes(self) -> int:
+        """Return total logical int4 packed-plus-scale bytes fetched."""
+        return sum(entry.payload.payload_nbytes for entry in self.int4_payloads)
 
 
 class RecoveryPayloadProvider(Protocol):
@@ -82,7 +104,7 @@ class RecoveryPayloadProvider(Protocol):
 
 
 class EagerRecoveryPayloadProvider:
-    """Fetch already-materialized fp16/int8 payloads from CPU backup storage."""
+    """Fetch already-materialized fp16/int8/int4 payloads from CPU backup."""
 
     def fetch(
         self,
@@ -92,17 +114,12 @@ class EagerRecoveryPayloadProvider:
         layer_name: str,
     ) -> TieredRecoveryPayloads:
         """Return available payloads and tier-specific missing ids."""
-        if assignment.int4_block_ids:
-            raise ValueError(
-                "MPR INT4 tier assignment requires INT4 backup payload "
-                "support from a later M4.5 step, got int4_block_ids="
-                f"{assignment.int4_block_ids}."
-            )
-
         fp16_payloads: list[FP16RecoveryPayloadEntry] = []
         int8_payloads: list[INT8RecoveryPayloadEntry] = []
+        int4_payloads: list[INT4RecoveryPayloadEntry] = []
         missing_fp16_block_ids: list[int] = []
         missing_int8_block_ids: list[int] = []
+        missing_int4_block_ids: list[int] = []
 
         for block_id in assignment.fp16_block_ids:
             block_id = int(block_id)
@@ -148,12 +165,36 @@ class EagerRecoveryPayloadProvider:
                 )
             )
 
+        for block_id in assignment.int4_block_ids:
+            block_id = int(block_id)
+            key = CPUBackupKey(
+                layer_name=layer_name,
+                physical_block_id=block_id,
+            )
+            payload = cpu_backup_store.get_payload(key, INT4_BACKUP_FORMAT)
+            if payload is None:
+                missing_int4_block_ids.append(block_id)
+                continue
+            if not isinstance(payload, INT4BackupPayload):
+                raise TypeError(
+                    "MPR expected an int4 backup payload for block "
+                    f"{block_id}, got {type(payload).__name__}."
+                )
+            int4_payloads.append(
+                INT4RecoveryPayloadEntry(
+                    physical_block_id=block_id,
+                    payload=payload,
+                )
+            )
+
         return TieredRecoveryPayloads(
             fp16_payloads=fp16_payloads,
             int8_payloads=int8_payloads,
+            int4_payloads=int4_payloads,
             skipped_block_ids=[
                 int(block_id) for block_id in assignment.skipped_block_ids
             ],
             missing_fp16_block_ids=missing_fp16_block_ids,
             missing_int8_block_ids=missing_int8_block_ids,
+            missing_int4_block_ids=missing_int4_block_ids,
         )
