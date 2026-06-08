@@ -187,3 +187,71 @@ Next step:
 ```text
 Step 4.5.4 Recovery Materialization and Debug Events
 ```
+
+## 2026-06-08: Step 4.5.4 Recovery Materialization and Debug Events
+
+Implemented INT4 tier materialization in the tiered recovery path.
+
+Implemented:
+
+```text
+BlockRecoveryManager now owns INT4BackupCodec
+materialize_tiered_payloads handles fp16 + int8 + int4 payloads
+INT4 payloads unpack/dequantize/materialize into the normal target KV cache
+  dtype/device before copy_
+RecoveryResult reports recovered_int4_block_ids, missing_int4_block_ids,
+  int4_payload_bytes, and int4_scale_bytes
+effective_recovery_transfer_bytes includes INT4 packed bytes plus scale bytes
+recovered_block_ids metadata is concatenated in tier order:
+  fp16 -> int8 -> int4
+sidecar no longer rejects INT4 tier assignment as unsupported
+eager tiered sidecar recovery now treats missing INT4 payloads as fail-fast
+  missing tier payload errors
+recovery_materialized debug events report INT4 recovered/missing/byte fields
+debug JSONL validation accepts and validates optional INT4 tier fields
+```
+
+Tests updated:
+
+```text
+recovery manager unit coverage now includes fp16/int8/int4 materialization
+INT4 recovered data is checked against the scale / 2 quantization bound
+INT4 missing-payload, shape-mismatch, and out-of-range cases are covered
+sidecar INT4 runtime recovery replaces the old unsupported-assignment test
+sidecar missing INT4 payload fail-fast behavior is covered
+tiered recovery debug JSONL fixture now includes INT4 fields
+```
+
+Validation attempted in the current Windows environment:
+
+```text
+python -m py_compile \
+  vllm/v1/mixed_precision_recovery/recovery.py \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  scripts/mpr_validate_debug_jsonl.py
+
+result:
+  passed
+
+python -m py_compile \
+  tests/v1/mixed_precision_recovery/test_backup_codec.py \
+  tests/v1/mixed_precision_recovery/test_recovery_payload.py \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py
+
+result:
+  passed
+```
+
+Validation not completed in this environment:
+
+```text
+python -m pytest ... failed before running tests because pytest is not
+installed in the available Windows Python.
+
+direct import smoke failed because torch is not installed in the available
+Windows Python.
+
+Focused pytest validation remains pending in the existing torch/vLLM runtime
+environment used by prior MPR validation.
+```

@@ -282,6 +282,12 @@ class RecoverySidecar:
             released_cpu_backup_int8_scale_bytes=(
                 release_result.int8_scale_bytes
             ),
+            released_cpu_backup_int4_payload_bytes=(
+                release_result.int4_payload_bytes
+            ),
+            released_cpu_backup_int4_scale_bytes=(
+                release_result.int4_scale_bytes
+            ),
             released_cpu_backup_total_actual_bytes=(
                 release_result.total_actual_backup_bytes
             ),
@@ -290,6 +296,8 @@ class RecoverySidecar:
             cpu_backup_fp16_payload_bytes=backup_stats.fp16_payload_bytes,
             cpu_backup_int8_payload_bytes=backup_stats.int8_payload_bytes,
             cpu_backup_int8_scale_bytes=backup_stats.int8_scale_bytes,
+            cpu_backup_int4_payload_bytes=backup_stats.int4_payload_bytes,
+            cpu_backup_int4_scale_bytes=backup_stats.int4_scale_bytes,
             cpu_backup_total_actual_bytes=(
                 backup_stats.total_actual_backup_bytes
             ),
@@ -590,7 +598,6 @@ class RecoverySidecar:
                 )
         if self.config.precision_tiering_enabled:
             assert tier_assignment is not None
-            self._raise_on_unsupported_int4_assignment(tier_assignment)
             tiered_payloads = self._recovery_payload_provider.fetch(
                 assignment=tier_assignment,
                 cpu_backup_store=self._cpu_backup_store,
@@ -658,6 +665,8 @@ class RecoverySidecar:
                 cpu_backup_fp16_payload_bytes=backup_stats.fp16_payload_bytes,
                 cpu_backup_int8_payload_bytes=backup_stats.int8_payload_bytes,
                 cpu_backup_int8_scale_bytes=backup_stats.int8_scale_bytes,
+                cpu_backup_int4_payload_bytes=backup_stats.int4_payload_bytes,
+                cpu_backup_int4_scale_bytes=backup_stats.int4_scale_bytes,
                 cpu_backup_total_actual_bytes=(
                     backup_stats.total_actual_backup_bytes
                 ),
@@ -694,19 +703,6 @@ class RecoverySidecar:
             physical_block_ids=score_context.physical_block_ids,
         )
 
-    def _raise_on_unsupported_int4_assignment(
-        self,
-        tier_assignment: TierAssignment,
-    ) -> None:
-        """Reject INT4 runtime recovery until the INT4 payload path exists."""
-        if not tier_assignment.int4_block_ids:
-            return
-        raise ValueError(
-            "MPR INT4 tier assignment requires INT4 backup payload and "
-            "materialization support from a later M4.5 step, got "
-            f"int4_block_ids={tier_assignment.int4_block_ids}."
-        )
-
     def _raise_on_missing_tier_payloads(
         self,
         tiered_payloads: TieredRecoveryPayloads,
@@ -715,13 +711,15 @@ class RecoverySidecar:
         if (
             not tiered_payloads.missing_fp16_block_ids
             and not tiered_payloads.missing_int8_block_ids
+            and not tiered_payloads.missing_int4_block_ids
         ):
             return
         raise ValueError(
             "MPR tiered recovery expected all selected tier payloads to "
             "exist for the eager provider, got "
             f"missing_fp16_block_ids={tiered_payloads.missing_fp16_block_ids}, "
-            f"missing_int8_block_ids={tiered_payloads.missing_int8_block_ids}."
+            f"missing_int8_block_ids={tiered_payloads.missing_int8_block_ids}, "
+            f"missing_int4_block_ids={tiered_payloads.missing_int4_block_ids}."
         )
 
     def _tiered_recovery_debug_fields(
@@ -746,10 +744,16 @@ class RecoverySidecar:
             "recovered_int8_block_ids": (
                 recovery_result.recovered_int8_block_ids
             ),
+            "recovered_int4_block_ids": (
+                recovery_result.recovered_int4_block_ids
+            ),
             "missing_fp16_block_ids": recovery_result.missing_fp16_block_ids,
             "missing_int8_block_ids": recovery_result.missing_int8_block_ids,
+            "missing_int4_block_ids": recovery_result.missing_int4_block_ids,
             "fp16_payload_bytes": recovery_result.fp16_payload_bytes,
             "int8_payload_bytes": recovery_result.int8_payload_bytes,
+            "int4_payload_bytes": recovery_result.int4_payload_bytes,
+            "int4_scale_bytes": recovery_result.int4_scale_bytes,
             "effective_recovery_transfer_bytes": (
                 recovery_result.effective_recovery_transfer_bytes
             ),
@@ -1581,6 +1585,8 @@ class RecoverySidecar:
                 cpu_backup_fp16_payload_bytes=result.fp16_payload_bytes,
                 cpu_backup_int8_payload_bytes=result.int8_payload_bytes,
                 cpu_backup_int8_scale_bytes=result.int8_scale_bytes,
+                cpu_backup_int4_payload_bytes=result.int4_payload_bytes,
+                cpu_backup_int4_scale_bytes=result.int4_scale_bytes,
                 cpu_backup_total_actual_bytes=(
                     result.total_actual_backup_bytes
                 ),
@@ -1594,6 +1600,10 @@ class RecoverySidecar:
                     stats.int8_payload_bytes
                 ),
                 cpu_backup_total_int8_scale_bytes=stats.int8_scale_bytes,
+                cpu_backup_total_int4_payload_bytes=(
+                    stats.int4_payload_bytes
+                ),
+                cpu_backup_total_int4_scale_bytes=stats.int4_scale_bytes,
                 cpu_backup_store_total_actual_bytes=(
                     stats.total_actual_backup_bytes
                 ),

@@ -14,6 +14,7 @@ import torch
 from vllm.v1.mixed_precision_recovery.backup_codec import (
     FP16BackupCodec,
     INT8BackupCodec,
+    INT4BackupCodec,
 )
 from vllm.v1.mixed_precision_recovery.cpu_backup import (
     CPUBackupKey,
@@ -22,6 +23,7 @@ from vllm.v1.mixed_precision_recovery.cpu_backup import (
 from vllm.v1.mixed_precision_recovery.recovery_payload import (
     FP16RecoveryPayloadEntry,
     INT8RecoveryPayloadEntry,
+    INT4RecoveryPayloadEntry,
     TieredRecoveryPayloads,
 )
 from vllm.v1.mixed_precision_recovery.scoring import DigestScoreResult
@@ -53,6 +55,7 @@ class RecoveryResult:
     fp16_payload_bytes: int = 0
     int8_payload_bytes: int = 0
     int4_payload_bytes: int = 0
+    int4_scale_bytes: int = 0
     effective_recovery_transfer_bytes: int = 0
 
 
@@ -107,6 +110,7 @@ class BlockRecoveryManager:
     def __init__(self) -> None:
         self._fp16_codec = FP16BackupCodec()
         self._int8_codec = INT8BackupCodec()
+        self._int4_codec = INT4BackupCodec()
 
     def recover(
         self,
@@ -209,17 +213,15 @@ class BlockRecoveryManager:
 
         recovered_fp16_block_ids: list[int] = []
         recovered_int8_block_ids: list[int] = []
-        if tiered_payloads.int4_payloads:
-            raise ValueError(
-                "MPR tiered int4 recovery materialization requires "
-                "Step 4.5.4 support."
-            )
+        recovered_int4_block_ids: list[int] = []
         skipped_block_ids = [
             int(block_id) for block_id in tiered_payloads.skipped_block_ids
         ]
         recovered_bytes = 0
         fp16_payload_bytes = 0
         int8_payload_bytes = 0
+        int4_payload_bytes = 0
+        int4_scale_bytes = 0
         effective_recovery_transfer_bytes = 0
         copy_wall_seconds = 0.0
         num_blocks = int(kv_cache.shape[1])
@@ -248,6 +250,24 @@ class BlockRecoveryManager:
             effective_recovery_transfer_bytes += payload_bytes
             copy_wall_seconds += elapsed
 
+        for entry in tiered_payloads.int4_payloads:
+            (
+                target_bytes,
+                payload_bytes,
+                scale_bytes,
+                elapsed,
+            ) = self._materialize_int4_entry(
+                entry=entry,
+                kv_cache=kv_cache,
+                num_blocks=num_blocks,
+            )
+            recovered_int4_block_ids.append(int(entry.physical_block_id))
+            recovered_bytes += target_bytes
+            int4_payload_bytes += payload_bytes
+            int4_scale_bytes += scale_bytes
+            effective_recovery_transfer_bytes += payload_bytes + scale_bytes
+            copy_wall_seconds += elapsed
+
         missing_fp16_block_ids = [
             int(block_id) for block_id in tiered_payloads.missing_fp16_block_ids
         ]
@@ -265,6 +285,7 @@ class BlockRecoveryManager:
         recovered_block_ids = [
             *recovered_fp16_block_ids,
             *recovered_int8_block_ids,
+            *recovered_int4_block_ids,
         ]
         missing_backup_block_ids = [
             *missing_fp16_block_ids,
@@ -290,6 +311,7 @@ class BlockRecoveryManager:
             copy_wall_seconds=copy_wall_seconds,
             recovered_fp16_block_ids=recovered_fp16_block_ids,
             recovered_int8_block_ids=recovered_int8_block_ids,
+            recovered_int4_block_ids=recovered_int4_block_ids,
             missing_fp16_block_ids=missing_fp16_block_ids,
             missing_int8_block_ids=missing_int8_block_ids,
             missing_int4_block_ids=missing_int4_block_ids,
@@ -298,6 +320,8 @@ class BlockRecoveryManager:
             ],
             fp16_payload_bytes=fp16_payload_bytes,
             int8_payload_bytes=int8_payload_bytes,
+            int4_payload_bytes=int4_payload_bytes,
+            int4_scale_bytes=int4_scale_bytes,
             effective_recovery_transfer_bytes=(
                 effective_recovery_transfer_bytes
             ),
@@ -336,6 +360,43 @@ class BlockRecoveryManager:
         return (
             target.numel() * target.element_size(),
             entry.payload.payload_nbytes,
+            elapsed,
+        )
+
+    def _materialize_int4_entry(
+        self,
+        *,
+        entry: INT4RecoveryPayloadEntry,
+        kv_cache: torch.Tensor,
+        num_blocks: int,
+    ) -> tuple[int, int, int, float]:
+        block_id = int(entry.physical_block_id)
+        if block_id < 0 or block_id >= num_blocks:
+            raise ValueError(
+                "MPR tiered int4 recovery block id is outside kv_cache "
+                f"block range: block_id={block_id}, num_blocks={num_blocks}."
+            )
+        target = kv_cache[:, block_id]
+        if tuple(entry.payload.original_shape) != tuple(target.shape):
+            raise ValueError(
+                "MPR tiered int4 recovery payload shape does not match "
+                f"target block shape for block_id={block_id}: "
+                f"payload_shape={entry.payload.original_shape}, "
+                f"target_shape={tuple(target.shape)}."
+            )
+
+        start = time.perf_counter()
+        materialized = self._int4_codec.materialize(
+            entry.payload,
+            target_dtype=target.dtype,
+            target_device=target.device,
+        )
+        target.copy_(materialized)
+        elapsed = time.perf_counter() - start
+        return (
+            target.numel() * target.element_size(),
+            entry.payload.packed.numel() * entry.payload.packed.element_size(),
+            entry.payload.scale.numel() * entry.payload.scale.element_size(),
             elapsed,
         )
 

@@ -23,6 +23,8 @@ CPU_BACKUP_STAT_FIELDS = (
     "cpu_backup_fp16_payload_bytes",
     "cpu_backup_int8_payload_bytes",
     "cpu_backup_int8_scale_bytes",
+    "cpu_backup_int4_payload_bytes",
+    "cpu_backup_int4_scale_bytes",
     "cpu_backup_total_actual_bytes",
 )
 
@@ -693,6 +695,11 @@ def validate_tiered_recovery_fields(
         "tier_int8_block_ids",
         minimum=0,
     )
+    tier_int4_block_ids = (
+        require_int_list(event, "tier_int4_block_ids", minimum=0)
+        if event.get("tier_int4_block_ids") is not None
+        else []
+    )
     tier_skip_block_ids = require_int_list(
         event,
         "tier_skip_block_ids",
@@ -708,6 +715,11 @@ def validate_tiered_recovery_fields(
         "recovered_int8_block_ids",
         minimum=0,
     )
+    recovered_int4_block_ids = (
+        require_int_list(event, "recovered_int4_block_ids", minimum=0)
+        if event.get("recovered_int4_block_ids") is not None
+        else []
+    )
     missing_fp16_block_ids = require_int_list(
         event,
         "missing_fp16_block_ids",
@@ -718,6 +730,11 @@ def validate_tiered_recovery_fields(
         "missing_int8_block_ids",
         minimum=0,
     )
+    missing_int4_block_ids = (
+        require_int_list(event, "missing_int4_block_ids", minimum=0)
+        if event.get("missing_int4_block_ids") is not None
+        else []
+    )
 
     selected_set = set(selected_block_ids)
     recovered_set = set(recovered_block_ids)
@@ -726,11 +743,14 @@ def validate_tiered_recovery_fields(
     for field, block_ids in (
         ("tier_fp16_block_ids", tier_fp16_block_ids),
         ("tier_int8_block_ids", tier_int8_block_ids),
+        ("tier_int4_block_ids", tier_int4_block_ids),
         ("tier_skip_block_ids", tier_skip_block_ids),
         ("recovered_fp16_block_ids", recovered_fp16_block_ids),
         ("recovered_int8_block_ids", recovered_int8_block_ids),
+        ("recovered_int4_block_ids", recovered_int4_block_ids),
         ("missing_fp16_block_ids", missing_fp16_block_ids),
         ("missing_int8_block_ids", missing_int8_block_ids),
+        ("missing_int4_block_ids", missing_int4_block_ids),
     ):
         if not set(block_ids).issubset(selected_set):
             raise AssertionError(
@@ -747,6 +767,11 @@ def validate_tiered_recovery_fields(
             f"{event['_source']}: recovered_int8_block_ids must be a subset "
             "of recovered_block_ids."
         )
+    if not set(recovered_int4_block_ids).issubset(recovered_set):
+        raise AssertionError(
+            f"{event['_source']}: recovered_int4_block_ids must be a subset "
+            "of recovered_block_ids."
+        )
     if not set(missing_fp16_block_ids).issubset(missing_set):
         raise AssertionError(
             f"{event['_source']}: missing_fp16_block_ids must be a subset "
@@ -757,6 +782,11 @@ def validate_tiered_recovery_fields(
             f"{event['_source']}: missing_int8_block_ids must be a subset "
             "of missing_backup_block_ids."
         )
+    if not set(missing_int4_block_ids).issubset(missing_set):
+        raise AssertionError(
+            f"{event['_source']}: missing_int4_block_ids must be a subset "
+            "of missing_backup_block_ids."
+        )
     if not set(tier_skip_block_ids).issubset(skipped_set):
         raise AssertionError(
             f"{event['_source']}: tier_skip_block_ids must be a subset of "
@@ -765,6 +795,10 @@ def validate_tiered_recovery_fields(
 
     require_int(event, "fp16_payload_bytes", minimum=0)
     require_int(event, "int8_payload_bytes", minimum=0)
+    if event.get("int4_payload_bytes") is not None:
+        require_int(event, "int4_payload_bytes", minimum=0)
+    if event.get("int4_scale_bytes") is not None:
+        require_int(event, "int4_scale_bytes", minimum=0)
     require_int(event, "effective_recovery_transfer_bytes", minimum=0)
 
 
