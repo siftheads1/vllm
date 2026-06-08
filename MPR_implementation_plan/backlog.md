@@ -35,6 +35,8 @@ separate CPU backup copy cost from MPR write-observation overhead in future
 ## Milestone 5 / Recovery Cleanup and Optimization
 
 ```text
+INT4 packed codec is not a Post-M5 backlog item anymore. It is promoted to
+  Milestone 4.5 so M5 can optimize the full fp16/int8/int4/skip tier set.
 optimize BlockRecoveryManager.materialize_blocks(...): current M3 v0 copies one
   selected block at a time for correctness/debug simplicity; threshold-based
   recovery may select many blocks and make the per-block Python loop costly
@@ -54,16 +56,10 @@ separate MPR debug-event measurement from real PCIe counter measurement:
   use dmon/nsys only as external traffic/profiling evidence
 reduce validation-only mutation machinery from normal production hot path
 make latency benchmark report backup/scoring/recovery components separately
-optimize Step 4.4 eager int8 backup creation:
-  current reference path is synchronous/blocking in the decode-side backup path
-  current eager fp16+int8 store derives INT8BackupPayload from the
-    already-created CPU fp16 payload to avoid a second GPU->CPU copy
-  evaluate lazy/on-the-fly int8 payload creation so fp16-only recovery and
-    unused int8 tiers do not pay quantization cost on every full block
-  evaluate GPU-side quantization plus compressed int8+scale CPU transfer as a
-    later production optimization after correctness is validated
-  combine with pinned host buffers, non_blocking copies, copy-stream readiness
-    tracking, or background CPU quantization only after measuring hot-path cost
+Step 4.4/4.5 CPU backup / eager low-precision payload creation optimization is
+  now a first-class Milestone 5 action item. See:
+  MPR_implementation_plan/milestones/milestone_5/action_plan.md
+  Step 5.3: CPU Backup and Low-Precision Payload Creation Optimization
 ```
 
 ## Production Integration Questions

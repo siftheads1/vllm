@@ -257,9 +257,9 @@ reference path. In the current implementation, backup copy/quantization should
 be treated as blocking decode-side work. The eager int8 payload is derived from
 the already-created CPU fp16 payload, so it avoids a second GPU->CPU copy but
 still pays CPU quantization cost synchronously. Future optimization items are
-recorded in ../../backlog.md for Milestone 5, including lazy/on-the-fly
-int8 creation, GPU-side quantization, pinned/non_blocking copies, readiness
-tracking, and background quantization.
+recorded as Milestone 5 Step 5.3, including lazy/on-the-fly int8 creation,
+GPU-side quantization, pinned/non_blocking copies, copy-stream readiness
+tracking, and background CPU quantization.
 ```
 
 Validation added:
@@ -645,5 +645,291 @@ result:
 Next step:
 
 ```text
-Step 4.8 Fault-Injection Tier Smoke.
+Step 4.8 Tiered Recovery Ratio Sweep Smoke.
+```
+
+## 2026-06-08: Step 4.8 Tiered Recovery Ratio Sweep Smoke
+
+Added an M4 smoke script for ratio-sweep inspection of tiered recovery output.
+
+Added:
+
+```text
+scripts/mpr_smoke_tiered_recovery.py
+```
+
+Default behavior:
+
+```text
+run one MPR-off baseline
+run tiered MPR recover mode for:
+  1.0:0.0
+  0.75:0.25
+  0.5:0.5
+  0.25:0.75
+  0.0:1.0
+```
+
+Optional skip-accounting behavior:
+
+```text
+--include-skip-ratio adds 0.25:0.50
+this observes skip assignment/accounting only
+degraded-residency skip correctness remains Step 4.9
+```
+
+Per-ratio validation:
+
+```text
+generation completes
+generated_token_ids is non-empty
+tiered recovery_materialized events exist
+missing_fp16_block_ids and missing_int8_block_ids are empty
+effective_recovery_transfer_bytes is positive
+no-skip ratios produce zero skip assignments
+optional skip ratio produces skip assignments without validating skip correctness
+fp16 ratio > 0 produces fp16 tier/recovered ids
+int8 ratio > 0 produces int8 tier/recovered ids
+existing debug JSONL validator accepts the ratio debug logs
+```
+
+Per-ratio reporting:
+
+```text
+generated text preview or full text
+first token mismatch vs baseline
+text common-prefix chars vs baseline
+tier fp16/int8/skip counts
+recovered fp16/int8 counts
+fp16/int8 payload bytes and effective transfer bytes
+generation log, debug dir, and validator log paths
+optional --summary-json with generated outputs and accounting summary
+```
+
+Validation run locally:
+
+```text
+python -m py_compile scripts/mpr_smoke_tiered_recovery.py
+
+result:
+  passed
+
+python scripts/mpr_smoke_tiered_recovery.py --help
+
+result:
+  passed
+```
+
+Runtime smoke not run in this implementation pass because it requires the target
+GPU/model environment.
+
+Next step:
+
+```text
+Step 4.9 Tiered Degraded-Residency Ratio Sweep Smoke.
+```
+
+## 2026-06-08: Step 4.9 Tiered Degraded-Residency Ratio Sweep Smoke
+
+Added an M4 smoke script for ratio-sweep validation of simulated
+degraded-residency skip behavior.
+
+Added:
+
+```text
+scripts/mpr_smoke_tiered_degraded_residency.py
+```
+
+Default behavior:
+
+```text
+run one MPR-off baseline
+run tiered MPR recover mode with validation-only zero_selected mutation for:
+  0.25:0.25
+  0.25:0.50
+  0.50:0.25
+  0.10:0.25
+  0.25:0.10
+```
+
+Runtime environment per ratio:
+
+```text
+VLLM_MPR_BACKUP_STORAGE_MODE=eager_fp16_int8
+VLLM_MPR_PRECISION_TIERING_ENABLE=1
+VLLM_MPR_PRECISION_POLICY=top_ratio
+VLLM_MPR_RECOVERY_TEST_MUTATE=zero_selected
+VLLM_MPR_RECOVERY_TEST_MODE=recover
+```
+
+Per-ratio validation:
+
+```text
+generation completes
+generated_token_ids is non-empty
+tiered recovery_materialized events exist
+recovery_test_mutated_block_ids is non-empty
+tier_skip_block_ids is non-empty
+skip ids are included in recovery_test_mutated_block_ids
+skip ids are included in skipped_block_ids
+skip ids are not included in recovered_block_ids
+fp16 ratio > 0 produces recovered fp16 ids
+int8 ratio > 0 produces recovered int8 ids
+missing_fp16_block_ids and missing_int8_block_ids are empty
+effective_recovery_transfer_bytes is positive
+```
+
+Validator update:
+
+```text
+scripts/mpr_validate_debug_jsonl.py
+  adds --require-tiered-skip-unrecovered
+  existing behavior is unchanged unless the flag is passed
+```
+
+Per-ratio reporting:
+
+```text
+generated text preview or full text
+first token mismatch vs baseline
+text common-prefix chars vs baseline
+degraded/mutated block count
+tier fp16/int8/skip counts
+recovered fp16/int8 counts
+unrecovered skip count
+fp16/int8 payload bytes and effective transfer bytes
+generation log, debug dir, and validator log paths
+optional --summary-json with baseline and per-ratio outputs
+```
+
+Validation run locally:
+
+```text
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m py_compile \
+  scripts/mpr_smoke_tiered_degraded_residency.py \
+  scripts/mpr_validate_debug_jsonl.py \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py
+
+result:
+  passed
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py -q
+
+result:
+  43 passed
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_recovery_payload.py \
+  tests/v1/mixed_precision_recovery/test_backup_codec.py \
+  tests/v1/mixed_precision_recovery/test_precision_policy.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py -q
+
+result:
+  66 passed
+
+git diff --check
+
+result:
+  passed
+```
+
+Runtime smoke completed on the target GPU/model environment:
+
+```text
+WORK_DIR=/tmp/mpr_m4_degraded_20260608_143758 \
+bash -lc 'python scripts/mpr_smoke_tiered_degraded_residency.py \
+  --work-dir "$WORK_DIR" \
+  --summary-json "$WORK_DIR/summary.json" \
+  --text-preview-chars 500'
+
+result:
+  passed
+
+summary_json:
+  /tmp/mpr_m4_degraded_20260608_143758/summary.json
+```
+
+Runtime smoke summary:
+
+```text
+baseline_generated_token_count: 512
+ratio_runs: 5
+skip_correctness_validated: true
+
+total_tiered_recovery_events: 2630
+total_skip_validating_events: 2182
+total_mutated_blocks: 22950
+
+total_fp16_tier / recovered_fp16: 7212 / 7212
+total_int8_tier / recovered_int8: 7052 / 7052
+total_skip_tier / unrecovered_skip: 8686 / 8686
+
+total_fp16_payload_bytes: 472645632
+total_int8_payload_bytes: 238301184
+total_effective_recovery_transfer_bytes: 710946816
+total_recovered_bytes: 934805504
+```
+
+Per-ratio runtime observations:
+
+```text
+ratio      gen  mismatch  prefix  events  mutated  fp16_tier  int8_tier  skip_tier  fp16_rec  int8_rec  skip_unrec
+0.25:0.25  512       305    1596     526     4590       1350       1318       1922      1350      1318        1922
+0.25:0.50  512       305    1596     526     4590       1350       2398        842      1350      2398         842
+0.50:0.25  512       305    1596     526     4590       2430       1318        842      2430      1318         842
+0.10:0.25  512       305    1596     526     4590        732       1318       2540       732      1318        2540
+0.25:0.10  512       305    1596     526     4590       1350        700       2540      1350       700        2540
+```
+
+Interpretation:
+
+```text
+For every ratio:
+  fp16 tier ids were recovered as fp16
+  int8 tier ids were recovered as int8
+  skip tier ids were validation-mutated and remained unrecovered
+
+Output divergence remains report-only:
+  all ratio runs first diverged from baseline at token index 305
+  all ratio runs shared a 1596-character common text prefix with baseline
+```
+
+Next step:
+
+```text
+Step 4.10 Milestone Result Document.
+```
+
+## 2026-06-08: Step 4.10 Milestone Result Document
+
+Recorded the Milestone 4 result document.
+
+Added:
+
+```text
+MPR_implementation_plan/milestones/milestone_4/results.md
+```
+
+Decision:
+
+```text
+Proceed to Milestone 4.5 before Milestone 5
+```
+
+Recorded:
+
+```text
+chosen config/env values
+implemented runtime behavior
+focused pytest result
+Step 4.8 tiered recovery ratio sweep summary
+Step 4.9 degraded-residency skip sweep summary
+fp16/int8 payload and effective transfer byte accounting
+known M4 limitations
+M4.5 INT4 integration target
+M5 optimization and cleanup targets after INT4
 ```

@@ -14,7 +14,8 @@ score finalized KV blocks
   -> materialize recovered blocks into the normal GPU KV cache before attention
 ```
 
-Milestone 5는 이 경로의 optimization/cleanup 단계로 둔다.
+Milestone 4.5는 INT4를 first-class tier로 통합하는 단계로 두고,
+Milestone 5는 그 이후 optimization/cleanup 단계로 둔다.
 
 ## Goal
 
@@ -443,33 +444,56 @@ validator preserves compatibility with M3 recovery logs
 focused sidecar tests cover tiering disabled vs enabled behavior
 ```
 
-## Step 4.8: Fault-Injection Tier Smoke
+## Step 4.8: Tiered Recovery Ratio Sweep Smoke
 
-Extend the M3 validation smoke to show that fp16/int8 recovery paths are both
-active.
+Add an M4 smoke script that runs tiered recovery across several FP16/INT8
+ratio compositions and prints/saves generated outputs for inspection.
 
-Recommended shape:
+Default ratio sweep:
 
 ```text
-baseline generation
-M3 fp16-only recovery generation
-M4 mixed-tier recovery generation
-validation-only mutation of selected tier candidates
-debug JSONL confirms fp16 and int8 materialization
+1.0:0.0
+0.75:0.25
+0.5:0.5
+0.25:0.75
+0.0:1.0
+```
+
+Optional skip-accounting case:
+
+```text
+--include-skip-ratio adds 0.25:0.50
+```
+
+Boundary:
+
+```text
+default Step 4.8 sweep avoids skip tier
+optional skip case only checks assignment/accounting
+true degraded-residency skip correctness remains Step 4.9
 ```
 
 Completion:
 
 ```text
 generation completes
-fp16 and int8 tier paths are both exercised
-debug validator sees tiered recovery events
-byte accounting shows int8 compressed payload usage
+generated token ids are non-empty
+tiered recovery_materialized events exist
+missing fp16/int8 payload lists are empty
+effective_recovery_transfer_bytes > 0
+no-skip ratios produce zero skip assignments
+optional skip ratio produces skip assignments without validating skip correctness
+fp16 ratio > 0 produces fp16 tier/recovered ids
+int8 ratio > 0 produces int8 tier/recovered ids
+debug JSONL validator accepts every ratio run
+script reports generated output preview/full text, mismatch vs baseline,
+  tier counts, recovered counts, int8 payload bytes, transfer bytes, and paths
 ```
 
-## Step 4.9: Simulated Eviction / Degraded-Residency Smoke
+## Step 4.9: Tiered Degraded-Residency Ratio Sweep Smoke
 
-Add a stronger validation step so skip is not only a debug label.
+Add a stronger validation smoke so skip is not only a debug label. This smoke
+runs multiple fp16/int8 ratio compositions that intentionally leave a skip tier.
 
 Validation behavior:
 
@@ -480,6 +504,16 @@ after tier assignment:
   materialize int8 tier
   leave skip tier degraded/unrecovered
   run attention
+```
+
+Default ratio sweep:
+
+```text
+0.25:0.25
+0.25:0.50
+0.50:0.25
+0.10:0.25
+0.25:0.10
 ```
 
 This simulates the semantic question:
@@ -501,9 +535,13 @@ direct mixed-dtype attention
 Completion:
 
 ```text
+generation completes for every ratio
+generated token ids are non-empty
 debug JSONL records degraded candidate ids and unrecovered skip ids
 validator checks skip tier remains unrecovered
-smoke demonstrates tiered materialization under degraded-residency conditions
+smoke reports generated text preview/full text, mismatch vs baseline,
+  tier/recovered counts, unrecovered skip count, byte accounting, and paths
+output divergence is report-only, not a pass/fail condition
 ```
 
 ## Step 4.10: Milestone Result Document
@@ -521,19 +559,24 @@ fp16 vs int8 payload byte accounting
 known limitations and M5 optimization targets
 ```
 
-## Known Follow-ups for Milestone 5
+## Known Follow-ups After Milestone 4
 
 ```text
+Milestone 4.5:
+  INT4 packed codec and first-class int4 recovery tier
+
+Milestone 5:
 batched materialization instead of per-block Python loop
 pinned CPU memory and non_blocking transfer
 custom CUDA/Triton quant/dequant materialization
-GPU low-precision staging buffer
-direct mixed-dtype attention path
-INT4 packed codec
 CPU fp16-only backup with on-the-fly quant provider
 sidecar responsibility split and hot-path debug cleanup
 real offload/eviction integration
-multi-request/preemption lifecycle correctness
+
+Potential future / currently out of scope:
+  GPU low-precision staging buffer
+  direct mixed-dtype attention path
+  multi-request/preemption lifecycle correctness
 ```
 
 ## Decision Gate
@@ -542,7 +585,7 @@ Milestone 4 끝에서 다음 중 하나를 선택한다.
 
 | Decision | Condition |
 |---|---|
-| Proceed to Milestone 5 | fp16/int8/skip tiering works semantically, compressed int8 transfer/materialization is observed, and simulated skip semantics are validated |
+| Proceed to Milestone 4.5 | fp16/int8/skip tiering works semantically, compressed int8 transfer/materialization is observed, and simulated skip semantics are validated |
 | Continue Milestone 4 | tiering exists but int8 materialization, skip validation, or byte accounting is incomplete |
 | Rework quantization granularity | per-token-per-kv-head scale is too costly or too inaccurate |
 | Rework payload storage | eager fp16+int8 storage is too awkward for policy experiments |
@@ -558,5 +601,6 @@ skip tiers, then materialize only the selected precision tiers into the normal
 GPU KV cache before attention?
 ```
 
-이 답이 안정적으로 나오면 Milestone 5에서 latency, transfer, materialization,
+이 답이 안정적으로 나오면 Milestone 4.5에서 INT4를 first-class tier로
+통합하고, 그 다음 Milestone 5에서 latency, transfer, materialization,
 debug overhead, sidecar structure를 정리하고 최적화한다.

@@ -596,6 +596,48 @@ def test_sidecar_tiered_recovery_materializes_fp16_and_int8_tiers():
     assert sidecar.counters["recovery_test_mutated"] == 0
 
 
+def test_sidecar_tiered_recovery_leaves_mutated_skip_tier_degraded():
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = _make_recovery_sidecar(
+        precision_tiering_enabled=True,
+        precision_policy="top_ratio",
+        tier_fp16_ratio=0.20,
+        tier_int8_ratio=0.20,
+        recovery_test_mutate="zero_selected",
+        recovery_test_mode="recover",
+    )
+    _add_third_digest(sidecar)
+    kv_cache = torch.full((2, 3, 4, 1, 2), -5.0, dtype=torch.float32)
+    fp16_backup = torch.full((2, 4, 1, 2), 9.0)
+    int8_backup = torch.full((2, 4, 1, 2), 3.0)
+    sidecar._cpu_backup_store.put(
+        layer_name=layer_name,
+        physical_block_id=1,
+        kv_block=fp16_backup,
+        backup_storage_mode="eager_fp16_int8",
+    )
+    sidecar._cpu_backup_store.put(
+        layer_name=layer_name,
+        physical_block_id=2,
+        kv_block=int8_backup,
+        backup_storage_mode="eager_fp16_int8",
+    )
+
+    sidecar.recover_before_attention_with_test_mutation(
+        layer_name=layer_name,
+        query=torch.ones(1, 1, 2),
+        attn_metadata=_decode_metadata_three_blocks(),
+        kv_cache=kv_cache,
+        block_size=4,
+    )
+
+    torch.testing.assert_close(kv_cache[:, 0], torch.zeros_like(kv_cache[:, 0]))
+    torch.testing.assert_close(kv_cache[:, 1], fp16_backup)
+    torch.testing.assert_close(kv_cache[:, 2], int8_backup)
+    assert sidecar.counters["recovery_materialized"] == 1
+    assert sidecar.counters["recovery_test_mutated"] == 0
+
+
 def test_sidecar_tiered_recovery_supports_threshold_policy():
     layer_name = "model.layers.0.self_attn.attn"
     sidecar = _make_recovery_sidecar(

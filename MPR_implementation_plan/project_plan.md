@@ -188,28 +188,51 @@ Mixed-Precision Recovery sidecar
 
 ```text
 score >= tau_high -> fp16 recovery
-score >= tau_low  -> int8/fp8 recovery
+score >= tau_low  -> int8 recovery
 otherwise         -> skip
 ```
 
 처음에는 attention kernel이 mixed precision page를 직접 읽도록 만들지 않는다. 대신 다음 중 하나로 시작한다.
 
 1. CPU에서 lower precision으로 저장하고 GPU recovery 시 dequantize해서 기존 KV cache에 씀
-2. GPU에 별도 low-precision staging buffer를 만들고, attention 전 fp16으로 materialize
-3. vLLM의 existing FP8 KV cache support를 활용할 수 있는지 조사
+2. INT4는 packed `uint8` payload와 explicit unpack/dequant path로 확장
+3. GPU low-precision staging buffer나 direct mixed-dtype attention은 potential
+   future solution으로만 둔다
 
 진짜 mixed-precision attention kernel은 마지막 단계로 미룬다.
+
+### Milestone 4.5: INT4 Packed Recovery Tier Integration
+
+목표:
+- INT4를 Post-M5 follow-up이 아니라 M5 optimization 전의 first-class tier로 통합한다
+- precision tier set을 `fp16 / int8 / int4 / skip`으로 확장한다
+- PyTorch의 부재한 general-purpose INT4 dtype에 의존하지 않고 packed `uint8`
+  payload로 INT4 backup을 표현한다
+
+성공 기준:
+- `tier_int4_ratio` 기반 top-ratio assignment가 fp16/int8/int4/skip을 모두 다룬다
+- INT4 payload는 CPU에서 packed `uint8` bytes + scale metadata로 저장된다
+- INT4 payload는 attention 전에 기존 GPU KV cache dtype으로 dequantize/materialize된다
+- debug JSONL과 smoke summary에서 int4 tier/recovery/missing-payload/byte accounting을 확인할 수 있다
+- simulated degraded-residency smoke에서 INT4가 있어도 skip tier는 unrecovered로 남는다
+
+비범위:
+- direct mixed-dtype attention
+- GPU low-precision staging buffer
+- real scheduler/offload-owned eviction
+- multi-request/preemption correctness
+- FP8 / vLLM native FP8 KV cache support
 
 ### Milestone 5: Recovery Cleanup and Optimization
 
 목표:
-- Milestone 4의 mixed-precision recovery skeleton을 유지하면서 hot-path overhead를 줄인다
+- Milestone 4와 4.5의 mixed-precision recovery skeleton을 유지하면서 hot-path overhead를 줄인다
 - validation-only fault injection과 production recovery path를 더 명확히 분리한다
 - 현재 환경에서 불필요한 debug/scoring/recovery 비용을 덜어낸다
 - recovery/backup path의 비용 구조를 측정 가능하게 만든다
 
 성공 기준:
-- M4 mixed-precision semantic smoke는 계속 통과한다
+- M4/M4.5 mixed-precision semantic smoke는 계속 통과한다
 - baseline 대비 decode overhead가 명확히 줄거나, 최소한 overhead breakdown이 분리된다
 - recovered bytes, recovery copy wall time, per-token recovered bytes를 smoke/benchmark에서 확인할 수 있다
 - Sidecar가 scoring, recovery, debug, fault-injection 책임을 지금보다 명확히 나눈다
@@ -241,7 +264,7 @@ otherwise         -> skip
    - 필요 시 nsys/dmon 기반 PCIe traffic 관측 절차 문서화
 ```
 
-Milestone 5는 새 mixed precision 기능을 넓히는 단계가 아니라, M4 skeleton을
+Milestone 5는 새 mixed precision tier를 넓히는 단계가 아니라, M4/M4.5 skeleton을
 실제 다음 단계로 가져갈 수 있게 만드는 cleanup/optimization milestone이다.
 
 ## 7. Pivot Plan: InfiniGen 기반 Prototype

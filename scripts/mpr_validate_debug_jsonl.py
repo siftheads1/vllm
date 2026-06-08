@@ -83,6 +83,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--require-tiered-skip-unrecovered",
+        action="store_true",
+        help=(
+            "Require at least one tiered recovery event where skip-tier blocks "
+            "were validation-mutated and remained unrecovered."
+        ),
+    )
+    parser.add_argument(
         "--show",
         type=int,
         default=10,
@@ -929,6 +937,44 @@ def validate_strict_current_request_score_event(event: dict[str, Any]) -> None:
         )
 
 
+def validate_tiered_skip_unrecovered_requirement(
+    recovery_events: list[dict[str, Any]],
+) -> None:
+    """Require observed degraded skip-tier blocks that stayed unrecovered."""
+    for event in recovery_events:
+        if event.get("precision_tiering_enabled") is not True:
+            continue
+        tier_skip_block_ids = set(
+            require_int_list(event, "tier_skip_block_ids", minimum=0)
+        )
+        if not tier_skip_block_ids:
+            continue
+        mutated_block_ids = set(
+            require_int_list(
+                event,
+                "recovery_test_mutated_block_ids",
+                minimum=0,
+            )
+        )
+        skipped_block_ids = set(
+            require_int_list(event, "skipped_block_ids", minimum=0)
+        )
+        recovered_block_ids = set(
+            require_int_list(event, "recovered_block_ids", minimum=0)
+        )
+        if (
+            tier_skip_block_ids.issubset(mutated_block_ids)
+            and tier_skip_block_ids.issubset(skipped_block_ids)
+            and tier_skip_block_ids.isdisjoint(recovered_block_ids)
+        ):
+            return
+
+    raise AssertionError(
+        "Expected at least one tiered recovery event with skip-tier blocks "
+        "that were validation-mutated and left unrecovered."
+    )
+
+
 def validate_digest_observe_matches(
     digest_events: list[dict[str, Any]],
     observe_events: list[dict[str, Any]],
@@ -1182,6 +1228,8 @@ def main() -> None:
             "recovery_test_mutated events, found "
             f"{len(recovery_test_mutated_events)}."
         )
+    if args.require_tiered_skip_unrecovered:
+        validate_tiered_skip_unrecovered_requirement(recovery_events)
 
     validate_digest_observe_matches(
         digest_events,

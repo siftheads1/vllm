@@ -28,4 +28,5 @@ review those rules and confirm the concrete plan with the user.
 - `milestones/milestone_2/`: CPU fp16 Backup
 - `milestones/milestone_3/`: Full-Precision Recovery
 - `milestones/milestone_4/`: Mixed-Precision Recovery
+- `milestones/milestone_4_5/`: INT4 Packed Recovery Tier Integration
 - `milestones/milestone_5/`: Recovery Cleanup and Optimization
