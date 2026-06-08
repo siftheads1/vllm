@@ -77,3 +77,30 @@ keep per-token-per-kv-head fp32 scales for the reference codec
 extend top_ratio first and defer threshold INT4 semantics
 add eager_fp16_int8_int4 while keeping eager_fp16_int8 as the default
 ```
+
+## 2026-06-08: Step 4.5.2 INT4 Backup Codec
+
+Completed the standalone INT4 backup codec step.
+
+Implemented:
+
+```text
+INT4BackupPayload
+INT4BackupCodec
+INT4_BACKUP_FORMAT = "int4"
+signed symmetric emitted range [-7, 7]
+per-token-per-kv-head fp32 scale
+packed torch.uint8 CPU payload
+two signed INT4 values per byte using two's-complement nibbles
+pack along head_dim with shape [2, block_size, num_kv_heads, ceil(head_dim / 2)]
+direct PyTorch materialize/unpack/dequantize path
+```
+
+Status:
+
+```text
+codec-only implementation complete
+CPUBackupStore integration remains Step 4.5.3
+runtime recovery integration remains later M4.5 steps
+user completed Step 4.5.2 focused tests
+```

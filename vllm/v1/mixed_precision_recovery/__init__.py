@@ -12,6 +12,9 @@ from vllm.v1.mixed_precision_recovery.backup_codec import (
     INT8_BACKUP_FORMAT,
     INT8BackupCodec,
     INT8BackupPayload,
+    INT4_BACKUP_FORMAT,
+    INT4BackupCodec,
+    INT4BackupPayload,
     PER_TOKEN_PER_KV_HEAD_SCALE,
 )
 from vllm.v1.mixed_precision_recovery.cpu_backup import (
@@ -76,6 +79,9 @@ __all__ = [
     "INT8_BACKUP_FORMAT",
     "INT8BackupCodec",
     "INT8BackupPayload",
+    "INT4_BACKUP_FORMAT",
+    "INT4BackupCodec",
+    "INT4BackupPayload",
     "PER_TOKEN_PER_KV_HEAD_SCALE",
     "CPUBackupKey",
     "CPUBackupPutResult",

@@ -10,6 +10,9 @@ from vllm.v1.mixed_precision_recovery.backup_codec import (
     INT8_BACKUP_FORMAT,
     INT8_QMAX,
     INT8BackupCodec,
+    INT4_BACKUP_FORMAT,
+    INT4_QMAX,
+    INT4BackupCodec,
     PER_TOKEN_PER_KV_HEAD_SCALE,
 )
 
@@ -24,6 +27,22 @@ def _kv_block() -> torch.Tensor:
             [
                 [[-1.0, 2.0, 3.0], [0.0, -0.5, 0.5]],
                 [[4.0, -3.0, 2.0], [-2.0, 1.0, -0.25]],
+            ],
+        ],
+        dtype=torch.float32,
+    )
+
+
+def _even_head_dim_kv_block() -> torch.Tensor:
+    return torch.tensor(
+        [
+            [
+                [[-7.0, -1.0, 0.0, 7.0]],
+                [[1.0, -2.0, 3.0, -4.0]],
+            ],
+            [
+                [[7.0, 0.0, -1.0, -7.0]],
+                [[-0.5, 0.5, -1.5, 1.5]],
             ],
         ],
         dtype=torch.float32,
@@ -128,6 +147,137 @@ def test_int8_backup_codec_zero_vector_handling_is_stable():
     torch.testing.assert_close(materialized, source)
 
 
+def test_int4_backup_codec_creates_expected_payload_metadata():
+    source = _kv_block()
+    payload = INT4BackupCodec().encode(source)
+
+    assert payload.format == INT4_BACKUP_FORMAT
+    assert payload.scale_granularity == PER_TOKEN_PER_KV_HEAD_SCALE
+    assert payload.quantized_range == (-7, 7)
+    assert payload.original_shape == tuple(source.shape)
+    assert payload.packed.device.type == "cpu"
+    assert payload.scale.device.type == "cpu"
+    assert payload.packed.dtype == torch.uint8
+    assert payload.scale.dtype == torch.float32
+    assert tuple(payload.packed.shape) == (*tuple(source.shape[:-1]), 2)
+    assert tuple(payload.scale.shape) == tuple(source.shape[:-1])
+    assert payload.payload_nbytes == (
+        payload.packed.numel() * payload.packed.element_size()
+        + payload.scale.numel() * payload.scale.element_size()
+    )
+
+
+def test_int4_backup_codec_packs_even_head_dim_shape():
+    source = _even_head_dim_kv_block()
+    payload = INT4BackupCodec().encode(source)
+
+    assert tuple(payload.packed.shape) == (*tuple(source.shape[:-1]), 2)
+    assert payload.payload_nbytes == (
+        payload.packed.numel() * payload.packed.element_size()
+        + payload.scale.numel() * payload.scale.element_size()
+    )
+
+
+def test_int4_backup_codec_pads_odd_head_dim_high_nibble():
+    source = torch.zeros(2, 1, 1, 3, dtype=torch.float32)
+    source[0, 0, 0] = torch.tensor([7.0, -1.0, -7.0])
+    payload = INT4BackupCodec().encode(source)
+
+    assert tuple(payload.packed.shape) == (2, 1, 1, 2)
+    assert payload.packed[0, 0, 0].tolist() == [0xF7, 0x09]
+
+    materialized = INT4BackupCodec().materialize(
+        payload,
+        target_dtype=torch.float32,
+        target_device="cpu",
+    )
+    torch.testing.assert_close(materialized[0, 0, 0], source[0, 0, 0])
+
+
+def test_int4_backup_codec_uses_twos_complement_nibble_packing():
+    source = _even_head_dim_kv_block()
+    payload = INT4BackupCodec().encode(source)
+
+    assert payload.packed[0, 0, 0].tolist() == [0xF9, 0x70]
+    assert payload.packed[1, 0, 0].tolist() == [0x07, 0x9F]
+
+    materialized = INT4BackupCodec().materialize(
+        payload,
+        target_dtype=torch.float32,
+        target_device="cpu",
+    )
+    torch.testing.assert_close(
+        materialized[0, 0, 0],
+        torch.tensor([-7.0, -1.0, 0.0, 7.0]),
+    )
+    torch.testing.assert_close(
+        materialized[1, 0, 0],
+        torch.tensor([7.0, 0.0, -1.0, -7.0]),
+    )
+
+
+def test_int4_backup_codec_uses_per_token_per_kv_head_scale():
+    source = _kv_block()
+    payload = INT4BackupCodec().encode(source)
+
+    expected_scale = source.abs().amax(dim=-1) / INT4_QMAX
+    expected_scale = torch.where(
+        source.abs().amax(dim=-1) == 0,
+        torch.ones_like(expected_scale),
+        expected_scale,
+    )
+    torch.testing.assert_close(payload.scale, expected_scale)
+
+
+def test_int4_backup_codec_round_trip_error_is_bounded():
+    source = _kv_block()
+    codec = INT4BackupCodec()
+    payload = codec.encode(source)
+
+    materialized = codec.materialize(
+        payload,
+        target_dtype=torch.float32,
+        target_device="cpu",
+    )
+
+    error = (materialized - source).abs()
+    bound = payload.scale.unsqueeze(-1) / 2
+    assert bool(torch.all(error <= bound + 1e-6))
+
+
+def test_int4_backup_codec_zero_vector_handling_is_stable():
+    source = torch.zeros(2, 2, 3, 5, dtype=torch.float32)
+    codec = INT4BackupCodec()
+    payload = codec.encode(source)
+    materialized = codec.materialize(
+        payload,
+        target_dtype=torch.float32,
+        target_device="cpu",
+    )
+
+    assert tuple(payload.packed.shape) == (2, 2, 3, 3)
+    assert torch.isfinite(payload.scale).all()
+    torch.testing.assert_close(payload.scale, torch.ones_like(payload.scale))
+    torch.testing.assert_close(payload.packed, torch.zeros_like(payload.packed))
+    torch.testing.assert_close(materialized, source)
+
+
+def test_int4_backup_codec_materializes_to_target_dtype_and_device():
+    source = _kv_block()
+    codec = INT4BackupCodec()
+    payload = codec.encode(source)
+
+    materialized = codec.materialize(
+        payload,
+        target_dtype=torch.float16,
+        target_device="cpu",
+    )
+
+    assert materialized.device.type == "cpu"
+    assert materialized.dtype == torch.float16
+    assert tuple(materialized.shape) == tuple(source.shape)
+
+
 def test_backup_codecs_reject_invalid_kv_block_shape():
     invalid = torch.zeros(1, 2, 3, 4)
 
@@ -135,3 +285,5 @@ def test_backup_codecs_reject_invalid_kv_block_shape():
         FP16BackupCodec().encode(invalid)
     with pytest.raises(ValueError, match="semantic K/V block"):
         INT8BackupCodec().encode(invalid)
+    with pytest.raises(ValueError, match="semantic K/V block"):
+        INT4BackupCodec().encode(invalid)
