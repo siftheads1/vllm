@@ -285,8 +285,10 @@ for mode in modes:
     generate_elapsed: list[float] = []
     tokens_per_sec: list[float] = []
     step_latencies: list[float] = []
-    boundary_latencies: list[float] = []
-    non_boundary_latencies: list[float] = []
+    prefill_latencies: list[float] = []
+    decode_latencies: list[float] = []
+    boundary_decode_latencies: list[float] = []
+    non_boundary_decode_latencies: list[float] = []
     csv_paths: list[str] = []
 
     for log_path in logs:
@@ -308,19 +310,32 @@ for mode in modes:
             for row in reader:
                 step_idx = int(row["step_idx"])
                 latency = float(row["latency_ms"])
+                phase = row.get("phase")
+                if phase not in {"prefill", "decode"}:
+                    phase = "prefill" if step_idx == 0 else "decode"
                 step_latencies.append(latency)
+                if phase == "prefill":
+                    prefill_latencies.append(latency)
+                    continue
+                decode_latencies.append(latency)
                 if step_idx in boundary_steps:
-                    boundary_latencies.append(latency)
+                    boundary_decode_latencies.append(latency)
                 else:
-                    non_boundary_latencies.append(latency)
+                    non_boundary_decode_latencies.append(latency)
 
     step_median = median(step_latencies)
     step_p95 = percentile(step_latencies, 95)
     step_max = max(step_latencies) if step_latencies else 0.0
+    decode_median = median(decode_latencies)
+    decode_p95 = percentile(decode_latencies, 95)
+    decode_max = max(decode_latencies) if decode_latencies else 0.0
     outlier = bool(
-        step_latencies
-        and step_median > 0.0
-        and (step_p95 > 1.5 * step_median or step_max > 2.0 * step_median)
+        decode_latencies
+        and decode_median > 0.0
+        and (
+            decode_p95 > 1.5 * decode_median
+            or decode_max > 2.0 * decode_median
+        )
     )
     rows.append({
         "mode": mode,
@@ -335,13 +350,26 @@ for mode in modes:
         "step_latency_ms_p95": step_p95,
         "step_latency_ms_p99": percentile(step_latencies, 99),
         "step_latency_ms_max": step_max,
-        "boundary_step_latency_ms_mean": mean(boundary_latencies),
-        "boundary_step_latency_ms_max": (
-            max(boundary_latencies) if boundary_latencies else 0.0
+        "prefill_step_latency_ms_mean": mean(prefill_latencies),
+        "prefill_step_latency_ms_max": (
+            max(prefill_latencies) if prefill_latencies else 0.0
         ),
-        "non_boundary_step_latency_ms_mean": mean(non_boundary_latencies),
-        "non_boundary_step_latency_ms_max": (
-            max(non_boundary_latencies) if non_boundary_latencies else 0.0
+        "decode_step_count": len(decode_latencies),
+        "decode_step_latency_ms_mean": mean(decode_latencies),
+        "decode_step_latency_ms_median": decode_median,
+        "decode_step_latency_ms_p95": decode_p95,
+        "decode_step_latency_ms_p99": percentile(decode_latencies, 99),
+        "decode_step_latency_ms_max": decode_max,
+        "boundary_decode_step_latency_ms_mean": mean(boundary_decode_latencies),
+        "boundary_decode_step_latency_ms_max": (
+            max(boundary_decode_latencies) if boundary_decode_latencies else 0.0
+        ),
+        "non_boundary_decode_step_latency_ms_mean": (
+            mean(non_boundary_decode_latencies)
+        ),
+        "non_boundary_decode_step_latency_ms_max": (
+            max(non_boundary_decode_latencies)
+            if non_boundary_decode_latencies else 0.0
         ),
         "outlier_rerun_recommended": outlier,
         "csv_paths": ";".join(csv_paths),

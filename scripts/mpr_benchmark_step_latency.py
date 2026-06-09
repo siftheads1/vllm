@@ -94,6 +94,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             file,
             fieldnames=[
                 "step_idx",
+                "phase",
                 "latency_ms",
                 "num_step_outputs",
                 "has_finished_output",
@@ -144,6 +145,7 @@ def main() -> None:
         latency_ms = (time.perf_counter() - start) * 1000.0
         row = {
             "step_idx": step_idx,
+            "phase": "prefill" if step_idx == 0 else "decode",
             "latency_ms": latency_ms,
             "num_step_outputs": len(outputs),
             "has_finished_output": any(
@@ -173,6 +175,16 @@ def main() -> None:
     generate_elapsed_sec = time.perf_counter() - generate_start
 
     latencies = [float(row["latency_ms"]) for row in step_rows]
+    prefill_latencies = [
+        float(row["latency_ms"])
+        for row in step_rows
+        if row["phase"] == "prefill"
+    ]
+    decode_latencies = [
+        float(row["latency_ms"])
+        for row in step_rows
+        if row["phase"] == "decode"
+    ]
     prompt_tokens = sum(
         len(output.prompt_token_ids)
         if output.prompt_token_ids is not None
@@ -189,12 +201,12 @@ def main() -> None:
     boundary_latencies = [
         float(row["latency_ms"])
         for row in step_rows
-        if int(row["step_idx"]) in boundary_set
+        if row["phase"] == "decode" and int(row["step_idx"]) in boundary_set
     ]
     non_boundary_latencies = [
         float(row["latency_ms"])
         for row in step_rows
-        if int(row["step_idx"]) not in boundary_set
+        if row["phase"] == "decode" and int(row["step_idx"]) not in boundary_set
     ]
 
     print(f"load_elapsed_sec: {load_elapsed_sec:.6f}")
@@ -217,20 +229,36 @@ def main() -> None:
         print(f"  p95: {percentile(latencies, 95):.6f}")
         print(f"  p99: {percentile(latencies, 99):.6f}")
         print(f"  max: {max(latencies):.6f}")
+    if prefill_latencies:
+        print("prefill_step_latency_ms:")
+        print(f"  mean: {statistics.mean(prefill_latencies):.6f}")
+        print(f"  max: {max(prefill_latencies):.6f}")
+    if decode_latencies:
+        print("decode_step_latency_ms:")
+        print(f"  mean: {statistics.mean(decode_latencies):.6f}")
+        print(f"  median: {statistics.median(decode_latencies):.6f}")
+        print(f"  p90: {percentile(decode_latencies, 90):.6f}")
+        print(f"  p95: {percentile(decode_latencies, 95):.6f}")
+        print(f"  p99: {percentile(decode_latencies, 99):.6f}")
+        print(f"  max: {max(decode_latencies):.6f}")
     if boundary_latencies:
-        print("predicted_boundary_step_latency_ms:")
+        print("predicted_boundary_decode_step_latency_ms:")
         print(f"  mean: {statistics.mean(boundary_latencies):.6f}")
         print(f"  max: {max(boundary_latencies):.6f}")
     if non_boundary_latencies:
-        print("non_boundary_step_latency_ms:")
+        print("non_boundary_decode_step_latency_ms:")
         print(f"  mean: {statistics.mean(non_boundary_latencies):.6f}")
         print(f"  max: {max(non_boundary_latencies):.6f}")
 
     if args.print_steps:
-        print("columns: step_idx, latency_ms, num_step_outputs, has_finished_output")
+        print(
+            "columns: step_idx, phase, latency_ms, num_step_outputs, "
+            "has_finished_output"
+        )
         for row in step_rows:
             print(
-                f"{row['step_idx']}, {row['latency_ms']:.6f}, "
+                f"{row['step_idx']}, {row['phase']}, "
+                f"{row['latency_ms']:.6f}, "
                 f"{row['num_step_outputs']}, {row['has_finished_output']}"
             )
     if args.csv is not None:

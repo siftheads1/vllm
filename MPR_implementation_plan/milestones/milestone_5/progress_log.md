@@ -122,12 +122,14 @@ Record per mode:
 ```text
 generate_elapsed_sec
 generated_tokens_per_sec
-engine step latency mean, median, p95, p99, max
-predicted boundary step latency mean, max
-non-boundary step latency mean, max
+all engine step latency mean, median, p95, p99, max
+prefill step latency mean, max
+decode step latency mean, median, p95, p99, max
+predicted boundary decode step latency mean, max
+non-boundary decode step latency mean, max
 CSV path
 warmup count and measured run count
-outlier rerun status
+outlier rerun status based on decode p95/max
 ```
 
 Runtime command:
@@ -138,7 +140,9 @@ bash scripts/mpr_run_m5_step51_latency.sh \
 ```
 
 The script records `manifest.txt`, per-mode warmup/measured `.log` and `.csv`
-files, `runtime_summary.csv`, and `outlier_check.txt`. It clears inherited
+files, `runtime_summary.csv`, and `outlier_check.txt`. The benchmark CSV marks
+`step_idx=0` as `prefill` and later steps as `decode`; the primary M5 latency
+comparison uses decode-only summary fields. The runner clears inherited
 `VLLM_MPR_*` environment for every run, keeps `VLLM_MPR_DEBUG_DIR` unset for
 latency measurements, and injects only the mode environment being measured.
 
