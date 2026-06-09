@@ -13,3 +13,4 @@ Milestone 4 and Milestone 4.5 mixed-precision recovery skeleton.
 
 - `action_plan.md`
 - `progress_log.md`
+- `reports/`

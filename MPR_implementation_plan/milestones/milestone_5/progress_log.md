@@ -179,7 +179,45 @@ Status:
 ```text
 Step 5.1 command set recorded.
 Runtime command script added at scripts/mpr_run_m5_step51_latency.sh.
-Runtime measurements not yet recorded.
+First runtime summary recorded below.
 Semantic smoke measurements not yet recorded.
 Synthetic microbenchmark measurements not yet recorded.
+```
+
+## 2026-06-10: Step 5.1 First Runtime Summary and Bottleneck Targets
+
+Received first runtime summary from the GPU runtime environment.
+
+Detailed report:
+
+```text
+MPR_implementation_plan/milestones/milestone_5/reports/step_5_1_runtime_bottleneck_report.md
+```
+
+Runtime summary:
+
+```text
+mode             decode mean   median    p95      max       tok/s   mean vs baseline
+baseline          25.00 ms    22.02    37.14     52.29    39.46       1.00x
+mpr_enable_only   43.06 ms    40.86    54.66     66.24    23.03       1.72x
+backup_only       42.77 ms    40.46    54.85     78.82    23.18       1.71x
+scoring_only      90.53 ms    95.10   103.29    181.33    11.01       3.62x
+fp16_recovery    126.45 ms   132.28   168.42    206.03     7.89       5.06x
+mixed_int8       204.79 ms   153.45   865.31   1757.53     4.88       8.19x
+mixed_int4       296.15 ms   202.45  1398.78   3348.17     3.38      11.85x
+```
+
+Primary bottleneck targets recorded in the report:
+
+```text
+1. MPR observe/digest base overhead
+2. Scoring path
+3. FP16 recovery materialization
+4. Mixed INT8/INT4 tail latency
+```
+
+Target 1 code map:
+
+```text
+MPR_implementation_plan/milestones/milestone_5/reports/step_5_1_target_1_observe_digest_code_map.md
 ```
