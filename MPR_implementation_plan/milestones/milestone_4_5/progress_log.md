@@ -410,3 +410,39 @@ python scripts/mpr_smoke_tiered_degraded_residency.py \
   --summary-json "$WORK_DIR/summary.json" \
   --text-preview-chars 500
 ```
+
+## 2026-06-09: Step 4.5.8 Result Document and M5 Handoff
+
+Recorded Milestone 4.5 results and M5 handoff.
+
+Added:
+
+```text
+MPR_implementation_plan/milestones/milestone_4_5/results.md
+```
+
+Recorded:
+
+```text
+INT4 encoding and scale decisions
+config/env and backup storage changes
+top-ratio fp16/int8/int4/skip runtime validation status
+debug JSONL and validator support
+known M4.5 limitations
+M5 optimization targets
+threshold INT4 support deferred pending threshold-specific profiling
+```
+
+Decision:
+
+```text
+Proceed to Milestone 5 with top-ratio as the validated M4.5 correctness
+baseline. Threshold-based INT4 policy/smoke should be added only after
+threshold profiling clarifies the right semantics and validation gates.
+```
+
+Status:
+
+```text
+Milestone 4.5 complete for top-ratio INT4 recovery.
+```
