@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import atexit
+import json
+import os
+import time
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -49,6 +53,63 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
 
 logger = init_logger(__name__)
+
+_MPR_OBSERVE_HOOK_TIMING = {
+    "count": 0,
+    "total_ms": 0.0,
+    "max_ms": 0.0,
+}
+
+
+def reset_mpr_observe_hook_timing() -> None:
+    _MPR_OBSERVE_HOOK_TIMING["count"] = 0
+    _MPR_OBSERVE_HOOK_TIMING["total_ms"] = 0.0
+    _MPR_OBSERVE_HOOK_TIMING["max_ms"] = 0.0
+
+
+def get_mpr_observe_hook_timing() -> dict[str, float | int]:
+    count = int(_MPR_OBSERVE_HOOK_TIMING["count"])
+    total_ms = float(_MPR_OBSERVE_HOOK_TIMING["total_ms"])
+    max_ms = float(_MPR_OBSERVE_HOOK_TIMING["max_ms"])
+    mean_ms = total_ms / count if count > 0 else 0.0
+    return {
+        "count": count,
+        "total_ms": total_ms,
+        "mean_ms": mean_ms,
+        "max_ms": max_ms,
+    }
+
+
+def _write_mpr_observe_hook_timing_at_exit() -> None:
+    timing = get_mpr_observe_hook_timing()
+    if int(timing["count"]) <= 0:
+        return
+
+    pid = os.getpid()
+    timing = {
+        **timing,
+        "pid": pid,
+    }
+    print(
+        "mpr_observe_hook_worker_summary: "
+        f"pid={pid} count={timing['count']} "
+        f"total_ms={float(timing['total_ms']):.6f} "
+        f"mean_ms={float(timing['mean_ms']):.6f} "
+        f"max_ms={float(timing['max_ms']):.6f}",
+        flush=True,
+    )
+
+    output_path = os.getenv("VLLM_MPR_OBSERVE_TIMING_PATH")
+    if not output_path:
+        return
+
+    path = f"{output_path}.{pid}.json"
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(timing, file, sort_keys=True)
+        file.write("\n")
+
+
+atexit.register(_write_mpr_observe_hook_timing_at_exit)
 
 
 def validate_kv_sharing_target(
@@ -806,14 +867,26 @@ def unified_kv_cache_update(
             kv_cache,
             layer_slot_mapping,
         )
-        _maybe_observe_mpr_kv_write(
-            layer_name,
-            attn_layer,
-            kv_cache,
-            key,
-            value,
-            layer_slot_mapping,
-        )
+        mpr_observe_start = time.perf_counter()
+        try:
+            _maybe_observe_mpr_kv_write(
+                layer_name,
+                attn_layer,
+                kv_cache,
+                key,
+                value,
+                layer_slot_mapping,
+            )
+        finally:
+            mpr_observe_ms = (
+                time.perf_counter() - mpr_observe_start
+            ) * 1000.0
+            _MPR_OBSERVE_HOOK_TIMING["count"] += 1
+            _MPR_OBSERVE_HOOK_TIMING["total_ms"] += mpr_observe_ms
+            _MPR_OBSERVE_HOOK_TIMING["max_ms"] = max(
+                float(_MPR_OBSERVE_HOOK_TIMING["max_ms"]),
+                mpr_observe_ms,
+            )
 
     return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
 

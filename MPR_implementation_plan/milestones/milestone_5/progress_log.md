@@ -221,3 +221,64 @@ Target 1 code map:
 ```text
 MPR_implementation_plan/milestones/milestone_5/reports/step_5_1_target_1_observe_digest_code_map.md
 ```
+
+## 2026-06-10: Step 5.1 Target 1 Observe Hook Attribution Probe
+
+Before changing observe/digest behavior, added temporary timing attribution for
+the `unified_kv_cache_update -> _maybe_observe_mpr_kv_write` hook.
+
+Path check:
+
+```text
+Decode-only exception probes confirmed both baseline and MPR-enable runs enter
+vllm/model_executor/layers/attention/attention.py::unified_kv_cache_update.
+The alternate-attention-backend/fused-path explanation for the missing timing
+counter was rejected for the Qwen3-8B benchmark path used here.
+```
+
+Timing collection note:
+
+```text
+Default V1 multiprocessing does not expose the worker-local module counter to
+the benchmark driver process. In that mode, the runtime summary can still show
+zero mpr_observe_hook_count even though the hook path is executed.
+
+For this attribution probe, rerun baseline and mpr_enable_only with:
+  VLLM_ENABLE_V1_MULTIPROCESSING=0
+so the benchmark process can read the hook counter directly.
+```
+
+Command shape:
+
+```bash
+VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+bash scripts/mpr_run_m5_step51_latency.sh \
+  --python /home/han/anaconda3/envs/20260528_vllm/bin/python \
+  --work-dir /tmp/mpr_observe_inproc_$(date +%Y%m%d_%H%M%S) \
+  --modes baseline,mpr_enable_only \
+  --warmup-runs 1 \
+  --measured-runs 3 \
+  --max-tokens 128
+```
+
+Observed conclusion:
+
+```text
+The in-process attribution run confirmed that the MPR enable-only overhead is
+dominated by the observe KV write hook. This supports making
+RecoverySidecar.observe_kv_write the first optimization target before changing
+scoring, recovery materialization, or precision policy.
+```
+
+Non-in-process reference artifact:
+
+```text
+/tmp/mpr_observe_enable_only_20260610_151730/runtime_summary.csv
+
+baseline decode mean:        17.28 ms
+mpr_enable_only decode mean: 31.10 ms
+increment:                  +13.82 ms
+
+The same artifact has mpr_observe_hook_count=0 because the run used default V1
+multiprocessing and did not recover worker-local timing counters.
+```

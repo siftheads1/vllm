@@ -19,6 +19,7 @@ WORK_DIR=""
 WARMUP_RUNS="1"
 MEASURED_RUNS="5"
 EXTRA_ARGS=()
+MODES="baseline,mpr_enable_only,backup_only,scoring_only,fp16_recovery,mixed_int8,mixed_int4"
 
 usage() {
   cat <<'EOF'
@@ -40,6 +41,8 @@ Options:
   --extra-arg VALUE               Append one argument to mpr_benchmark_step_latency.py.
                                   Repeat for flags and values, e.g.
                                   --extra-arg --trust-remote-code.
+  --modes CSV                     Comma-separated modes to run. Default: all modes.
+                                  Example: baseline,mpr_enable_only
   -h, --help                      Show this help.
 
 The script runs seven modes:
@@ -129,6 +132,11 @@ while [[ $# -gt 0 ]]; do
       EXTRA_ARGS+=("$2")
       shift 2
       ;;
+    --modes)
+      require_value "$1" "${2:-}"
+      MODES="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -211,6 +219,7 @@ write_manifest() {
     echo "seed: $SEED"
     echo "warmup_runs: $WARMUP_RUNS"
     echo "measured_runs: $MEASURED_RUNS"
+    echo "modes: $MODES"
     if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
       printf 'extra_args:'
       printf ' %q' "${EXTRA_ARGS[@]}"
@@ -222,24 +231,17 @@ write_manifest() {
 }
 
 write_runtime_summary() {
-  "$PYTHON_BIN" - "$WORK_DIR" <<'PY'
+  "$PYTHON_BIN" - "$WORK_DIR" "$MODES" <<'PY'
 import ast
 import csv
+import json
 import re
 import statistics
 import sys
 from pathlib import Path
 
 work_dir = Path(sys.argv[1])
-modes = [
-    "baseline",
-    "mpr_enable_only",
-    "backup_only",
-    "scoring_only",
-    "fp16_recovery",
-    "mixed_int8",
-    "mixed_int4",
-]
+modes = [mode for mode in sys.argv[2].split(",") if mode]
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -279,6 +281,42 @@ def parse_boundary_steps(text: str) -> set[int]:
     return {int(item) for item in value}
 
 
+def read_mpr_observe_timing(log_path: Path) -> dict[str, float]:
+    base = log_path.with_suffix(".mpr_observe_timing.json")
+    timing_paths = sorted(log_path.parent.glob(base.name + ".*.json"))
+    count = 0.0
+    total_ms = 0.0
+    max_ms = 0.0
+    for timing_path in timing_paths:
+        try:
+            data = json.loads(timing_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        count += float(data.get("count", 0.0))
+        total_ms += float(data.get("total_ms", 0.0))
+        max_ms = max(max_ms, float(data.get("max_ms", 0.0)))
+    mean_ms = total_ms / count if count > 0.0 else 0.0
+    return {
+        "count": count,
+        "total_ms": total_ms,
+        "mean_ms": mean_ms,
+        "max_ms": max_ms,
+    }
+
+
+def parse_mpr_observe_timing(text: str) -> dict[str, float]:
+    count = parse_float_line(text, "mpr_observe_hook_count") or 0.0
+    total_ms = parse_float_line(text, "mpr_observe_hook_total_ms") or 0.0
+    mean_ms = parse_float_line(text, "mpr_observe_hook_mean_ms") or 0.0
+    max_ms = parse_float_line(text, "mpr_observe_hook_max_ms") or 0.0
+    return {
+        "count": count,
+        "total_ms": total_ms,
+        "mean_ms": mean_ms,
+        "max_ms": max_ms,
+    }
+
+
 rows: list[dict[str, str | int | float | bool]] = []
 for mode in modes:
     logs = sorted(work_dir.glob(f"{mode}_measured_*.log"))
@@ -289,6 +327,11 @@ for mode in modes:
     decode_latencies: list[float] = []
     boundary_decode_latencies: list[float] = []
     non_boundary_decode_latencies: list[float] = []
+    mpr_observe_hook_counts: list[float] = []
+    mpr_observe_hook_total_ms: list[float] = []
+    mpr_observe_hook_mean_ms: list[float] = []
+    mpr_observe_hook_max_ms: list[float] = []
+    mpr_observe_hook_per_decode_step_ms: list[float] = []
     csv_paths: list[str] = []
 
     for log_path in logs:
@@ -299,12 +342,12 @@ for mode in modes:
         tokens_per_sec_value = parse_float_line(text, "generated_tokens_per_sec")
         if tokens_per_sec_value is not None:
             tokens_per_sec.append(tokens_per_sec_value)
-
         boundary_steps = parse_boundary_steps(text)
         csv_path = log_path.with_suffix(".csv")
         if not csv_path.exists():
             continue
         csv_paths.append(str(csv_path))
+        run_decode_count = 0
         with csv_path.open(newline="", encoding="utf-8") as csv_file:
             reader = csv.DictReader(csv_file)
             for row in reader:
@@ -318,10 +361,25 @@ for mode in modes:
                     prefill_latencies.append(latency)
                     continue
                 decode_latencies.append(latency)
+                run_decode_count += 1
                 if step_idx in boundary_steps:
                     boundary_decode_latencies.append(latency)
                 else:
                     non_boundary_decode_latencies.append(latency)
+
+        timing = read_mpr_observe_timing(log_path)
+        if timing["count"] <= 0.0:
+            timing = parse_mpr_observe_timing(text)
+        if timing["count"] > 0.0:
+            mpr_observe_hook_counts.append(timing["count"])
+            mpr_observe_hook_total_ms.append(timing["total_ms"])
+            mpr_observe_hook_mean_ms.append(timing["mean_ms"])
+            mpr_observe_hook_max_ms.append(timing["max_ms"])
+            mpr_observe_hook_per_decode_step_ms.append(
+                timing["total_ms"] / run_decode_count
+                if run_decode_count > 0
+                else 0.0
+            )
 
     step_median = median(step_latencies)
     step_p95 = percentile(step_latencies, 95)
@@ -370,6 +428,16 @@ for mode in modes:
         "non_boundary_decode_step_latency_ms_max": (
             max(non_boundary_decode_latencies)
             if non_boundary_decode_latencies else 0.0
+        ),
+        "mpr_observe_hook_count_mean": mean(mpr_observe_hook_counts),
+        "mpr_observe_hook_count_total": sum(mpr_observe_hook_counts),
+        "mpr_observe_hook_total_ms_mean": mean(mpr_observe_hook_total_ms),
+        "mpr_observe_hook_mean_ms_mean": mean(mpr_observe_hook_mean_ms),
+        "mpr_observe_hook_max_ms_max": (
+            max(mpr_observe_hook_max_ms) if mpr_observe_hook_max_ms else 0.0
+        ),
+        "mpr_observe_hook_total_per_decode_step_ms_mean": (
+            mean(mpr_observe_hook_per_decode_step_ms)
         ),
         "outlier_rerun_recommended": outlier,
         "csv_paths": ";".join(csv_paths),
@@ -428,72 +496,91 @@ run_mode() {
   done
 }
 
+mode_enabled() {
+  local mode="$1"
+  [[ ",$MODES," == *",$mode,"* ]]
+}
+
 write_manifest
 
-run_mode baseline
+if mode_enabled baseline; then
+  run_mode baseline
+fi
 
-run_mode mpr_enable_only \
-  VLLM_MPR_ENABLE=1 \
-  VLLM_MPR_CPU_BACKUP=0 \
-  VLLM_MPR_SCORING_ENABLE=0 \
-  VLLM_MPR_RECOVERY_ENABLE=0
+if mode_enabled mpr_enable_only; then
+  run_mode mpr_enable_only \
+    VLLM_MPR_ENABLE=1 \
+    VLLM_MPR_CPU_BACKUP=0 \
+    VLLM_MPR_SCORING_ENABLE=0 \
+    VLLM_MPR_RECOVERY_ENABLE=0
+fi
 
-run_mode backup_only \
-  VLLM_MPR_ENABLE=1 \
-  VLLM_MPR_CPU_BACKUP=1 \
-  VLLM_MPR_BACKUP_STORAGE_MODE=fp16_only \
-  VLLM_MPR_SCORING_ENABLE=0 \
-  VLLM_MPR_RECOVERY_ENABLE=0
+if mode_enabled backup_only; then
+  run_mode backup_only \
+    VLLM_MPR_ENABLE=1 \
+    VLLM_MPR_CPU_BACKUP=1 \
+    VLLM_MPR_BACKUP_STORAGE_MODE=fp16_only \
+    VLLM_MPR_SCORING_ENABLE=0 \
+    VLLM_MPR_RECOVERY_ENABLE=0
+fi
 
-run_mode scoring_only \
-  VLLM_MPR_ENABLE=1 \
-  VLLM_MPR_CPU_BACKUP=0 \
-  VLLM_MPR_SCORING_ENABLE=1 \
-  VLLM_MPR_RECOVERY_ENABLE=0
+if mode_enabled scoring_only; then
+  run_mode scoring_only \
+    VLLM_MPR_ENABLE=1 \
+    VLLM_MPR_CPU_BACKUP=0 \
+    VLLM_MPR_SCORING_ENABLE=1 \
+    VLLM_MPR_RECOVERY_ENABLE=0
+fi
 
-run_mode fp16_recovery \
-  VLLM_MPR_ENABLE=1 \
-  VLLM_MPR_CPU_BACKUP=1 \
-  VLLM_MPR_BACKUP_STORAGE_MODE=fp16_only \
-  VLLM_MPR_SCORING_ENABLE=1 \
-  VLLM_MPR_RECOVERY_ENABLE=1 \
-  VLLM_MPR_PRECISION_TIERING_ENABLE=0 \
-  VLLM_MPR_RECOVERY_POLICY=threshold_block \
-  VLLM_MPR_RECOVERY_THRESHOLD=-1e30 \
-  VLLM_MPR_RECOVERY_TOPK=1 \
-  VLLM_MPR_RECOVERY_TEST_MUTATE=off
+if mode_enabled fp16_recovery; then
+  run_mode fp16_recovery \
+    VLLM_MPR_ENABLE=1 \
+    VLLM_MPR_CPU_BACKUP=1 \
+    VLLM_MPR_BACKUP_STORAGE_MODE=fp16_only \
+    VLLM_MPR_SCORING_ENABLE=1 \
+    VLLM_MPR_RECOVERY_ENABLE=1 \
+    VLLM_MPR_PRECISION_TIERING_ENABLE=0 \
+    VLLM_MPR_RECOVERY_POLICY=threshold_block \
+    VLLM_MPR_RECOVERY_THRESHOLD=-1e30 \
+    VLLM_MPR_RECOVERY_TOPK=1 \
+    VLLM_MPR_RECOVERY_TEST_MUTATE=off
+fi
 
-run_mode mixed_int8 \
-  VLLM_MPR_ENABLE=1 \
-  VLLM_MPR_CPU_BACKUP=1 \
-  VLLM_MPR_BACKUP_STORAGE_MODE=eager_fp16_int8 \
-  VLLM_MPR_SCORING_ENABLE=1 \
-  VLLM_MPR_RECOVERY_ENABLE=1 \
-  VLLM_MPR_PRECISION_TIERING_ENABLE=1 \
-  VLLM_MPR_PRECISION_POLICY=top_ratio \
-  VLLM_MPR_TIER_FP16_RATIO=0.25 \
-  VLLM_MPR_TIER_INT8_RATIO=0.75 \
-  VLLM_MPR_TIER_INT4_RATIO=0.0 \
-  VLLM_MPR_RECOVERY_POLICY=threshold_block \
-  VLLM_MPR_RECOVERY_THRESHOLD=-1e30 \
-  VLLM_MPR_RECOVERY_TOPK=1 \
-  VLLM_MPR_RECOVERY_TEST_MUTATE=off
+if mode_enabled mixed_int8; then
+  run_mode mixed_int8 \
+    VLLM_MPR_ENABLE=1 \
+    VLLM_MPR_CPU_BACKUP=1 \
+    VLLM_MPR_BACKUP_STORAGE_MODE=eager_fp16_int8 \
+    VLLM_MPR_SCORING_ENABLE=1 \
+    VLLM_MPR_RECOVERY_ENABLE=1 \
+    VLLM_MPR_PRECISION_TIERING_ENABLE=1 \
+    VLLM_MPR_PRECISION_POLICY=top_ratio \
+    VLLM_MPR_TIER_FP16_RATIO=0.25 \
+    VLLM_MPR_TIER_INT8_RATIO=0.75 \
+    VLLM_MPR_TIER_INT4_RATIO=0.0 \
+    VLLM_MPR_RECOVERY_POLICY=threshold_block \
+    VLLM_MPR_RECOVERY_THRESHOLD=-1e30 \
+    VLLM_MPR_RECOVERY_TOPK=1 \
+    VLLM_MPR_RECOVERY_TEST_MUTATE=off
+fi
 
-run_mode mixed_int4 \
-  VLLM_MPR_ENABLE=1 \
-  VLLM_MPR_CPU_BACKUP=1 \
-  VLLM_MPR_BACKUP_STORAGE_MODE=eager_fp16_int8_int4 \
-  VLLM_MPR_SCORING_ENABLE=1 \
-  VLLM_MPR_RECOVERY_ENABLE=1 \
-  VLLM_MPR_PRECISION_TIERING_ENABLE=1 \
-  VLLM_MPR_PRECISION_POLICY=top_ratio \
-  VLLM_MPR_TIER_FP16_RATIO=0.25 \
-  VLLM_MPR_TIER_INT8_RATIO=0.25 \
-  VLLM_MPR_TIER_INT4_RATIO=0.50 \
-  VLLM_MPR_RECOVERY_POLICY=threshold_block \
-  VLLM_MPR_RECOVERY_THRESHOLD=-1e30 \
-  VLLM_MPR_RECOVERY_TOPK=1 \
-  VLLM_MPR_RECOVERY_TEST_MUTATE=off
+if mode_enabled mixed_int4; then
+  run_mode mixed_int4 \
+    VLLM_MPR_ENABLE=1 \
+    VLLM_MPR_CPU_BACKUP=1 \
+    VLLM_MPR_BACKUP_STORAGE_MODE=eager_fp16_int8_int4 \
+    VLLM_MPR_SCORING_ENABLE=1 \
+    VLLM_MPR_RECOVERY_ENABLE=1 \
+    VLLM_MPR_PRECISION_TIERING_ENABLE=1 \
+    VLLM_MPR_PRECISION_POLICY=top_ratio \
+    VLLM_MPR_TIER_FP16_RATIO=0.25 \
+    VLLM_MPR_TIER_INT8_RATIO=0.25 \
+    VLLM_MPR_TIER_INT4_RATIO=0.50 \
+    VLLM_MPR_RECOVERY_POLICY=threshold_block \
+    VLLM_MPR_RECOVERY_THRESHOLD=-1e30 \
+    VLLM_MPR_RECOVERY_TOPK=1 \
+    VLLM_MPR_RECOVERY_TEST_MUTATE=off
+fi
 
 write_runtime_summary
 

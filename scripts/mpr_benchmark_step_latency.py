@@ -108,6 +108,9 @@ def main() -> None:
     args = parse_args()
 
     os.environ.setdefault("VLLM_USE_V1", "1")
+    if args.csv is not None:
+        timing_path = args.csv.with_suffix(".mpr_observe_timing.json")
+        os.environ["VLLM_MPR_OBSERVE_TIMING_PATH"] = str(timing_path)
 
     from vllm import LLM, SamplingParams
 
@@ -134,6 +137,13 @@ def main() -> None:
         trust_remote_code=args.trust_remote_code,
     )
     load_elapsed_sec = time.perf_counter() - load_start
+
+    from vllm.model_executor.layers.attention.attention import (
+        get_mpr_observe_hook_timing,
+        reset_mpr_observe_hook_timing,
+    )
+
+    reset_mpr_observe_hook_timing()
 
     step_rows: list[dict[str, Any]] = []
     original_step = llm.llm_engine.step
@@ -249,6 +259,27 @@ def main() -> None:
         print("non_boundary_decode_step_latency_ms:")
         print(f"  mean: {statistics.mean(non_boundary_latencies):.6f}")
         print(f"  max: {max(non_boundary_latencies):.6f}")
+    mpr_observe_timing = get_mpr_observe_hook_timing()
+    mpr_observe_total_ms = float(mpr_observe_timing["total_ms"])
+    mpr_observe_per_decode_step_ms = (
+        mpr_observe_total_ms / len(decode_latencies)
+        if decode_latencies
+        else 0.0
+    )
+    print(f"mpr_observe_hook_count: {int(mpr_observe_timing['count'])}")
+    print(f"mpr_observe_hook_total_ms: {mpr_observe_total_ms:.6f}")
+    print(
+        "mpr_observe_hook_mean_ms: "
+        f"{float(mpr_observe_timing['mean_ms']):.6f}"
+    )
+    print(
+        "mpr_observe_hook_max_ms: "
+        f"{float(mpr_observe_timing['max_ms']):.6f}"
+    )
+    print(
+        "mpr_observe_hook_total_per_decode_step_ms: "
+        f"{mpr_observe_per_decode_step_ms:.6f}"
+    )
 
     if args.print_steps:
         print(
