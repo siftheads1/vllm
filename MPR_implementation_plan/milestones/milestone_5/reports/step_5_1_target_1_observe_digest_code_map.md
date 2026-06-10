@@ -4,6 +4,16 @@ Target 1 explains the overhead observed in `mpr_enable_only`, where
 `VLLM_MPR_ENABLE=1` but CPU backup, scoring, recovery, and debug JSONL writing
 are disabled.
 
+Current status after the Step 5.2 counter-backend work:
+
+```text
+This report is the initial slot-path code map for Target 1. The later
+counter-based observe path removes the always-paid slot scan / CPU-sync cost
+for the single-request pure-decode non-boundary benchmark shape. The remaining
+Target 1 profiling focus is now block-boundary digest creation and any fallback
+from the counter path to the slot path.
+```
+
 Measured evidence from the first runtime summary:
 
 ```text
@@ -277,3 +287,37 @@ replace ArkVale digest with cheaper raw_minmax for measurement modes
 
 These candidates need explicit design confirmation before implementation
 because they may affect scoring/recovery availability and correctness timing.
+
+## Current Boundary Profiling Focus
+
+After the counter-backend implementation, the next profiling pass should focus
+on boundary-only work instead of the full slot observe path.
+
+Enable the targeted probes with:
+
+```text
+VLLM_MPR_BOUNDARY_PROFILE=1
+```
+
+Suggested counter-boundary probes:
+
+```text
+prepare_counter_kv_write total
+observe_kv_write_by_counter total
+counter block-table lookup / block-id extraction
+_create_digest_for_full_block total
+_key_cache_for_digest total
+summarize_key_block total
+_to_block_digest total
+_append_quest_metadata_digest total
+_maybe_backup_kv_block total / early return
+counter debug record path, only when logging is enabled
+```
+
+The profiling result should separate:
+
+```text
+non-boundary steady-state counter overhead
+boundary digest creation overhead
+fallback-to-slot overhead, if any
+```

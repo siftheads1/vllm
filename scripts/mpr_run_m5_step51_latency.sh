@@ -21,6 +21,7 @@ MEASURED_RUNS="5"
 EXTRA_ARGS=()
 MODES="baseline,mpr_enable_only,backup_only,scoring_only,fp16_recovery,mixed_int8,mixed_int4"
 OBSERVE_BACKEND="slot"
+BOUNDARY_PROFILE="0"
 
 usage() {
   cat <<'EOF'
@@ -45,6 +46,7 @@ Options:
   --modes CSV                     Comma-separated modes to run. Default: all modes.
                                   Example: baseline,mpr_enable_only
   --observe-backend NAME          MPR KV observe backend: slot or counter. Default: slot.
+  --boundary-profile              Enable targeted MPR boundary-step profiling counters.
   -h, --help                      Show this help.
 
 The script runs seven modes:
@@ -144,6 +146,10 @@ while [[ $# -gt 0 ]]; do
       OBSERVE_BACKEND="$2"
       shift 2
       ;;
+    --boundary-profile)
+      BOUNDARY_PROFILE="1"
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -200,6 +206,7 @@ BASE_ENV=(
   -u VLLM_MPR_RECOVERY_TEST_MODE
   -u VLLM_MPR_ENABLE_LOGGING
   -u VLLM_MPR_OBSERVE_BACKEND
+  -u VLLM_MPR_BOUNDARY_PROFILE
   -u VLLM_MPR_DEBUG_DIR
   VLLM_USE_V1=1
 )
@@ -234,6 +241,7 @@ write_manifest() {
     echo "measured_runs: $MEASURED_RUNS"
     echo "modes: $MODES"
     echo "observe_backend: $OBSERVE_BACKEND"
+    echo "boundary_profile: $BOUNDARY_PROFILE"
     if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
       printf 'extra_args:'
       printf ' %q' "${EXTRA_ARGS[@]}"
@@ -350,6 +358,18 @@ COUNTER_OBSERVE_KEYS = [
     "counter_observe_digest_created",
 ]
 
+BOUNDARY_PROFILE_TIMING_KEYS = [
+    "counter_prepare",
+    "counter_observe",
+    "counter_key_cache",
+    "counter_block_lookup",
+    "counter_create_digest",
+    "counter_summarize_key_block",
+    "counter_to_block_digest",
+    "counter_append_quest_metadata",
+    "counter_backup",
+]
+
 
 rows: list[dict[str, str | int | float | bool]] = []
 for mode in modes:
@@ -372,6 +392,11 @@ for mode in modes:
     mpr_observe_block_offsets_per_decode_step_ms: list[float] = []
     mpr_counter_observe_values = {
         key: [] for key in COUNTER_OBSERVE_KEYS
+    }
+    mpr_boundary_profile_values = {
+        f"{key}_{field}": []
+        for key in BOUNDARY_PROFILE_TIMING_KEYS
+        for field in ("count", "total_ms", "mean_ms", "max_ms")
     }
     csv_paths: list[str] = []
 
@@ -453,6 +478,14 @@ for mode in modes:
             value = parse_float_line(text, f"mpr_{key}")
             if value is not None:
                 mpr_counter_observe_values[key].append(value)
+        for key in BOUNDARY_PROFILE_TIMING_KEYS:
+            for field in ("count", "total_ms", "mean_ms", "max_ms"):
+                value = parse_float_line(
+                    text,
+                    f"mpr_boundary_profile_{key}_{field}",
+                )
+                if value is not None:
+                    mpr_boundary_profile_values[f"{key}_{field}"].append(value)
 
     step_median = median(step_latencies)
     step_p95 = percentile(step_latencies, 95)
@@ -548,6 +581,11 @@ for mode in modes:
     }
     for key in COUNTER_OBSERVE_KEYS:
         row[f"mpr_{key}_mean"] = mean(mpr_counter_observe_values[key])
+    for key in BOUNDARY_PROFILE_TIMING_KEYS:
+        for field in ("count", "total_ms", "mean_ms", "max_ms"):
+            row[f"mpr_boundary_profile_{key}_{field}_mean"] = mean(
+                mpr_boundary_profile_values[f"{key}_{field}"]
+            )
     rows.append(row)
 
 summary_path = work_dir / "runtime_summary.csv"
@@ -582,8 +620,12 @@ run_one() {
   local idx="$3"
   shift 3
   local prefix="$WORK_DIR/${mode}_${phase}_${idx}"
+  local profile_env=()
+  if [[ "$BOUNDARY_PROFILE" == "1" ]]; then
+    profile_env=(VLLM_MPR_BOUNDARY_PROFILE=1)
+  fi
   echo "running ${mode} ${phase} ${idx}"
-  "${BASE_ENV[@]}" "$@" \
+  "${BASE_ENV[@]}" "${profile_env[@]}" "$@" \
     "$PYTHON_BIN" scripts/mpr_benchmark_step_latency.py \
       "${COMMON_ARGS[@]}" \
       "${EXTRA_ARGS[@]}" \

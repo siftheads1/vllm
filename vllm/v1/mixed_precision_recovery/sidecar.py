@@ -54,6 +54,18 @@ from vllm.v1.mixed_precision_recovery.scoring import (
 
 logger = init_logger(__name__)
 
+_BOUNDARY_PROFILE_TIMING_NAMES = (
+    "counter_prepare",
+    "counter_observe",
+    "counter_key_cache",
+    "counter_block_lookup",
+    "counter_create_digest",
+    "counter_summarize_key_block",
+    "counter_to_block_digest",
+    "counter_append_quest_metadata",
+    "counter_backup",
+)
+
 
 @dataclass
 class BlockDigest:
@@ -163,6 +175,11 @@ class RecoverySidecar:
             "observe_block_offsets_count": 0.0,
             "observe_block_offsets_total_ms": 0.0,
             "observe_block_offsets_max_ms": 0.0,
+            **{
+                f"{name}_{suffix}": 0.0
+                for name in _BOUNDARY_PROFILE_TIMING_NAMES
+                for suffix in ("count", "total_ms", "max_ms")
+            },
         }
     )
     _counter_leader_layer_name: str | None = None
@@ -232,7 +249,36 @@ class RecoverySidecar:
             "observe_block_offsets_max_ms": timing[
                 "observe_block_offsets_max_ms"
             ],
+            **self._boundary_profile_timing_snapshot(),
         }
+
+    def _boundary_profile_timing_snapshot(self) -> dict[str, float | int]:
+        timing = self._observe_kv_write_timing
+        result: dict[str, float | int] = {}
+        for name in _BOUNDARY_PROFILE_TIMING_NAMES:
+            count = int(timing.get(f"{name}_count", 0.0))
+            total_ms = timing.get(f"{name}_total_ms", 0.0)
+            result[f"{name}_count"] = count
+            result[f"{name}_total_ms"] = total_ms
+            result[f"{name}_mean_ms"] = total_ms / count if count > 0 else 0.0
+            result[f"{name}_max_ms"] = timing.get(f"{name}_max_ms", 0.0)
+        return result
+
+    def _record_boundary_profile_timing(
+        self,
+        name: str,
+        start: float,
+    ) -> None:
+        if not self.config.boundary_profile_enabled:
+            return
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        timing = self._observe_kv_write_timing
+        count_key = f"{name}_count"
+        total_key = f"{name}_total_ms"
+        max_key = f"{name}_max_ms"
+        timing[count_key] = timing.get(count_key, 0.0) + 1.0
+        timing[total_key] = timing.get(total_key, 0.0) + elapsed_ms
+        timing[max_key] = max(timing.get(max_key, 0.0), elapsed_ms)
 
     def release_blocks(
         self,
@@ -524,49 +570,65 @@ class RecoverySidecar:
         consume the leader's latest snapshot so boundary detection is shared
         while digest creation remains layer-local.
         """
-        self.counters["counter_observe_candidate_count"] += 1
-        if attn_metadata is None:
-            self.counters["counter_observe_missing_attn_metadata"] += 1
-            return False, None
-        if self._counter_block_table(attn_metadata) is None:
-            self.counters["counter_observe_missing_block_table"] += 1
-            return False, None
-        query_len = self._counter_single_request_query_len(attn_metadata)
-        if query_len is None:
-            self.counters["counter_observe_unsupported_num_reqs"] += 1
-            self._counter_seq_lens_initialized = False
-            self._counter_seq_lens_by_row = []
-            return False, None
+        profile_enabled = self.config.boundary_profile_enabled
+        profile_start = time.perf_counter() if profile_enabled else 0.0
         try:
-            if query_len <= 0:
+            self.counters["counter_observe_candidate_count"] += 1
+            if attn_metadata is None:
+                self.counters["counter_observe_missing_attn_metadata"] += 1
+                return False, None
+            block_table_start = time.perf_counter() if profile_enabled else 0.0
+            has_block_table = self._counter_block_table(attn_metadata) is not None
+            if profile_enabled:
+                self._record_boundary_profile_timing(
+                    "counter_block_lookup",
+                    block_table_start,
+                )
+            if not has_block_table:
+                self.counters["counter_observe_missing_block_table"] += 1
+                return False, None
+            query_len = self._counter_single_request_query_len(attn_metadata)
+            if query_len is None:
+                self.counters["counter_observe_unsupported_num_reqs"] += 1
+                self._counter_seq_lens_initialized = False
+                self._counter_seq_lens_by_row = []
+                return False, None
+            try:
+                if query_len <= 0:
+                    self.counters["counter_observe_bad_query_len"] += 1
+                    return False, None
+                if self._counter_leader_layer_name is None:
+                    self._counter_leader_layer_name = layer_name
+                    self.counters["counter_observe_leader_selected"] += 1
+                if layer_name == self._counter_leader_layer_name:
+                    if query_len == 1:
+                        if not self._counter_seq_lens_initialized:
+                            self.counters["counter_observe_uninitialized"] += 1
+                            return False, None
+                        self._counter_seq_lens_by_row[0] += 1
+                        self.counters["counter_observe_decode_advanced"] += 1
+                    else:
+                        self._counter_seq_lens_by_row = [query_len]
+                        self._counter_seq_lens_initialized = True
+                        self.counters["counter_observe_prefill_initialized"] += 1
+                if not self._counter_seq_lens_initialized:
+                    self.counters["counter_observe_uninitialized"] += 1
+                    return False, None
+                seq_lens = list(self._counter_seq_lens_by_row)
+                if query_len != 1:
+                    self.counters["counter_observe_not_pure_decode"] += 1
+                    return False, seq_lens
+                self.counters["counter_observe_accepted"] += 1
+                return True, seq_lens
+            except (AttributeError, RuntimeError, TypeError, ValueError):
                 self.counters["counter_observe_bad_query_len"] += 1
                 return False, None
-            if self._counter_leader_layer_name is None:
-                self._counter_leader_layer_name = layer_name
-                self.counters["counter_observe_leader_selected"] += 1
-            if layer_name == self._counter_leader_layer_name:
-                if query_len == 1:
-                    if not self._counter_seq_lens_initialized:
-                        self.counters["counter_observe_uninitialized"] += 1
-                        return False, None
-                    self._counter_seq_lens_by_row[0] += 1
-                    self.counters["counter_observe_decode_advanced"] += 1
-                else:
-                    self._counter_seq_lens_by_row = [query_len]
-                    self._counter_seq_lens_initialized = True
-                    self.counters["counter_observe_prefill_initialized"] += 1
-            if not self._counter_seq_lens_initialized:
-                self.counters["counter_observe_uninitialized"] += 1
-                return False, None
-            seq_lens = list(self._counter_seq_lens_by_row)
-            if query_len != 1:
-                self.counters["counter_observe_not_pure_decode"] += 1
-                return False, seq_lens
-            self.counters["counter_observe_accepted"] += 1
-            return True, seq_lens
-        except (AttributeError, RuntimeError, TypeError, ValueError):
-            self.counters["counter_observe_bad_query_len"] += 1
-            return False, None
+        finally:
+            if profile_enabled:
+                self._record_boundary_profile_timing(
+                    "counter_prepare",
+                    profile_start,
+                )
 
     def observe_kv_write_by_counter(
         self,
@@ -585,6 +647,8 @@ class RecoverySidecar:
         """
         if not self.config.enabled:
             return []
+        profile_enabled = self.config.boundary_profile_enabled
+        profile_start = time.perf_counter() if profile_enabled else 0.0
         self.counters["counter_observe_used"] += 1
         should_record = False
         layer_event_idx = None
@@ -601,14 +665,31 @@ class RecoverySidecar:
         if kv_cache is None:
             raise ValueError(f"MPR requires kv_cache for digesting {layer_name}.")
 
+        key_cache_start = time.perf_counter() if profile_enabled else 0.0
         key_cache = self._key_cache_for_digest(
             layer_name=layer_name,
             kv_cache=kv_cache,
             block_size=block_size,
         )
+        if profile_enabled:
+            self._record_boundary_profile_timing(
+                "counter_key_cache",
+                key_cache_start,
+            )
+        block_table_start = time.perf_counter() if profile_enabled else 0.0
         block_table = self._counter_block_table(attn_metadata)
+        if profile_enabled:
+            self._record_boundary_profile_timing(
+                "counter_block_lookup",
+                block_table_start,
+            )
         if seq_lens is None or block_table is None:
             self.counters["counter_observe_fallback_required"] += 1
+            if profile_enabled:
+                self._record_boundary_profile_timing(
+                    "counter_observe",
+                    profile_start,
+                )
             return []
 
         created_block_ids: list[int] = []
@@ -617,15 +698,22 @@ class RecoverySidecar:
             if seq_len <= 0 or seq_len % block_size != 0:
                 continue
             logical_block_idx = seq_len // block_size - 1
+            block_lookup_start = time.perf_counter() if profile_enabled else 0.0
             block_id = self._counter_block_id(
                 block_table=block_table,
                 req_idx=req_idx,
                 logical_block_idx=logical_block_idx,
             )
+            if profile_enabled:
+                self._record_boundary_profile_timing(
+                    "counter_block_lookup",
+                    block_lookup_start,
+                )
             if block_id is None:
                 continue
             boundary_request_indices.append(req_idx)
             self.counters["counter_observe_boundary_requests"] += 1
+            digest_start = time.perf_counter() if profile_enabled else 0.0
             if self._create_digest_for_full_block(
                 layer_name=layer_name,
                 block_id=block_id,
@@ -636,6 +724,11 @@ class RecoverySidecar:
             ):
                 created_block_ids.append(block_id)
                 self.counters["counter_observe_digest_created"] += 1
+            if profile_enabled:
+                self._record_boundary_profile_timing(
+                    "counter_create_digest",
+                    digest_start,
+                )
         if not boundary_request_indices:
             self.counters["counter_observe_no_boundary"] += 1
 
@@ -657,6 +750,11 @@ class RecoverySidecar:
                 ),
                 total_digest_blocks=self._num_digest_blocks(),
                 digest_kind=self.config.digest_kind,
+            )
+        if profile_enabled:
+            self._record_boundary_profile_timing(
+                "counter_observe",
+                profile_start,
             )
         return created_block_ids
 
@@ -1762,25 +1860,50 @@ class RecoverySidecar:
         if block_id in layer_digests:
             return False
 
+        profile_enabled = self.config.boundary_profile_enabled
+        summarize_start = time.perf_counter() if profile_enabled else 0.0
         digest = summarize_key_block(
             key_cache[block_id],
             digest_kind=self.config.digest_kind,
         )
+        if profile_enabled:
+            self._record_boundary_profile_timing(
+                "counter_summarize_key_block",
+                summarize_start,
+            )
+        to_digest_start = time.perf_counter() if profile_enabled else 0.0
         layer_digests[block_id] = self._to_block_digest(
             digest,
             layer_event_idx,
         )
+        if profile_enabled:
+            self._record_boundary_profile_timing(
+                "counter_to_block_digest",
+                to_digest_start,
+            )
+        quest_metadata_start = time.perf_counter() if profile_enabled else 0.0
         self._append_quest_metadata_digest(
             layer_name=layer_name,
             block_id=block_id,
             digest=digest,
         )
+        if profile_enabled:
+            self._record_boundary_profile_timing(
+                "counter_append_quest_metadata",
+                quest_metadata_start,
+            )
+        backup_start = time.perf_counter() if profile_enabled else 0.0
         self._maybe_backup_kv_block(
             layer_name=layer_name,
             block_id=block_id,
             kv_block=kv_cache[:, block_id],
             layer_event_idx=layer_event_idx,
         )
+        if profile_enabled:
+            self._record_boundary_profile_timing(
+                "counter_backup",
+                backup_start,
+            )
         if layer_name in self._layer_indices:
             self._record(
                 "digest_created",
@@ -2189,7 +2312,7 @@ def get_mpr_sidecar() -> RecoverySidecar:
 
 def get_mpr_observe_kv_write_timing() -> dict[str, float | int]:
     if _GLOBAL_SIDECAR is None:
-        return {
+        result: dict[str, float | int] = {
             "count": 0,
             "pre_observe_block_offsets_total_ms": 0.0,
             "pre_observe_block_offsets_mean_ms": 0.0,
@@ -2199,6 +2322,12 @@ def get_mpr_observe_kv_write_timing() -> dict[str, float | int]:
             "observe_block_offsets_mean_ms": 0.0,
             "observe_block_offsets_max_ms": 0.0,
         }
+        for name in _BOUNDARY_PROFILE_TIMING_NAMES:
+            result[f"{name}_count"] = 0
+            result[f"{name}_total_ms"] = 0.0
+            result[f"{name}_mean_ms"] = 0.0
+            result[f"{name}_max_ms"] = 0.0
+        return result
     return _GLOBAL_SIDECAR.observe_kv_write_timing()
 
 

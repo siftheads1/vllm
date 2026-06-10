@@ -338,6 +338,33 @@ def main() -> None:
         "mpr_observe_block_offsets_total_per_decode_step_ms: "
         f"{(mpr_offsets_total_ms / len(decode_latencies)) if decode_latencies else 0.0:.6f}"
     )
+    for key in (
+        "counter_prepare",
+        "counter_observe",
+        "counter_key_cache",
+        "counter_block_lookup",
+        "counter_create_digest",
+        "counter_summarize_key_block",
+        "counter_to_block_digest",
+        "counter_append_quest_metadata",
+        "counter_backup",
+    ):
+        print(
+            f"mpr_boundary_profile_{key}_count: "
+            f"{int(mpr_kv_timing[f'{key}_count'])}"
+        )
+        print(
+            f"mpr_boundary_profile_{key}_total_ms: "
+            f"{float(mpr_kv_timing[f'{key}_total_ms']):.6f}"
+        )
+        print(
+            f"mpr_boundary_profile_{key}_mean_ms: "
+            f"{float(mpr_kv_timing[f'{key}_mean_ms']):.6f}"
+        )
+        print(
+            f"mpr_boundary_profile_{key}_max_ms: "
+            f"{float(mpr_kv_timing[f'{key}_max_ms']):.6f}"
+        )
     mpr_stats = get_mpr_sidecar().snapshot_stats()
     for key in (
         "counter_observe_candidate_count",

@@ -68,6 +68,7 @@ class MPRConfig:
     enabled: bool = False
     enable_logging: bool = False
     observe_backend: str = "slot"
+    boundary_profile_enabled: bool = False
     debug_dir: str | None = None
     topk: int = 8
     max_layers: int | None = None
@@ -162,6 +163,10 @@ class MPRConfig:
                 "VLLM_MPR_OBSERVE_BACKEND",
                 "slot",
                 {"slot", "counter"},
+            ),
+            boundary_profile_enabled=_parse_bool(
+                "VLLM_MPR_BOUNDARY_PROFILE",
+                False,
             ),
             debug_dir=os.getenv("VLLM_MPR_DEBUG_DIR") or None,
             topk=_parse_int("VLLM_MPR_TOPK", 8, 1),

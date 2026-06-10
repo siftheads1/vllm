@@ -398,7 +398,7 @@ Added an experimental `VLLM_MPR_OBSERVE_BACKEND=counter` path for
 `mpr_enable_only`-style overhead isolation. The default remains
 `VLLM_MPR_OBSERVE_BACKEND=slot`.
 
-Implementation notes:
+Initial implementation notes:
 
 ```text
 counter backend:
@@ -725,8 +725,9 @@ all layers:
 
 The obsolete CPU-seq-lens probe path (`can_observe_kv_write_by_counter` and
 `_counter_seq_lens_cpu`) was removed after switching to the sidecar-owned shared
-counter. The counter backend still reads attention metadata for
-`query_start_loc_cpu` and block table lookup only.
+counter. The counter backend now reads attention metadata fields
+`num_actual_tokens` and `max_query_len` for the single-request query-length
+check, plus the request block table for boundary block-id lookup.
 
 The implementation remains intentionally narrow for the first overhead test:
 only single-request rows use the counter backend; multi-request/mixed cases fall
@@ -764,4 +765,145 @@ test_digest.py: 7 passed
 test_scoring.py: 48 passed, 2 skipped
 test_recovery.py + test_debug_jsonl_validator.py: 60 passed
 git diff --check: passed
+```
+
+## 2026-06-10: Current Target 1 Status and Next Boundary Profiling Gate
+
+Current working conclusion:
+
+```text
+The counter observe backend resolves the MPR enable-only steady-state overhead
+for the single-request pure-decode non-boundary path. In that path,
+non-boundary decode latency is now close to baseline, so the always-paid slot
+scan / CPU-sync observe cost is no longer the primary Target 1 bottleneck.
+```
+
+Scope of this conclusion:
+
+```text
+resolved:
+  MPR enable-only non-boundary observe bookkeeping overhead on the counter path
+
+still in scope:
+  block-boundary decode spikes caused by digest creation
+  any fallback from counter observe to the slot backend
+  multi-request / mixed-batch / broader serving cases not covered by the narrow
+    single-request pure-decode counter path
+```
+
+Target 1 should therefore be treated as narrowed rather than fully closed:
+
+```text
+MPR enable-only steady-state overhead: resolved for the current counter-backend
+  benchmark shape
+Remaining Target 1 cost: boundary-step digest creation and fallback coverage
+```
+
+Next profiling gate:
+
+```text
+Profile block-boundary decode steps under --observe-backend counter.
+
+Primary questions:
+  1. How much of the boundary spike is digest creation itself?
+  2. How much is block-table lookup / counter bookkeeping?
+  3. How much is optional Quest metadata append or backup hook early-return work?
+  4. Are boundary spikes proportional to number of layers / created digests?
+  5. Does any unexpected slot fallback remain in the measurement run?
+```
+
+Suggested boundary profiling probes:
+
+```text
+observe_kv_write_by_counter total
+prepare_counter_kv_write total
+counter block-table lookup / block-id extraction
+_create_digest_for_full_block total
+_key_cache_for_digest total
+summarize_key_block total
+_to_block_digest total
+_append_quest_metadata_digest total
+_maybe_backup_kv_block total / early return
+counter debug record path, only when logging is enabled
+```
+
+Instrumentation rule:
+
+```text
+Keep boundary profiling explicitly gated so the measurement machinery does not
+become another always-on hot-path cost. Do not change precision policy,
+recovery policy, or digest semantics while profiling this boundary cost.
+```
+
+## 2026-06-10: Boundary Profiling Instrumentation
+
+Added targeted boundary-step profiling behind:
+
+```text
+VLLM_MPR_BOUNDARY_PROFILE=1
+```
+
+Runner support:
+
+```bash
+bash scripts/mpr_run_m5_step51_latency.sh \
+  --modes baseline,mpr_enable_only \
+  --observe-backend counter \
+  --boundary-profile
+```
+
+The profiling flag is disabled by default. When enabled, the benchmark prints
+and the step-51 runner summarizes:
+
+```text
+mpr_boundary_profile_counter_prepare_*
+mpr_boundary_profile_counter_observe_*
+mpr_boundary_profile_counter_key_cache_*
+mpr_boundary_profile_counter_block_lookup_*
+mpr_boundary_profile_counter_create_digest_*
+mpr_boundary_profile_counter_summarize_key_block_*
+mpr_boundary_profile_counter_to_block_digest_*
+mpr_boundary_profile_counter_append_quest_metadata_*
+mpr_boundary_profile_counter_backup_*
+```
+
+Each probe reports:
+
+```text
+count
+total_ms
+mean_ms
+max_ms
+```
+
+Validation in the local Windows workspace:
+
+```bash
+python -m py_compile \
+  vllm/v1/mixed_precision_recovery/config.py \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  vllm/envs.py \
+  scripts/mpr_benchmark_step_latency.py
+
+git -c safe.directory=C:/Lab/mixed_precision_recovery_vllm/vllm diff --check
+```
+
+Result:
+
+```text
+py_compile: passed
+git diff --check: passed
+```
+
+Not run in this local workspace:
+
+```text
+bash -n scripts/mpr_run_m5_step51_latency.sh:
+  blocked because bash.exe failed to launch in this Windows session
+
+pytest:
+  blocked because the local Python environment has no pytest module
+
+runtime import smoke:
+  blocked because the local Python environment has no torch module
 ```
