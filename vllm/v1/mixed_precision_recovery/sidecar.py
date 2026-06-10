@@ -1425,53 +1425,59 @@ class RecoverySidecar:
             elif quest_packed_fallback_reason is None:
                 quest_packed_fallback_reason = "fallback_after_fast_path_miss"
 
-        score_packing_debug_start = (
-            time.perf_counter() if profile_enabled else 0.0
-        )
-        score_packing_debug = self._score_packing_debug_fields(
-            quest_packed_fast_path=quest_packed_fast_path,
-            quest_packed_fallback_reason=quest_packed_fallback_reason,
-        )
-        if profile_enabled:
-            self._record_scoring_profile_timing(
-                "scoring_score_packing_debug",
-                score_packing_debug_start,
-            )
         scores = score_result.block_scores
         topk = min(self.config.topk, int(scores.numel()))
-        block_topk_start = time.perf_counter() if profile_enabled else 0.0
-        topk_block_ids, topk_score_values = self._topk_block_scores(
-            scores=scores,
-            physical_block_ids=physical_block_ids,
-            topk=topk,
-        )
-        if profile_enabled:
-            self._record_scoring_profile_timing(
-                "scoring_block_topk",
-                block_topk_start,
+        debug_record_enabled = self.config.enable_logging and bool(should_record)
+        score_packing_debug: dict[str, Any] = {}
+        topk_block_ids: list[int] = []
+        topk_score_values: list[float] = []
+        head_debug: dict[str, Any] = {}
+        score_block_debug: dict[str, Any] = {}
+        if debug_record_enabled:
+            score_packing_debug_start = (
+                time.perf_counter() if profile_enabled else 0.0
             )
-        head_topk_start = time.perf_counter() if profile_enabled else 0.0
-        head_debug = self._head_score_debug_fields(
-            score_result=score_result,
-            physical_block_ids=physical_block_ids,
-            topk=topk,
-        )
-        if profile_enabled:
-            self._record_scoring_profile_timing(
-                "scoring_head_topk_debug",
-                head_topk_start,
+            score_packing_debug = self._score_packing_debug_fields(
+                quest_packed_fast_path=quest_packed_fast_path,
+                quest_packed_fallback_reason=quest_packed_fallback_reason,
             )
-
-        block_debug_start = time.perf_counter() if profile_enabled else 0.0
-        score_block_debug = self._score_block_debug_fields(
-            request_context=request_context,
-            observed_digest_block_ids=physical_block_ids,
-        )
-        if profile_enabled:
-            self._record_scoring_profile_timing(
-                "scoring_block_debug_fields",
-                block_debug_start,
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_score_packing_debug",
+                    score_packing_debug_start,
+                )
+            block_topk_start = time.perf_counter() if profile_enabled else 0.0
+            topk_block_ids, topk_score_values = self._topk_block_scores(
+                scores=scores,
+                physical_block_ids=physical_block_ids,
+                topk=topk,
             )
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_block_topk",
+                    block_topk_start,
+                )
+            head_topk_start = time.perf_counter() if profile_enabled else 0.0
+            head_debug = self._head_score_debug_fields(
+                score_result=score_result,
+                physical_block_ids=physical_block_ids,
+                topk=topk,
+            )
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_head_topk_debug",
+                    head_topk_start,
+                )
+            block_debug_start = time.perf_counter() if profile_enabled else 0.0
+            score_block_debug = self._score_block_debug_fields(
+                request_context=request_context,
+                observed_digest_block_ids=physical_block_ids,
+            )
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_block_debug_fields",
+                    block_debug_start,
+                )
 
         context_start = time.perf_counter() if profile_enabled else 0.0
         score_context = QueryScoreContext(
@@ -1501,6 +1507,9 @@ class RecoverySidecar:
     def _record_score_estimated(self, score_context: QueryScoreContext) -> None:
         """Record a score_estimated event from reusable score context."""
         if not score_context.should_record:
+            return
+        if not self.config.enable_logging:
+            self.counters["score_estimated"] += 1
             return
         score_result = score_context.score_result
         self._record(

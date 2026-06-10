@@ -895,6 +895,38 @@ py_compile: passed
 git diff --check: passed
 ```
 
+## 2026-06-11: Gate Scoring Debug Work on Logging
+
+Remote scoring-profile results indicated that `scoring_estimate_query_scores`
+was dominated by debug/top-k work, especially `scoring_head_topk_debug`, while
+the actual scorer/kernel cost was not the obvious end-to-end latency driver.
+
+Change:
+
+```text
+Gate score debug field construction on:
+  self.config.enable_logging and should_record
+
+When logging is disabled, _estimate_query_scores now skips:
+  _score_packing_debug_fields
+  _topk_block_scores
+  _head_score_debug_fields
+  _score_block_debug_fields
+
+_record_score_estimated also avoids JSONL field construction when logging is
+disabled, while preserving the score_estimated event counter.
+```
+
+Preserved behavior:
+
+```text
+score_result.block_scores and physical_block_ids remain available for recovery
+and precision tier assignment.
+
+When VLLM_MPR_ENABLE_LOGGING=1 and the layer/step passes dump limits, the same
+debug fields are still generated for JSONL validation.
+```
+
 Not run in this local workspace:
 
 ```text
