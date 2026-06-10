@@ -907,3 +907,72 @@ pytest:
 runtime import smoke:
   blocked because the local Python environment has no torch module
 ```
+
+## 2026-06-11: Scoring Path Profiling Instrumentation
+
+Added targeted scoring-path wall-time profiling behind:
+
+```text
+VLLM_MPR_SCORING_PROFILE=1
+```
+
+Runner support:
+
+```bash
+VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+bash scripts/mpr_run_m5_step51_latency.sh \
+  --modes baseline,scoring_only \
+  --observe-backend counter \
+  --scoring-profile
+```
+
+The profiling flag is disabled by default. When enabled, the benchmark prints
+and the step-51 runner summarizes:
+
+```text
+mpr_scoring_profile_scoring_estimate_query_scores_*
+mpr_scoring_profile_scoring_record_estimated_*
+mpr_scoring_profile_scoring_should_record_*
+mpr_scoring_profile_scoring_query_clone_*
+mpr_scoring_profile_scoring_window_stack_mean_*
+mpr_scoring_profile_scoring_block_size_*
+mpr_scoring_profile_scoring_request_block_context_*
+mpr_scoring_profile_scoring_select_digest_blocks_*
+mpr_scoring_profile_scoring_quest_packed_prefix_*
+mpr_scoring_profile_scoring_quest_packed_estimate_*
+mpr_scoring_profile_scoring_pack_layer_digests_*
+mpr_scoring_profile_scoring_backend_estimate_*
+mpr_scoring_profile_scoring_score_packing_debug_*
+mpr_scoring_profile_scoring_block_topk_*
+mpr_scoring_profile_scoring_head_topk_debug_*
+mpr_scoring_profile_scoring_block_debug_fields_*
+mpr_scoring_profile_scoring_context_build_*
+```
+
+Primary attribution questions:
+
+```text
+Does scoring_only overhead come from the scorer backend itself, or from
+query-window maintenance, request/block CPU metadata conversion, digest packing,
+or debug top-k CPU conversions?
+```
+
+Validation in the local Windows workspace:
+
+```bash
+python -m py_compile \
+  vllm/v1/mixed_precision_recovery/config.py \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  vllm/v1/mixed_precision_recovery/__init__.py \
+  vllm/envs.py \
+  scripts/mpr_benchmark_step_latency.py
+
+git -c safe.directory=C:/Lab/mixed_precision_recovery_vllm/vllm diff --check
+```
+
+Result:
+
+```text
+py_compile: passed
+git diff --check: passed
+```

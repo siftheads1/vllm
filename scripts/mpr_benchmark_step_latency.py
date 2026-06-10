@@ -144,12 +144,15 @@ def main() -> None:
     )
     from vllm.v1.mixed_precision_recovery import (
         get_mpr_observe_kv_write_timing,
+        get_mpr_scoring_profile_timing,
         get_mpr_sidecar,
         reset_mpr_observe_kv_write_timing,
+        reset_mpr_scoring_profile_timing,
     )
 
     reset_mpr_observe_hook_timing()
     reset_mpr_observe_kv_write_timing()
+    reset_mpr_scoring_profile_timing()
 
     step_rows: list[dict[str, Any]] = []
     original_step = llm.llm_engine.step
@@ -364,6 +367,42 @@ def main() -> None:
         print(
             f"mpr_boundary_profile_{key}_max_ms: "
             f"{float(mpr_kv_timing[f'{key}_max_ms']):.6f}"
+        )
+    mpr_scoring_timing = get_mpr_scoring_profile_timing()
+    for key in (
+        "scoring_estimate_query_scores",
+        "scoring_record_estimated",
+        "scoring_should_record",
+        "scoring_query_clone",
+        "scoring_window_stack_mean",
+        "scoring_block_size",
+        "scoring_request_block_context",
+        "scoring_select_digest_blocks",
+        "scoring_quest_packed_prefix",
+        "scoring_quest_packed_estimate",
+        "scoring_pack_layer_digests",
+        "scoring_backend_estimate",
+        "scoring_score_packing_debug",
+        "scoring_block_topk",
+        "scoring_head_topk_debug",
+        "scoring_block_debug_fields",
+        "scoring_context_build",
+    ):
+        print(
+            f"mpr_scoring_profile_{key}_count: "
+            f"{int(mpr_scoring_timing[f'{key}_count'])}"
+        )
+        print(
+            f"mpr_scoring_profile_{key}_total_ms: "
+            f"{float(mpr_scoring_timing[f'{key}_total_ms']):.6f}"
+        )
+        print(
+            f"mpr_scoring_profile_{key}_mean_ms: "
+            f"{float(mpr_scoring_timing[f'{key}_mean_ms']):.6f}"
+        )
+        print(
+            f"mpr_scoring_profile_{key}_max_ms: "
+            f"{float(mpr_scoring_timing[f'{key}_max_ms']):.6f}"
         )
     mpr_stats = get_mpr_sidecar().snapshot_stats()
     for key in (

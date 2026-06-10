@@ -66,6 +66,26 @@ _BOUNDARY_PROFILE_TIMING_NAMES = (
     "counter_backup",
 )
 
+_SCORING_PROFILE_TIMING_NAMES = (
+    "scoring_estimate_query_scores",
+    "scoring_record_estimated",
+    "scoring_should_record",
+    "scoring_query_clone",
+    "scoring_window_stack_mean",
+    "scoring_block_size",
+    "scoring_request_block_context",
+    "scoring_select_digest_blocks",
+    "scoring_quest_packed_prefix",
+    "scoring_quest_packed_estimate",
+    "scoring_pack_layer_digests",
+    "scoring_backend_estimate",
+    "scoring_score_packing_debug",
+    "scoring_block_topk",
+    "scoring_head_topk_debug",
+    "scoring_block_debug_fields",
+    "scoring_context_build",
+)
+
 
 @dataclass
 class BlockDigest:
@@ -182,6 +202,13 @@ class RecoverySidecar:
             },
         }
     )
+    _scoring_profile_timing: dict[str, float] = field(
+        default_factory=lambda: {
+            f"{name}_{suffix}": 0.0
+            for name in _SCORING_PROFILE_TIMING_NAMES
+            for suffix in ("count", "total_ms", "max_ms")
+        }
+    )
     _counter_leader_layer_name: str | None = None
     _counter_seq_lens_by_row: list[int] = field(default_factory=list)
     _counter_seq_lens_initialized: bool = False
@@ -273,6 +300,39 @@ class RecoverySidecar:
             return
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         timing = self._observe_kv_write_timing
+        count_key = f"{name}_count"
+        total_key = f"{name}_total_ms"
+        max_key = f"{name}_max_ms"
+        timing[count_key] = timing.get(count_key, 0.0) + 1.0
+        timing[total_key] = timing.get(total_key, 0.0) + elapsed_ms
+        timing[max_key] = max(timing.get(max_key, 0.0), elapsed_ms)
+
+    def reset_scoring_profile_timing(self) -> None:
+        timing = self._scoring_profile_timing
+        for key in timing:
+            timing[key] = 0.0
+
+    def scoring_profile_timing(self) -> dict[str, float | int]:
+        timing = self._scoring_profile_timing
+        result: dict[str, float | int] = {}
+        for name in _SCORING_PROFILE_TIMING_NAMES:
+            count = int(timing.get(f"{name}_count", 0.0))
+            total_ms = timing.get(f"{name}_total_ms", 0.0)
+            result[f"{name}_count"] = count
+            result[f"{name}_total_ms"] = total_ms
+            result[f"{name}_mean_ms"] = total_ms / count if count > 0 else 0.0
+            result[f"{name}_max_ms"] = timing.get(f"{name}_max_ms", 0.0)
+        return result
+
+    def _record_scoring_profile_timing(
+        self,
+        name: str,
+        start: float,
+    ) -> None:
+        if not self.config.scoring_profile_enabled:
+            return
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        timing = self._scoring_profile_timing
         count_key = f"{name}_count"
         total_key = f"{name}_total_ms"
         max_key = f"{name}_max_ms"
@@ -776,14 +836,27 @@ class RecoverySidecar:
         if not self.config.scoring_enabled:
             self.counters["score_skipped_disabled"] += 1
             return
+        profile_enabled = self.config.scoring_profile_enabled
+        estimate_start = time.perf_counter() if profile_enabled else 0.0
         score_context = self._estimate_query_scores(
             layer_name=layer_name,
             query=query,
             attn_metadata=attn_metadata,
         )
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_estimate_query_scores",
+                estimate_start,
+            )
         if score_context is None:
             return
+        record_start = time.perf_counter() if profile_enabled else 0.0
         self._record_score_estimated(score_context)
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_record_estimated",
+                record_start,
+            )
 
     def recover_before_attention(
         self,
@@ -879,6 +952,8 @@ class RecoverySidecar:
             )
             return
 
+        profile_enabled = self.config.scoring_profile_enabled
+        estimate_start = time.perf_counter() if profile_enabled else 0.0
         score_context = self._estimate_query_scores(
             layer_name=layer_name,
             query=query,
@@ -887,6 +962,11 @@ class RecoverySidecar:
             layer_event_idx=layer_event_idx,
             block_size_override=block_size,
         )
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_estimate_query_scores",
+                estimate_start,
+            )
         if score_context is None:
             self._record_recovery_skip(
                 should_record,
@@ -1105,11 +1185,18 @@ class RecoverySidecar:
         block_size_override: int | None = None,
     ) -> QueryScoreContext | None:
         """Estimate query-time digest scores and return reusable context."""
+        profile_enabled = self.config.scoring_profile_enabled
         if should_record is None:
+            should_record_start = time.perf_counter() if profile_enabled else 0.0
             should_record, layer_event_idx = self._should_record_layer_event(
                 layer_name,
                 self._score_counts,
             )
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_should_record",
+                    should_record_start,
+                )
         if query is None:
             self._record_score_skip(
                 should_record,
@@ -1181,7 +1268,13 @@ class RecoverySidecar:
 
         # query_for_window: current decode query for the single active request.
         # Shape: [num_q_heads, head_dim].
+        query_clone_start = time.perf_counter() if profile_enabled else 0.0
         query_for_window = query[0].detach().clone()
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_query_clone",
+                query_clone_start,
+            )
         if not torch.is_floating_point(query_for_window):
             self._record_score_skip(
                 should_record,
@@ -1199,26 +1292,50 @@ class RecoverySidecar:
         window.append(query_for_window)
         # window_query: average of the observed decode queries so far, up to
         # VLLM_MPR_WINDOW_SIZE. Shape: [num_q_heads, head_dim].
+        window_start = time.perf_counter() if profile_enabled else 0.0
         window_query = torch.stack(tuple(window), dim=0).mean(dim=0)
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_window_stack_mean",
+                window_start,
+            )
 
+        block_size_start = time.perf_counter() if profile_enabled else 0.0
         block_size = (
             block_size_override
             if block_size_override is not None
             else self._block_size_for_layer(layer_name)
         )
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_block_size",
+                block_size_start,
+            )
+        request_context_start = time.perf_counter() if profile_enabled else 0.0
         request_context = self._request_block_context(
             attn_metadata=attn_metadata,
             block_size=block_size,
         )
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_request_block_context",
+                request_context_start,
+            )
         candidate_block_ids = (
             request_context.score_candidate_block_ids
             if request_context.has_block_table_context
             else None
         )
+        select_digest_start = time.perf_counter() if profile_enabled else 0.0
         physical_block_ids = self._select_layer_digest_block_ids(
             layer_name,
             candidate_block_ids=candidate_block_ids,
         )
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_select_digest_blocks",
+                select_digest_start,
+            )
         if not physical_block_ids:
             skip_reason = (
                 "no_score_candidate_blocks"
@@ -1244,6 +1361,7 @@ class RecoverySidecar:
             self._scoring_backend,
             "estimate_packed",
         ):
+            packed_prefix_start = time.perf_counter() if profile_enabled else 0.0
             packed, quest_packed_fallback_reason = (
                 self._try_get_quest_packed_prefix(
                     layer_name=layer_name,
@@ -1253,23 +1371,43 @@ class RecoverySidecar:
                     dtype=window_query.dtype,
                 )
             )
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_quest_packed_prefix",
+                    packed_prefix_start,
+                )
             if packed is not None:
+                packed_estimate_start = (
+                    time.perf_counter() if profile_enabled else 0.0
+                )
                 score_result = self._scoring_backend.estimate_packed(
                     query_window=window_query,
                     packed=packed,
                     num_kv_heads=int(packed.metadata_data.shape[3]),
                     score_agg=self.config.score_agg,
                 )
+                if profile_enabled:
+                    self._record_scoring_profile_timing(
+                        "scoring_quest_packed_estimate",
+                        packed_estimate_start,
+                    )
                 quest_packed_fast_path = True
                 quest_packed_fallback_reason = None
 
         if score_result is None:
+            pack_start = time.perf_counter() if profile_enabled else 0.0
             physical_block_ids, digest_min, digest_max = self._pack_layer_digests(
                 layer_name,
                 device=window_query.device,
                 dtype=window_query.dtype,
                 candidate_block_ids=candidate_block_ids,
             )
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_pack_layer_digests",
+                    pack_start,
+                )
+            estimate_start = time.perf_counter() if profile_enabled else 0.0
             score_result = self._scoring_backend.estimate(
                 query_window=window_query,
                 digest_min=digest_min,
@@ -1277,34 +1415,66 @@ class RecoverySidecar:
                 score_agg=self.config.score_agg,
                 metadata_page_size=block_size,
             )
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_backend_estimate",
+                    estimate_start,
+                )
             if self.config.scoring_backend != "quest_cuda":
                 quest_packed_fallback_reason = "backend_not_quest_cuda"
             elif quest_packed_fallback_reason is None:
                 quest_packed_fallback_reason = "fallback_after_fast_path_miss"
 
+        score_packing_debug_start = (
+            time.perf_counter() if profile_enabled else 0.0
+        )
         score_packing_debug = self._score_packing_debug_fields(
             quest_packed_fast_path=quest_packed_fast_path,
             quest_packed_fallback_reason=quest_packed_fallback_reason,
         )
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_score_packing_debug",
+                score_packing_debug_start,
+            )
         scores = score_result.block_scores
         topk = min(self.config.topk, int(scores.numel()))
+        block_topk_start = time.perf_counter() if profile_enabled else 0.0
         topk_block_ids, topk_score_values = self._topk_block_scores(
             scores=scores,
             physical_block_ids=physical_block_ids,
             topk=topk,
         )
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_block_topk",
+                block_topk_start,
+            )
+        head_topk_start = time.perf_counter() if profile_enabled else 0.0
         head_debug = self._head_score_debug_fields(
             score_result=score_result,
             physical_block_ids=physical_block_ids,
             topk=topk,
         )
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_head_topk_debug",
+                head_topk_start,
+            )
 
+        block_debug_start = time.perf_counter() if profile_enabled else 0.0
         score_block_debug = self._score_block_debug_fields(
             request_context=request_context,
             observed_digest_block_ids=physical_block_ids,
         )
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_block_debug_fields",
+                block_debug_start,
+            )
 
-        return QueryScoreContext(
+        context_start = time.perf_counter() if profile_enabled else 0.0
+        score_context = QueryScoreContext(
             layer_name=layer_name,
             should_record=should_record,
             layer_event_idx=layer_event_idx,
@@ -1321,6 +1491,12 @@ class RecoverySidecar:
             head_debug=head_debug,
             score_block_debug=score_block_debug,
         )
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_context_build",
+                context_start,
+            )
+        return score_context
 
     def _record_score_estimated(self, score_context: QueryScoreContext) -> None:
         """Record a score_estimated event from reusable score context."""
@@ -2334,6 +2510,23 @@ def get_mpr_observe_kv_write_timing() -> dict[str, float | int]:
 def reset_mpr_observe_kv_write_timing() -> None:
     if _GLOBAL_SIDECAR is not None:
         _GLOBAL_SIDECAR.reset_observe_kv_write_timing()
+
+
+def get_mpr_scoring_profile_timing() -> dict[str, float | int]:
+    if _GLOBAL_SIDECAR is None:
+        result: dict[str, float | int] = {}
+        for name in _SCORING_PROFILE_TIMING_NAMES:
+            result[f"{name}_count"] = 0
+            result[f"{name}_total_ms"] = 0.0
+            result[f"{name}_mean_ms"] = 0.0
+            result[f"{name}_max_ms"] = 0.0
+        return result
+    return _GLOBAL_SIDECAR.scoring_profile_timing()
+
+
+def reset_mpr_scoring_profile_timing() -> None:
+    if _GLOBAL_SIDECAR is not None:
+        _GLOBAL_SIDECAR.reset_scoring_profile_timing()
 
 
 def reset_mpr_sidecar() -> None:

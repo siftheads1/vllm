@@ -68,8 +68,10 @@ from vllm.v1.mixed_precision_recovery.scoring import (
 from vllm.v1.mixed_precision_recovery.sidecar import (
     RecoverySidecar,
     get_mpr_observe_kv_write_timing,
+    get_mpr_scoring_profile_timing,
     get_mpr_sidecar,
     reset_mpr_observe_kv_write_timing,
+    reset_mpr_scoring_profile_timing,
     reset_mpr_sidecar,
 )
 
@@ -120,8 +122,10 @@ __all__ = [
     "get_digest_scoring_backend",
     "get_mpr_sidecar",
     "get_mpr_observe_kv_write_timing",
+    "get_mpr_scoring_profile_timing",
     "pack_quest_metadata_cache",
     "reset_mpr_observe_kv_write_timing",
+    "reset_mpr_scoring_profile_timing",
     "reset_mpr_sidecar",
     "select_recovery_block_ids",
     "summarize_key_block",

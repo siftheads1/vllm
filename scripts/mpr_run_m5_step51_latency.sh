@@ -22,6 +22,7 @@ EXTRA_ARGS=()
 MODES="baseline,mpr_enable_only,backup_only,scoring_only,fp16_recovery,mixed_int8,mixed_int4"
 OBSERVE_BACKEND="slot"
 BOUNDARY_PROFILE="0"
+SCORING_PROFILE="0"
 
 usage() {
   cat <<'EOF'
@@ -47,6 +48,7 @@ Options:
                                   Example: baseline,mpr_enable_only
   --observe-backend NAME          MPR KV observe backend: slot or counter. Default: slot.
   --boundary-profile              Enable targeted MPR boundary-step profiling counters.
+  --scoring-profile               Enable targeted MPR scoring-path profiling counters.
   -h, --help                      Show this help.
 
 The script runs seven modes:
@@ -150,6 +152,10 @@ while [[ $# -gt 0 ]]; do
       BOUNDARY_PROFILE="1"
       shift
       ;;
+    --scoring-profile)
+      SCORING_PROFILE="1"
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -207,6 +213,7 @@ BASE_ENV=(
   -u VLLM_MPR_ENABLE_LOGGING
   -u VLLM_MPR_OBSERVE_BACKEND
   -u VLLM_MPR_BOUNDARY_PROFILE
+  -u VLLM_MPR_SCORING_PROFILE
   -u VLLM_MPR_DEBUG_DIR
   VLLM_USE_V1=1
 )
@@ -242,6 +249,7 @@ write_manifest() {
     echo "modes: $MODES"
     echo "observe_backend: $OBSERVE_BACKEND"
     echo "boundary_profile: $BOUNDARY_PROFILE"
+    echo "scoring_profile: $SCORING_PROFILE"
     if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
       printf 'extra_args:'
       printf ' %q' "${EXTRA_ARGS[@]}"
@@ -370,6 +378,26 @@ BOUNDARY_PROFILE_TIMING_KEYS = [
     "counter_backup",
 ]
 
+SCORING_PROFILE_TIMING_KEYS = [
+    "scoring_estimate_query_scores",
+    "scoring_record_estimated",
+    "scoring_should_record",
+    "scoring_query_clone",
+    "scoring_window_stack_mean",
+    "scoring_block_size",
+    "scoring_request_block_context",
+    "scoring_select_digest_blocks",
+    "scoring_quest_packed_prefix",
+    "scoring_quest_packed_estimate",
+    "scoring_pack_layer_digests",
+    "scoring_backend_estimate",
+    "scoring_score_packing_debug",
+    "scoring_block_topk",
+    "scoring_head_topk_debug",
+    "scoring_block_debug_fields",
+    "scoring_context_build",
+]
+
 
 rows: list[dict[str, str | int | float | bool]] = []
 for mode in modes:
@@ -396,6 +424,11 @@ for mode in modes:
     mpr_boundary_profile_values = {
         f"{key}_{field}": []
         for key in BOUNDARY_PROFILE_TIMING_KEYS
+        for field in ("count", "total_ms", "mean_ms", "max_ms")
+    }
+    mpr_scoring_profile_values = {
+        f"{key}_{field}": []
+        for key in SCORING_PROFILE_TIMING_KEYS
         for field in ("count", "total_ms", "mean_ms", "max_ms")
     }
     csv_paths: list[str] = []
@@ -486,6 +519,14 @@ for mode in modes:
                 )
                 if value is not None:
                     mpr_boundary_profile_values[f"{key}_{field}"].append(value)
+        for key in SCORING_PROFILE_TIMING_KEYS:
+            for field in ("count", "total_ms", "mean_ms", "max_ms"):
+                value = parse_float_line(
+                    text,
+                    f"mpr_scoring_profile_{key}_{field}",
+                )
+                if value is not None:
+                    mpr_scoring_profile_values[f"{key}_{field}"].append(value)
 
     step_median = median(step_latencies)
     step_p95 = percentile(step_latencies, 95)
@@ -586,6 +627,11 @@ for mode in modes:
             row[f"mpr_boundary_profile_{key}_{field}_mean"] = mean(
                 mpr_boundary_profile_values[f"{key}_{field}"]
             )
+    for key in SCORING_PROFILE_TIMING_KEYS:
+        for field in ("count", "total_ms", "mean_ms", "max_ms"):
+            row[f"mpr_scoring_profile_{key}_{field}_mean"] = mean(
+                mpr_scoring_profile_values[f"{key}_{field}"]
+            )
     rows.append(row)
 
 summary_path = work_dir / "runtime_summary.csv"
@@ -623,6 +669,9 @@ run_one() {
   local profile_env=()
   if [[ "$BOUNDARY_PROFILE" == "1" ]]; then
     profile_env=(VLLM_MPR_BOUNDARY_PROFILE=1)
+  fi
+  if [[ "$SCORING_PROFILE" == "1" ]]; then
+    profile_env+=("VLLM_MPR_SCORING_PROFILE=1")
   fi
   echo "running ${mode} ${phase} ${idx}"
   "${BASE_ENV[@]}" "${profile_env[@]}" "$@" \
