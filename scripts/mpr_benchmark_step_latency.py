@@ -142,8 +142,14 @@ def main() -> None:
         get_mpr_observe_hook_timing,
         reset_mpr_observe_hook_timing,
     )
+    from vllm.v1.mixed_precision_recovery import (
+        get_mpr_observe_kv_write_timing,
+        get_mpr_sidecar,
+        reset_mpr_observe_kv_write_timing,
+    )
 
     reset_mpr_observe_hook_timing()
+    reset_mpr_observe_kv_write_timing()
 
     step_rows: list[dict[str, Any]] = []
     original_step = llm.llm_engine.step
@@ -254,10 +260,18 @@ def main() -> None:
     if boundary_latencies:
         print("predicted_boundary_decode_step_latency_ms:")
         print(f"  mean: {statistics.mean(boundary_latencies):.6f}")
+        print(f"  median: {statistics.median(boundary_latencies):.6f}")
+        print(f"  p90: {percentile(boundary_latencies, 90):.6f}")
+        print(f"  p95: {percentile(boundary_latencies, 95):.6f}")
+        print(f"  p99: {percentile(boundary_latencies, 99):.6f}")
         print(f"  max: {max(boundary_latencies):.6f}")
     if non_boundary_latencies:
         print("non_boundary_decode_step_latency_ms:")
         print(f"  mean: {statistics.mean(non_boundary_latencies):.6f}")
+        print(f"  median: {statistics.median(non_boundary_latencies):.6f}")
+        print(f"  p90: {percentile(non_boundary_latencies, 90):.6f}")
+        print(f"  p95: {percentile(non_boundary_latencies, 95):.6f}")
+        print(f"  p99: {percentile(non_boundary_latencies, 99):.6f}")
         print(f"  max: {max(non_boundary_latencies):.6f}")
     mpr_observe_timing = get_mpr_observe_hook_timing()
     mpr_observe_total_ms = float(mpr_observe_timing["total_ms"])
@@ -280,6 +294,70 @@ def main() -> None:
         "mpr_observe_hook_total_per_decode_step_ms: "
         f"{mpr_observe_per_decode_step_ms:.6f}"
     )
+    mpr_kv_timing = get_mpr_observe_kv_write_timing()
+    mpr_pre_total_ms = float(
+        mpr_kv_timing["pre_observe_block_offsets_total_ms"]
+    )
+    mpr_offsets_total_ms = float(
+        mpr_kv_timing["observe_block_offsets_total_ms"]
+    )
+    print(f"mpr_observe_kv_write_count: {int(mpr_kv_timing['count'])}")
+    print(
+        "mpr_observe_pre_block_offsets_total_ms: "
+        f"{mpr_pre_total_ms:.6f}"
+    )
+    print(
+        "mpr_observe_pre_block_offsets_mean_ms: "
+        f"{float(mpr_kv_timing['pre_observe_block_offsets_mean_ms']):.6f}"
+    )
+    print(
+        "mpr_observe_pre_block_offsets_max_ms: "
+        f"{float(mpr_kv_timing['pre_observe_block_offsets_max_ms']):.6f}"
+    )
+    print(
+        "mpr_observe_pre_block_offsets_total_per_decode_step_ms: "
+        f"{(mpr_pre_total_ms / len(decode_latencies)) if decode_latencies else 0.0:.6f}"
+    )
+    print(
+        "mpr_observe_block_offsets_count: "
+        f"{int(mpr_kv_timing['observe_block_offsets_count'])}"
+    )
+    print(
+        "mpr_observe_block_offsets_total_ms: "
+        f"{mpr_offsets_total_ms:.6f}"
+    )
+    print(
+        "mpr_observe_block_offsets_mean_ms: "
+        f"{float(mpr_kv_timing['observe_block_offsets_mean_ms']):.6f}"
+    )
+    print(
+        "mpr_observe_block_offsets_max_ms: "
+        f"{float(mpr_kv_timing['observe_block_offsets_max_ms']):.6f}"
+    )
+    print(
+        "mpr_observe_block_offsets_total_per_decode_step_ms: "
+        f"{(mpr_offsets_total_ms / len(decode_latencies)) if decode_latencies else 0.0:.6f}"
+    )
+    mpr_stats = get_mpr_sidecar().snapshot_stats()
+    for key in (
+        "counter_observe_candidate_count",
+        "counter_observe_accepted",
+        "counter_observe_used",
+        "counter_observe_missing_attn_metadata",
+        "counter_observe_missing_block_table",
+        "counter_observe_bad_query_len",
+        "counter_observe_unsupported_num_reqs",
+        "counter_observe_leader_selected",
+        "counter_observe_prefill_initialized",
+        "counter_observe_decode_advanced",
+        "counter_observe_uninitialized",
+        "counter_observe_not_pure_decode",
+        "counter_observe_fallback_required",
+        "counter_observe_no_boundary",
+        "counter_observe_boundary_requests",
+        "counter_observe_digest_created",
+    ):
+        print(f"mpr_{key}: {int(mpr_stats.get(key, 0))}")
 
     if args.print_steps:
         print(

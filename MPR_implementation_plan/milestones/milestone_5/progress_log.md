@@ -282,3 +282,486 @@ increment:                  +13.82 ms
 The same artifact has mpr_observe_hook_count=0 because the run used default V1
 multiprocessing and did not recover worker-local timing counters.
 ```
+
+## 2026-06-10: Step 5.2 Observe Logging Gate
+
+Implemented the first observe hot-path cleanup by separating debug logging from
+required KV-write observation.
+
+Change:
+
+```text
+Added VLLM_MPR_ENABLE_LOGGING.
+JSONL debug writing is active only when:
+  VLLM_MPR_ENABLE=1
+  VLLM_MPR_ENABLE_LOGGING=1
+  VLLM_MPR_DEBUG_DIR is set
+
+RecoverySidecar.observe_kv_write no longer computes debug-only fields when
+logging is disabled:
+  per-layer dump gating
+  unique block id list for JSONL
+  min/max block offset for JSONL
+  shape fields and digest-count fields for observe_kv_write JSONL
+```
+
+Preserved behavior:
+
+```text
+block offset observation still runs
+full-block digest creation still runs
+CPU backup creation still runs when enabled
+event counters are still updated by _record for existing unit-test/stat users
+debug/smoke scripts that require JSONL now set VLLM_MPR_ENABLE_LOGGING=1
+```
+
+Validation:
+
+```bash
+python -m py_compile \
+  vllm/v1/mixed_precision_recovery/config.py \
+  vllm/v1/mixed_precision_recovery/debug.py \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  vllm/envs.py \
+  scripts/mpr_smoke_tiered_recovery.py \
+  scripts/mpr_smoke_tiered_degraded_residency.py \
+  scripts/mpr_smoke_recovery_quality.py
+
+bash -n scripts/mpr_run_m5_step51_latency.sh
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_digest.py \
+  tests/v1/mixed_precision_recovery/test_scoring.py -q
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py -q
+```
+
+Result:
+
+```text
+test_digest.py + test_scoring.py: 52 passed, 2 skipped
+test_recovery.py + test_debug_jsonl_validator.py: 60 passed
+```
+
+## 2026-06-10: Step 5.2 Observe KV Write Split Timing
+
+Added temporary, lightweight timing attribution inside
+`RecoverySidecar.observe_kv_write` to split the observe hot path into:
+
+```text
+pre_observe_block_offsets:
+  slot_mapping flatten
+  invalid negative slot check
+  PAD filtering
+  block id / block offset derivation
+
+observe_block_offsets:
+  _observe_block_offsets(...) call itself
+```
+
+The benchmark script now prints both totals and per-decode-step summaries, and
+the step-51 runner carries those fields into `runtime_summary.csv`.
+
+Validation:
+
+```bash
+python -m py_compile \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  vllm/v1/mixed_precision_recovery/__init__.py \
+  scripts/mpr_benchmark_step_latency.py
+
+bash -n scripts/mpr_run_m5_step51_latency.sh
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_digest.py \
+  tests/v1/mixed_precision_recovery/test_scoring.py -q
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py -q
+```
+
+Result:
+
+```text
+py_compile: passed
+bash -n: passed
+test_digest.py + test_scoring.py: 52 passed, 2 skipped
+test_recovery.py + test_debug_jsonl_validator.py: 60 passed
+```
+
+## 2026-06-10: Step 5.2 Counter-Based KV Observe Backend
+
+Added an experimental `VLLM_MPR_OBSERVE_BACKEND=counter` path for
+`mpr_enable_only`-style overhead isolation. The default remains
+`VLLM_MPR_OBSERVE_BACKEND=slot`.
+
+Implementation notes:
+
+```text
+counter backend:
+  enabled only for pure decode batches
+  uses query_start_loc_cpu to reject prefill/mixed continuous batching
+  uses CPU seq lengths plus block table to detect block boundaries
+  creates a digest when post-update seq_len % block_size == 1
+  falls back to slot backend at the attention hook when unsupported
+
+shared digest helper:
+  slot and counter paths now both use _create_digest_for_full_block
+  digest cache, Quest metadata, CPU backup, and digest_created logging stay shared
+```
+
+Benchmark runner update:
+
+```bash
+bash scripts/mpr_run_m5_step51_latency.sh \
+  --modes baseline,mpr_enable_only \
+  --observe-backend counter
+```
+
+The runner now defaults output directories under:
+
+```text
+/home/han/KV_cache_quant/proposed_method_develop/results
+```
+
+Validation:
+
+```bash
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m py_compile \
+  vllm/v1/mixed_precision_recovery/config.py \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  vllm/model_executor/layers/attention/attention.py \
+  scripts/mpr_benchmark_step_latency.py
+
+bash -n scripts/mpr_run_m5_step51_latency.sh
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_digest.py -q
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_scoring.py -q
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py -q
+
+git diff --check
+```
+
+Result:
+
+```text
+py_compile: passed
+bash -n: passed
+test_digest.py: 7 passed
+test_scoring.py: 48 passed, 2 skipped
+test_recovery.py + test_debug_jsonl_validator.py: 60 passed
+git diff --check: passed
+```
+
+## 2026-06-10: Step 5.2 Counter Backend Runtime Result and Boundary Distribution
+
+Latest artifact:
+
+```text
+/home/han/KV_cache_quant/proposed_method_develop/results/mpr_m5_step51_20260610_191946/runtime_summary.csv
+```
+
+The sidecar-owned counter backend successfully took the decode path:
+
+```text
+mpr_counter_observe_candidate_count_mean: 4680
+mpr_counter_observe_accepted_mean: 4572
+mpr_counter_observe_used_mean: 4572
+mpr_counter_observe_prefill_initialized_mean: 1
+mpr_counter_observe_decode_advanced_mean: 127
+mpr_counter_observe_boundary_requests_mean: 288
+mpr_counter_observe_digest_created_mean: 288
+```
+
+Observed effect:
+
+```text
+baseline decode mean:                  17.07 ms
+counter mpr_enable_only decode mean:   17.97 ms
+remaining decode overhead:             ~0.90 ms/step
+
+counter hook total per decode step:     ~1.49 ms
+slot pre-block-offset path per step:    ~0.06 ms
+slot _observe_block_offsets per step:   ~0.01 ms
+```
+
+Compared with the slot fallback run, the hot slot scan overhead was removed:
+
+```text
+slot fallback hook per decode step:     ~9.51 ms
+counter hook per decode step:           ~1.49 ms
+```
+
+Boundary decode steps still show a latency spike, consistent with digest
+creation being concentrated on block boundaries:
+
+```text
+boundary decode mean:       ~31.07 ms
+non-boundary decode mean:   ~17.55 ms
+```
+
+Before profiling/optimizing boundary digest creation, the benchmark output was
+extended to report distribution statistics for boundary and non-boundary decode
+steps, matching the regular decode latency reporting style:
+
+```text
+predicted_boundary_decode_step_latency_ms:
+  mean
+  median
+  p90
+  p95
+  p99
+  max
+
+non_boundary_decode_step_latency_ms:
+  mean
+  median
+  p90
+  p95
+  p99
+  max
+```
+
+The step-51 runner now carries these fields into `runtime_summary.csv`:
+
+```text
+boundary_decode_step_latency_ms_median
+boundary_decode_step_latency_ms_p90
+boundary_decode_step_latency_ms_p95
+boundary_decode_step_latency_ms_p99
+non_boundary_decode_step_latency_ms_median
+non_boundary_decode_step_latency_ms_p90
+non_boundary_decode_step_latency_ms_p95
+non_boundary_decode_step_latency_ms_p99
+```
+
+Validation:
+
+```bash
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m py_compile \
+  scripts/mpr_benchmark_step_latency.py \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  vllm/model_executor/layers/attention/attention.py
+
+bash -n scripts/mpr_run_m5_step51_latency.sh
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_digest.py -q
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_scoring.py -q
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py -q
+
+git diff --check
+```
+
+Result:
+
+```text
+py_compile: passed
+bash -n: passed
+test_digest.py: 7 passed
+test_scoring.py: 48 passed, 2 skipped
+test_recovery.py + test_debug_jsonl_validator.py: 60 passed
+git diff --check: passed
+```
+
+## 2026-06-10: Step 5.2 Remove Query-Start CPU Dependency
+
+A follow-up `--observe-backend counter` run showed the shared counter path was
+still falling back because per-layer FlashAttention metadata does not expose
+`query_start_loc_cpu`:
+
+```text
+mpr_counter_observe_candidate_count_mean: 4680
+mpr_counter_observe_accepted_mean: 0
+mpr_counter_observe_missing_query_start_loc_cpu_mean: 4680
+```
+
+The counter backend no longer reads `query_start_loc_cpu`. It now derives the
+single-request query length from per-layer metadata fields that FlashAttention
+does expose:
+
+```text
+single request if num_actual_tokens == max_query_len
+query_len = num_actual_tokens
+multi-request / mixed batches fall back to slot backend
+```
+
+The benchmark diagnostics were updated accordingly:
+
+```text
+removed:
+  mpr_counter_observe_missing_query_start_loc_cpu
+  mpr_counter_observe_bad_query_start_loc_cpu
+
+added:
+  mpr_counter_observe_bad_query_len
+```
+
+Validation:
+
+```bash
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m py_compile \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  scripts/mpr_benchmark_step_latency.py
+
+bash -n scripts/mpr_run_m5_step51_latency.sh
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_digest.py -q
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_scoring.py -q
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py -q
+
+git diff --check
+```
+
+Result:
+
+```text
+py_compile: passed
+bash -n: passed
+test_digest.py: 7 passed
+test_scoring.py: 48 passed, 2 skipped
+test_recovery.py + test_debug_jsonl_validator.py: 60 passed
+git diff --check: passed
+```
+
+## 2026-06-10: Step 5.2 Counter Fallback Diagnostics
+
+The first `--observe-backend counter` run still exercised the slot path:
+
+```text
+observe_backend: counter
+mpr_observe_block_offsets_count: 4608
+mpr_observe_pre_block_offsets_total_per_decode_step_ms: ~7.49
+mpr_observe_block_offsets_total_per_decode_step_ms: ~1.63
+```
+
+Added lightweight diagnostic counters to distinguish counter acceptance from
+fallback reasons:
+
+```text
+mpr_counter_observe_candidate_count
+mpr_counter_observe_accepted
+mpr_counter_observe_used
+mpr_counter_observe_missing_block_table
+mpr_counter_observe_missing_query_start_loc_cpu
+mpr_counter_observe_not_pure_decode
+```
+
+The benchmark script prints these counters, and the step-51 runner carries their
+per-run mean into `runtime_summary.csv`.
+
+Validation:
+
+```bash
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m py_compile \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  scripts/mpr_benchmark_step_latency.py
+
+bash -n scripts/mpr_run_m5_step51_latency.sh
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_digest.py -q
+
+git diff --check
+```
+
+Result:
+
+```text
+py_compile: passed
+bash -n: passed
+test_digest.py: 7 passed
+git diff --check: passed
+```
+
+## 2026-06-10: Step 5.2 Shared Sequence Counter Backend
+
+The counter fallback diagnostics showed that all counter candidates were
+rejected because the per-layer FlashAttention metadata did not expose CPU
+sequence lengths:
+
+```text
+mpr_counter_observe_candidate_count_mean: 4680
+mpr_counter_observe_accepted_mean: 0
+mpr_counter_observe_missing_seq_lens_cpu_mean: 4680
+```
+
+Rather than copying GPU `seq_lens` to CPU, the counter backend now maintains a
+sidecar-owned shared sequence counter:
+
+```text
+leader layer:
+  selected from the first observed layer
+  initializes seq_len from single-request prefill query_len
+  advances seq_len by 1 on pure decode
+
+other layers:
+  do not advance seq_len
+  consume the leader's latest seq_len snapshot
+
+all layers:
+  create their own layer-local digest when seq_len % block_size == 0
+```
+
+The obsolete CPU-seq-lens probe path (`can_observe_kv_write_by_counter` and
+`_counter_seq_lens_cpu`) was removed after switching to the sidecar-owned shared
+counter. The counter backend still reads attention metadata for
+`query_start_loc_cpu` and block table lookup only.
+
+The implementation remains intentionally narrow for the first overhead test:
+only single-request rows use the counter backend; multi-request/mixed cases fall
+back to the slot backend and reset the counter initialization state.
+
+Validation:
+
+```bash
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m py_compile \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  vllm/model_executor/layers/attention/attention.py \
+  scripts/mpr_benchmark_step_latency.py
+
+bash -n scripts/mpr_run_m5_step51_latency.sh
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_digest.py -q
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_scoring.py -q
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_recovery.py \
+  tests/v1/mixed_precision_recovery/test_debug_jsonl_validator.py -q
+
+git diff --check
+```
+
+Result:
+
+```text
+py_compile: passed
+bash -n: passed
+test_digest.py: 7 passed
+test_scoring.py: 48 passed, 2 skipped
+test_recovery.py + test_debug_jsonl_validator.py: 60 passed
+git diff --check: passed
+```

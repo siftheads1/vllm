@@ -538,6 +538,7 @@ def test_sidecar_cpu_backup_created_debug_reports_payload_bytes(tmp_path):
     sidecar = RecoverySidecar(
         config=MPRConfig(
             enabled=True,
+            enable_logging=True,
             debug_dir=str(tmp_path),
             cpu_backup_enabled=True,
             precision_tiering_enabled=True,

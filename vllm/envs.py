@@ -277,6 +277,8 @@ if TYPE_CHECKING:
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_MPR_ENABLE: bool = False
+    VLLM_MPR_ENABLE_LOGGING: bool = False
+    VLLM_MPR_OBSERVE_BACKEND: str = "slot"
     VLLM_MPR_DEBUG_DIR: str | None = None
     VLLM_MPR_TOPK: int = 8
     VLLM_MPR_MAX_LAYERS: int = -1
@@ -1983,6 +1985,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Enable the experimental Mixed-Precision Recovery sidecar.
     "VLLM_MPR_ENABLE": lambda: bool(int(os.getenv("VLLM_MPR_ENABLE", "0"))),
+    # Enable MPR JSONL/debug logging and debug event bookkeeping.
+    "VLLM_MPR_ENABLE_LOGGING": lambda: bool(
+        int(os.getenv("VLLM_MPR_ENABLE_LOGGING", "0"))
+    ),
+    # KV observation backend for MPR digest creation: slot or counter.
+    "VLLM_MPR_OBSERVE_BACKEND": lambda: os.getenv(
+        "VLLM_MPR_OBSERVE_BACKEND",
+        "slot",
+    ).lower(),
     # Optional directory for MPR JSONL debug artifacts.
     "VLLM_MPR_DEBUG_DIR": lambda: os.getenv("VLLM_MPR_DEBUG_DIR", None),
     # Number of candidate KV blocks to report in MPR debug output.
@@ -2239,6 +2250,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CUDA_COMPATIBILITY_PATH",
         "VLLM_SKIP_MODEL_NAME_VALIDATION",
         "VLLM_MPR_ENABLE",
+        "VLLM_MPR_ENABLE_LOGGING",
+        "VLLM_MPR_OBSERVE_BACKEND",
         "VLLM_MPR_DEBUG_DIR",
         "VLLM_MPR_TOPK",
         "VLLM_MPR_MAX_LAYERS",

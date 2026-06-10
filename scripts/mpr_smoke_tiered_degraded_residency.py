@@ -164,6 +164,7 @@ def degraded_env(
             "VLLM_MPR_RECOVERY_TEST_MUTATE": "zero_selected",
             "VLLM_MPR_RECOVERY_TEST_MODE": "recover",
             "VLLM_MPR_RECENT_TOKENS": str(args.recent_tokens),
+            "VLLM_MPR_ENABLE_LOGGING": "1",
             "VLLM_MPR_DEBUG_DIR": str(debug_dir),
             "VLLM_MPR_MAX_LAYERS": str(args.debug_max_layers),
             "VLLM_MPR_MAX_STEPS": str(args.debug_max_steps),

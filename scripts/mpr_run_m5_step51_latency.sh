@@ -20,13 +20,14 @@ WARMUP_RUNS="1"
 MEASURED_RUNS="5"
 EXTRA_ARGS=()
 MODES="baseline,mpr_enable_only,backup_only,scoring_only,fp16_recovery,mixed_int8,mixed_int4"
+OBSERVE_BACKEND="slot"
 
 usage() {
   cat <<'EOF'
 Usage: bash scripts/mpr_run_m5_step51_latency.sh [options]
 
 Options:
-  --work-dir PATH                 Output directory. Defaults to /tmp/mpr_m5_step51_<timestamp>.
+  --work-dir PATH                 Output directory. Defaults to ../results/mpr_m5_step51_<timestamp>.
   --python PATH                   Python executable. Default: python.
   --warmup-runs N                 Warmup generations per mode. Default: 1.
   --measured-runs N               Measured generations per mode. Default: 5.
@@ -43,6 +44,7 @@ Options:
                                   --extra-arg --trust-remote-code.
   --modes CSV                     Comma-separated modes to run. Default: all modes.
                                   Example: baseline,mpr_enable_only
+  --observe-backend NAME          MPR KV observe backend: slot or counter. Default: slot.
   -h, --help                      Show this help.
 
 The script runs seven modes:
@@ -137,6 +139,11 @@ while [[ $# -gt 0 ]]; do
       MODES="$2"
       shift 2
       ;;
+    --observe-backend)
+      require_value "$1" "${2:-}"
+      OBSERVE_BACKEND="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -161,9 +168,13 @@ if ! is_nonnegative_int "$MEASURED_RUNS" || [[ "$MEASURED_RUNS" -eq 0 ]]; then
   echo "error: --measured-runs must be a positive integer" >&2
   exit 2
 fi
+if [[ "$OBSERVE_BACKEND" != "slot" && "$OBSERVE_BACKEND" != "counter" ]]; then
+  echo "error: --observe-backend must be slot or counter" >&2
+  exit 2
+fi
 
 if [[ -z "$WORK_DIR" ]]; then
-  WORK_DIR="/tmp/mpr_m5_step51_$(date +%Y%m%d_%H%M%S)"
+  WORK_DIR="/home/han/KV_cache_quant/proposed_method_develop/results/mpr_m5_step51_$(date +%Y%m%d_%H%M%S)"
 fi
 mkdir -p "$WORK_DIR"
 
@@ -187,6 +198,8 @@ BASE_ENV=(
   -u VLLM_MPR_RECOVERY_TOPK
   -u VLLM_MPR_RECOVERY_TEST_MUTATE
   -u VLLM_MPR_RECOVERY_TEST_MODE
+  -u VLLM_MPR_ENABLE_LOGGING
+  -u VLLM_MPR_OBSERVE_BACKEND
   -u VLLM_MPR_DEBUG_DIR
   VLLM_USE_V1=1
 )
@@ -220,6 +233,7 @@ write_manifest() {
     echo "warmup_runs: $WARMUP_RUNS"
     echo "measured_runs: $MEASURED_RUNS"
     echo "modes: $MODES"
+    echo "observe_backend: $OBSERVE_BACKEND"
     if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
       printf 'extra_args:'
       printf ' %q' "${EXTRA_ARGS[@]}"
@@ -317,6 +331,26 @@ def parse_mpr_observe_timing(text: str) -> dict[str, float]:
     }
 
 
+COUNTER_OBSERVE_KEYS = [
+    "counter_observe_candidate_count",
+    "counter_observe_accepted",
+    "counter_observe_used",
+    "counter_observe_missing_attn_metadata",
+    "counter_observe_missing_block_table",
+    "counter_observe_bad_query_len",
+    "counter_observe_unsupported_num_reqs",
+    "counter_observe_leader_selected",
+    "counter_observe_prefill_initialized",
+    "counter_observe_decode_advanced",
+    "counter_observe_uninitialized",
+    "counter_observe_not_pure_decode",
+    "counter_observe_fallback_required",
+    "counter_observe_no_boundary",
+    "counter_observe_boundary_requests",
+    "counter_observe_digest_created",
+]
+
+
 rows: list[dict[str, str | int | float | bool]] = []
 for mode in modes:
     logs = sorted(work_dir.glob(f"{mode}_measured_*.log"))
@@ -332,6 +366,13 @@ for mode in modes:
     mpr_observe_hook_mean_ms: list[float] = []
     mpr_observe_hook_max_ms: list[float] = []
     mpr_observe_hook_per_decode_step_ms: list[float] = []
+    mpr_observe_pre_block_offsets_ms: list[float] = []
+    mpr_observe_pre_block_offsets_per_decode_step_ms: list[float] = []
+    mpr_observe_block_offsets_ms: list[float] = []
+    mpr_observe_block_offsets_per_decode_step_ms: list[float] = []
+    mpr_counter_observe_values = {
+        key: [] for key in COUNTER_OBSERVE_KEYS
+    }
     csv_paths: list[str] = []
 
     for log_path in logs:
@@ -380,6 +421,38 @@ for mode in modes:
                 if run_decode_count > 0
                 else 0.0
             )
+        pre_offsets_ms = parse_float_line(
+            text,
+            "mpr_observe_pre_block_offsets_total_ms",
+        )
+        if pre_offsets_ms is not None:
+            mpr_observe_pre_block_offsets_ms.append(pre_offsets_ms)
+        pre_offsets_per_decode_ms = parse_float_line(
+            text,
+            "mpr_observe_pre_block_offsets_total_per_decode_step_ms",
+        )
+        if pre_offsets_per_decode_ms is not None:
+            mpr_observe_pre_block_offsets_per_decode_step_ms.append(
+                pre_offsets_per_decode_ms
+            )
+        block_offsets_ms = parse_float_line(
+            text,
+            "mpr_observe_block_offsets_total_ms",
+        )
+        if block_offsets_ms is not None:
+            mpr_observe_block_offsets_ms.append(block_offsets_ms)
+        block_offsets_per_decode_ms = parse_float_line(
+            text,
+            "mpr_observe_block_offsets_total_per_decode_step_ms",
+        )
+        if block_offsets_per_decode_ms is not None:
+            mpr_observe_block_offsets_per_decode_step_ms.append(
+                block_offsets_per_decode_ms
+            )
+        for key in COUNTER_OBSERVE_KEYS:
+            value = parse_float_line(text, f"mpr_{key}")
+            if value is not None:
+                mpr_counter_observe_values[key].append(value)
 
     step_median = median(step_latencies)
     step_p95 = percentile(step_latencies, 95)
@@ -387,6 +460,22 @@ for mode in modes:
     decode_median = median(decode_latencies)
     decode_p95 = percentile(decode_latencies, 95)
     decode_max = max(decode_latencies) if decode_latencies else 0.0
+    boundary_decode_median = median(boundary_decode_latencies)
+    boundary_decode_p90 = percentile(boundary_decode_latencies, 90)
+    boundary_decode_p95 = percentile(boundary_decode_latencies, 95)
+    boundary_decode_p99 = percentile(boundary_decode_latencies, 99)
+    boundary_decode_max = (
+        max(boundary_decode_latencies) if boundary_decode_latencies else 0.0
+    )
+    non_boundary_decode_median = median(non_boundary_decode_latencies)
+    non_boundary_decode_p90 = percentile(non_boundary_decode_latencies, 90)
+    non_boundary_decode_p95 = percentile(non_boundary_decode_latencies, 95)
+    non_boundary_decode_p99 = percentile(non_boundary_decode_latencies, 99)
+    non_boundary_decode_max = (
+        max(non_boundary_decode_latencies)
+        if non_boundary_decode_latencies
+        else 0.0
+    )
     outlier = bool(
         decode_latencies
         and decode_median > 0.0
@@ -395,7 +484,7 @@ for mode in modes:
             or decode_max > 2.0 * decode_median
         )
     )
-    rows.append({
+    row = {
         "mode": mode,
         "measured_runs": len(logs),
         "generate_elapsed_sec_mean": mean(generate_elapsed),
@@ -419,16 +508,19 @@ for mode in modes:
         "decode_step_latency_ms_p99": percentile(decode_latencies, 99),
         "decode_step_latency_ms_max": decode_max,
         "boundary_decode_step_latency_ms_mean": mean(boundary_decode_latencies),
-        "boundary_decode_step_latency_ms_max": (
-            max(boundary_decode_latencies) if boundary_decode_latencies else 0.0
-        ),
+        "boundary_decode_step_latency_ms_median": boundary_decode_median,
+        "boundary_decode_step_latency_ms_p90": boundary_decode_p90,
+        "boundary_decode_step_latency_ms_p95": boundary_decode_p95,
+        "boundary_decode_step_latency_ms_p99": boundary_decode_p99,
+        "boundary_decode_step_latency_ms_max": boundary_decode_max,
         "non_boundary_decode_step_latency_ms_mean": (
             mean(non_boundary_decode_latencies)
         ),
-        "non_boundary_decode_step_latency_ms_max": (
-            max(non_boundary_decode_latencies)
-            if non_boundary_decode_latencies else 0.0
-        ),
+        "non_boundary_decode_step_latency_ms_median": non_boundary_decode_median,
+        "non_boundary_decode_step_latency_ms_p90": non_boundary_decode_p90,
+        "non_boundary_decode_step_latency_ms_p95": non_boundary_decode_p95,
+        "non_boundary_decode_step_latency_ms_p99": non_boundary_decode_p99,
+        "non_boundary_decode_step_latency_ms_max": non_boundary_decode_max,
         "mpr_observe_hook_count_mean": mean(mpr_observe_hook_counts),
         "mpr_observe_hook_count_total": sum(mpr_observe_hook_counts),
         "mpr_observe_hook_total_ms_mean": mean(mpr_observe_hook_total_ms),
@@ -439,9 +531,24 @@ for mode in modes:
         "mpr_observe_hook_total_per_decode_step_ms_mean": (
             mean(mpr_observe_hook_per_decode_step_ms)
         ),
+        "mpr_observe_pre_block_offsets_total_ms_mean": (
+            mean(mpr_observe_pre_block_offsets_ms)
+        ),
+        "mpr_observe_pre_block_offsets_total_per_decode_step_ms_mean": (
+            mean(mpr_observe_pre_block_offsets_per_decode_step_ms)
+        ),
+        "mpr_observe_block_offsets_total_ms_mean": (
+            mean(mpr_observe_block_offsets_ms)
+        ),
+        "mpr_observe_block_offsets_total_per_decode_step_ms_mean": (
+            mean(mpr_observe_block_offsets_per_decode_step_ms)
+        ),
         "outlier_rerun_recommended": outlier,
         "csv_paths": ";".join(csv_paths),
-    })
+    }
+    for key in COUNTER_OBSERVE_KEYS:
+        row[f"mpr_{key}_mean"] = mean(mpr_counter_observe_values[key])
+    rows.append(row)
 
 summary_path = work_dir / "runtime_summary.csv"
 fieldnames = list(rows[0].keys()) if rows else []
@@ -510,6 +617,7 @@ fi
 if mode_enabled mpr_enable_only; then
   run_mode mpr_enable_only \
     VLLM_MPR_ENABLE=1 \
+    VLLM_MPR_OBSERVE_BACKEND="$OBSERVE_BACKEND" \
     VLLM_MPR_CPU_BACKUP=0 \
     VLLM_MPR_SCORING_ENABLE=0 \
     VLLM_MPR_RECOVERY_ENABLE=0
@@ -518,6 +626,7 @@ fi
 if mode_enabled backup_only; then
   run_mode backup_only \
     VLLM_MPR_ENABLE=1 \
+    VLLM_MPR_OBSERVE_BACKEND="$OBSERVE_BACKEND" \
     VLLM_MPR_CPU_BACKUP=1 \
     VLLM_MPR_BACKUP_STORAGE_MODE=fp16_only \
     VLLM_MPR_SCORING_ENABLE=0 \
@@ -527,6 +636,7 @@ fi
 if mode_enabled scoring_only; then
   run_mode scoring_only \
     VLLM_MPR_ENABLE=1 \
+    VLLM_MPR_OBSERVE_BACKEND="$OBSERVE_BACKEND" \
     VLLM_MPR_CPU_BACKUP=0 \
     VLLM_MPR_SCORING_ENABLE=1 \
     VLLM_MPR_RECOVERY_ENABLE=0
@@ -535,6 +645,7 @@ fi
 if mode_enabled fp16_recovery; then
   run_mode fp16_recovery \
     VLLM_MPR_ENABLE=1 \
+    VLLM_MPR_OBSERVE_BACKEND="$OBSERVE_BACKEND" \
     VLLM_MPR_CPU_BACKUP=1 \
     VLLM_MPR_BACKUP_STORAGE_MODE=fp16_only \
     VLLM_MPR_SCORING_ENABLE=1 \
@@ -549,6 +660,7 @@ fi
 if mode_enabled mixed_int8; then
   run_mode mixed_int8 \
     VLLM_MPR_ENABLE=1 \
+    VLLM_MPR_OBSERVE_BACKEND="$OBSERVE_BACKEND" \
     VLLM_MPR_CPU_BACKUP=1 \
     VLLM_MPR_BACKUP_STORAGE_MODE=eager_fp16_int8 \
     VLLM_MPR_SCORING_ENABLE=1 \
@@ -567,6 +679,7 @@ fi
 if mode_enabled mixed_int4; then
   run_mode mixed_int4 \
     VLLM_MPR_ENABLE=1 \
+    VLLM_MPR_OBSERVE_BACKEND="$OBSERVE_BACKEND" \
     VLLM_MPR_CPU_BACKUP=1 \
     VLLM_MPR_BACKUP_STORAGE_MODE=eager_fp16_int8_int4 \
     VLLM_MPR_SCORING_ENABLE=1 \

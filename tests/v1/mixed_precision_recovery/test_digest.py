@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import torch
 
 from vllm.v1.mixed_precision_recovery.config import MPRConfig
@@ -97,6 +99,115 @@ def test_sidecar_creates_digest_once_block_is_full():
     assert list(block_digest.digest_max.shape) == [1, 2]
     torch.testing.assert_close(block_digest.digest_min, expected_digest.digest_min)
     torch.testing.assert_close(block_digest.digest_max, expected_digest.digest_max)
+
+
+def test_sidecar_counter_backend_creates_digest_at_decode_boundary():
+    leader_layer_name = "model.layers.0.self_attn.attn"
+    follower_layer_name = "model.layers.1.self_attn.attn"
+    sidecar = RecoverySidecar(
+        config=MPRConfig(
+            enabled=True,
+            observe_backend="counter",
+            digest_kind=RAW_MINMAX_DIGEST_KIND,
+        )
+    )
+    kv_cache = torch.zeros(2, 4, 4, 1, 2)
+    kv_cache[0, 2] = torch.tensor(
+        [
+            [[1.0, 3.0]],
+            [[5.0, 1.0]],
+            [[3.0, 7.0]],
+            [[9.0, 5.0]],
+        ]
+    )
+    prefill_metadata = SimpleNamespace(
+        num_actual_tokens=3,
+        max_query_len=3,
+        block_table=torch.tensor([[2, 3]]),
+    )
+    decode_metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        max_query_len=1,
+        block_table=torch.tensor([[2, 3]]),
+    )
+
+    use_counter, seq_lens = sidecar.prepare_counter_kv_write(
+        layer_name=leader_layer_name,
+        attn_metadata=prefill_metadata,
+    )
+    assert not use_counter
+    assert seq_lens == [3]
+    use_counter, seq_lens = sidecar.prepare_counter_kv_write(
+        layer_name=leader_layer_name,
+        attn_metadata=decode_metadata,
+    )
+    assert use_counter
+    assert seq_lens == [4]
+    created = sidecar.observe_kv_write_by_counter(
+        layer_name=follower_layer_name,
+        kv_cache=kv_cache,
+        attn_metadata=decode_metadata,
+        block_size=4,
+        seq_lens=seq_lens,
+    )
+
+    assert created == [2]
+    block_digest = sidecar._digest_cache[follower_layer_name][2]
+    torch.testing.assert_close(block_digest.digest_min, kv_cache[0, 2].amin(dim=0))
+    torch.testing.assert_close(block_digest.digest_max, kv_cache[0, 2].amax(dim=0))
+
+
+def test_sidecar_counter_backend_skips_non_boundary_decode_step():
+    sidecar = RecoverySidecar(config=MPRConfig(enabled=True, observe_backend="counter"))
+    kv_cache = torch.zeros(2, 4, 4, 1, 2)
+    prefill_metadata = SimpleNamespace(
+        num_actual_tokens=4,
+        max_query_len=4,
+        block_table=torch.tensor([[2, 3]]),
+    )
+    decode_metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        max_query_len=1,
+        block_table=torch.tensor([[2, 3]]),
+    )
+
+    sidecar.prepare_counter_kv_write(
+        layer_name="model.layers.0.self_attn.attn",
+        attn_metadata=prefill_metadata,
+    )
+    use_counter, seq_lens = sidecar.prepare_counter_kv_write(
+        layer_name="model.layers.0.self_attn.attn",
+        attn_metadata=decode_metadata,
+    )
+    assert use_counter
+    assert seq_lens == [5]
+
+    created = sidecar.observe_kv_write_by_counter(
+        layer_name="model.layers.0.self_attn.attn",
+        kv_cache=kv_cache,
+        attn_metadata=decode_metadata,
+        block_size=4,
+        seq_lens=seq_lens,
+    )
+
+    assert created == []
+    assert sidecar._digest_cache == {}
+
+
+def test_sidecar_counter_backend_rejects_mixed_batch():
+    sidecar = RecoverySidecar(config=MPRConfig(enabled=True, observe_backend="counter"))
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=4,
+        max_query_len=3,
+        block_table=torch.tensor([[2, 3], [4, 5]]),
+    )
+
+    use_counter, seq_lens = sidecar.prepare_counter_kv_write(
+        layer_name="model.layers.0.self_attn.attn",
+        attn_metadata=attn_metadata,
+    )
+    assert not use_counter
+    assert seq_lens is None
 
 
 def test_sidecar_can_create_raw_minmax_digest():

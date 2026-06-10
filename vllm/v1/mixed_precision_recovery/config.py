@@ -66,6 +66,8 @@ class MPRConfig:
     """
 
     enabled: bool = False
+    enable_logging: bool = False
+    observe_backend: str = "slot"
     debug_dir: str | None = None
     topk: int = 8
     max_layers: int | None = None
@@ -97,6 +99,11 @@ class MPRConfig:
 
     def __post_init__(self) -> None:
         """Validate MPR config values that depend on multiple fields."""
+        if self.observe_backend not in {"slot", "counter"}:
+            raise ValueError(
+                "observe_backend must be 'slot' or 'counter', got "
+                f"{self.observe_backend!r}."
+            )
         if self.precision_policy not in {"top_ratio", "threshold"}:
             raise ValueError(
                 "precision_policy must be 'top_ratio' or 'threshold', got "
@@ -150,6 +157,12 @@ class MPRConfig:
     def from_env(cls) -> "MPRConfig":
         return cls(
             enabled=_parse_bool("VLLM_MPR_ENABLE", False),
+            enable_logging=_parse_bool("VLLM_MPR_ENABLE_LOGGING", False),
+            observe_backend=_parse_choice(
+                "VLLM_MPR_OBSERVE_BACKEND",
+                "slot",
+                {"slot", "counter"},
+            ),
             debug_dir=os.getenv("VLLM_MPR_DEBUG_DIR") or None,
             topk=_parse_int("VLLM_MPR_TOPK", 8, 1),
             max_layers=_parse_optional_limit("VLLM_MPR_MAX_LAYERS"),

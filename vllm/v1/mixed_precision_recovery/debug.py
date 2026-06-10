@@ -20,14 +20,15 @@ def _json_default(value: Any) -> str:
 class MPRDebugWriter:
     """Rank-local JSONL writer.
 
-    The writer is inert unless MPR is enabled and ``VLLM_MPR_DEBUG_DIR`` is set.
+    The writer is inert unless MPR is enabled, MPR logging is enabled, and
+    ``VLLM_MPR_DEBUG_DIR`` is set.
     """
 
     def __init__(self, config: MPRConfig) -> None:
         self.path: Path | None = None
         self._file = None
 
-        if not config.enabled or config.debug_dir is None:
+        if not config.enabled or not config.enable_logging or config.debug_dir is None:
             return
 
         debug_dir = Path(config.debug_dir)

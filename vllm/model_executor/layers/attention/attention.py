@@ -755,6 +755,7 @@ def _maybe_observe_mpr_kv_write(
     kv_cache: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
+    attn_metadata: AttentionMetadata,
     layer_slot_mapping: torch.Tensor,
 ) -> None:
     if not envs.VLLM_MPR_ENABLE:
@@ -767,7 +768,25 @@ def _maybe_observe_mpr_kv_write(
 
     from vllm.v1.mixed_precision_recovery import get_mpr_sidecar
 
-    get_mpr_sidecar().observe_kv_write(
+    sidecar = get_mpr_sidecar()
+    if sidecar.config.observe_backend == "counter":
+        use_counter, seq_lens = sidecar.prepare_counter_kv_write(
+            layer_name=layer_name,
+            attn_metadata=attn_metadata,
+        )
+        if use_counter:
+            sidecar.observe_kv_write_by_counter(
+                layer_name=layer_name,
+                key=key,
+                value=value,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                block_size=block_size,
+                seq_lens=seq_lens,
+            )
+            return
+
+    sidecar.observe_kv_write(
         layer_name=layer_name,
         key=key,
         value=value,
@@ -855,7 +874,9 @@ def unified_kv_cache_update(
     the data dependency between them to ensure torch.compile preserves ordering.
     """
     layer_name = _resolve_layer_name(layer_name)
-    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
@@ -875,6 +896,7 @@ def unified_kv_cache_update(
                 kv_cache,
                 key,
                 value,
+                attn_metadata,
                 layer_slot_mapping,
             )
         finally:

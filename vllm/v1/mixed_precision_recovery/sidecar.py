@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -154,6 +155,19 @@ class RecoverySidecar:
     _recovery_payload_provider: RecoveryPayloadProvider = field(
         default_factory=EagerRecoveryPayloadProvider
     )
+    _observe_kv_write_timing: dict[str, float] = field(
+        default_factory=lambda: {
+            "count": 0.0,
+            "pre_observe_block_offsets_total_ms": 0.0,
+            "pre_observe_block_offsets_max_ms": 0.0,
+            "observe_block_offsets_count": 0.0,
+            "observe_block_offsets_total_ms": 0.0,
+            "observe_block_offsets_max_ms": 0.0,
+        }
+    )
+    _counter_leader_layer_name: str | None = None
+    _counter_seq_lens_by_row: list[int] = field(default_factory=list)
+    _counter_seq_lens_initialized: bool = False
 
     def __post_init__(self) -> None:
         """Initialize optional debug output and emit the init event."""
@@ -166,7 +180,7 @@ class RecoverySidecar:
                 "MPR sidecar enabled: topk=%d, window_size=%d, "
                 "recent_tokens=%d, score_agg=%s, scoring_backend=%s, "
                 "digest_kind=%s, score_granularity=%s, cpu_backup=%s, "
-                "scoring_enabled=%s, debug_dir=%s",
+                "scoring_enabled=%s, enable_logging=%s, debug_dir=%s",
                 self.config.topk,
                 self.config.window_size,
                 self.config.recent_tokens,
@@ -176,9 +190,11 @@ class RecoverySidecar:
                 self.config.score_granularity,
                 self.config.cpu_backup_enabled,
                 self.config.scoring_enabled,
+                self.config.enable_logging,
                 self.config.debug_dir,
             )
-            self._record("init")
+            if self.config.enable_logging:
+                self._record("init")
 
     def enabled(self) -> bool:
         """Return whether MPR sidecar observation is enabled."""
@@ -187,6 +203,36 @@ class RecoverySidecar:
     def cpu_backup_stats(self) -> CPUBackupStats:
         """Return point-in-time CPU backup stats."""
         return self._cpu_backup_store.stats()
+
+    def reset_observe_kv_write_timing(self) -> None:
+        timing = self._observe_kv_write_timing
+        for key in timing:
+            timing[key] = 0.0
+
+    def observe_kv_write_timing(self) -> dict[str, float | int]:
+        timing = self._observe_kv_write_timing
+        count = int(timing["count"])
+        pre_total_ms = timing["pre_observe_block_offsets_total_ms"]
+        offsets_count = int(timing["observe_block_offsets_count"])
+        offsets_total_ms = timing["observe_block_offsets_total_ms"]
+        return {
+            "count": count,
+            "pre_observe_block_offsets_total_ms": pre_total_ms,
+            "pre_observe_block_offsets_mean_ms": (
+                pre_total_ms / count if count > 0 else 0.0
+            ),
+            "pre_observe_block_offsets_max_ms": timing[
+                "pre_observe_block_offsets_max_ms"
+            ],
+            "observe_block_offsets_count": offsets_count,
+            "observe_block_offsets_total_ms": offsets_total_ms,
+            "observe_block_offsets_mean_ms": (
+                offsets_total_ms / offsets_count if offsets_count > 0 else 0.0
+            ),
+            "observe_block_offsets_max_ms": timing[
+                "observe_block_offsets_max_ms"
+            ],
+        }
 
     def release_blocks(
         self,
@@ -334,10 +380,30 @@ class RecoverySidecar:
         """
         if not self.config.enabled:
             return
-        should_record, layer_event_idx = self._should_record_layer_event(
-            layer_name,
-            self._kv_write_counts,
-        )
+        observe_start = time.perf_counter()
+        pre_timing_recorded = False
+
+        def record_pre_observe_block_offsets_time() -> None:
+            nonlocal pre_timing_recorded
+            if pre_timing_recorded:
+                return
+            pre_timing_recorded = True
+            elapsed_ms = (time.perf_counter() - observe_start) * 1000.0
+            timing = self._observe_kv_write_timing
+            timing["count"] += 1.0
+            timing["pre_observe_block_offsets_total_ms"] += elapsed_ms
+            timing["pre_observe_block_offsets_max_ms"] = max(
+                timing["pre_observe_block_offsets_max_ms"],
+                elapsed_ms,
+            )
+
+        should_record = False
+        layer_event_idx = None
+        if self.config.enable_logging:
+            should_record, layer_event_idx = self._should_record_layer_event(
+                layer_name,
+                self._kv_write_counts,
+            )
         if block_size is None or block_size <= 0:
             raise ValueError(
                 f"MPR requires a positive block_size for {layer_name}, "
@@ -351,19 +417,21 @@ class RecoverySidecar:
         flat_slots = slot_mapping.detach().reshape(-1)
         num_slots = int(flat_slots.numel())
         if num_slots == 0:
-            unique_block_ids: list[int] = []
-            min_block_offset = None
-            max_block_offset = None
             num_pad_slots = 0
             digest_created_block_ids: list[int] = []
+            if should_record:
+                unique_block_ids: list[int] = []
+                min_block_offset = None
+                max_block_offset = None
+            record_pre_observe_block_offsets_time()
         else:
-            has_invalid_negative_slot = bool((flat_slots < PAD_SLOT_ID).any().item())
-            if has_invalid_negative_slot:
-                min_slot = int(flat_slots.min().item())
-                raise AssertionError(
-                    f"MPR observed invalid negative slot id for {layer_name}: "
-                    f"min_slot={min_slot}."
-                )
+            # has_invalid_negative_slot = bool((flat_slots < PAD_SLOT_ID).any().item())
+            # if has_invalid_negative_slot:
+            #     min_slot = int(flat_slots.min().item())
+            #     raise AssertionError(
+            #         f"MPR observed invalid negative slot id for {layer_name}: "
+            #         f"min_slot={min_slot}."
+            #     )
 
             # vLLM pads unused CUDA graph slots with PAD_SLOT_ID. These are not
             # KV writes and should not participate in block/offset summaries.
@@ -372,10 +440,12 @@ class RecoverySidecar:
             valid_slots = flat_slots[flat_slots != PAD_SLOT_ID]
             num_pad_slots = num_slots - int(valid_slots.numel())
             if valid_slots.numel() == 0:
-                unique_block_ids = []
-                min_block_offset = None
-                max_block_offset = None
                 digest_created_block_ids = []
+                if should_record:
+                    unique_block_ids = []
+                    min_block_offset = None
+                    max_block_offset = None
+                record_pre_observe_block_offsets_time()
             else:
                 # block_ids: physical KV block id for each valid slot.
                 # Shape: [num_valid_slots].
@@ -384,20 +454,39 @@ class RecoverySidecar:
                 # block_offsets: token offset within the physical block.
                 # Shape: [num_valid_slots].
                 block_offsets = valid_slots % block_size
-                unique_block_ids = [
-                    int(block_id)
-                    for block_id in sorted(block_ids.unique().detach().cpu().tolist())
-                ]
-                min_block_offset = int(block_offsets.min().item())
-                max_block_offset = int(block_offsets.max().item())
-                digest_created_block_ids = self._observe_block_offsets(
-                    layer_name=layer_name,
-                    block_ids=block_ids,
-                    block_offsets=block_offsets,
-                    block_size=block_size,
-                    kv_cache=kv_cache,
-                    layer_event_idx=layer_event_idx,
-                )
+                if should_record:
+                    if not self.config.enable_logging:
+                        raise Exception("Trying to record even though logging is disabled")
+                    unique_block_ids = [
+                        int(block_id)
+                        for block_id in sorted(
+                            block_ids.unique().detach().cpu().tolist()
+                        )
+                    ]
+                    min_block_offset = int(block_offsets.min().item())
+                    max_block_offset = int(block_offsets.max().item())
+                record_pre_observe_block_offsets_time()
+                observe_offsets_start = time.perf_counter()
+                try:
+                    digest_created_block_ids = self._observe_block_offsets(
+                        layer_name=layer_name,
+                        block_ids=block_ids,
+                        block_offsets=block_offsets,
+                        block_size=block_size,
+                        kv_cache=kv_cache,
+                        layer_event_idx=layer_event_idx,
+                    )
+                finally:
+                    elapsed_ms = (
+                        time.perf_counter() - observe_offsets_start
+                    ) * 1000.0
+                    timing = self._observe_kv_write_timing
+                    timing["observe_block_offsets_count"] += 1.0
+                    timing["observe_block_offsets_total_ms"] += elapsed_ms
+                    timing["observe_block_offsets_max_ms"] = max(
+                        timing["observe_block_offsets_max_ms"],
+                        elapsed_ms,
+                    )
 
         if should_record:
             self._record(
@@ -422,6 +511,154 @@ class RecoverySidecar:
                 total_digest_blocks=self._num_digest_blocks(),
                 digest_kind=self.config.digest_kind,
             )
+
+    def prepare_counter_kv_write(
+        self,
+        *,
+        layer_name: str,
+        attn_metadata: Any,
+    ) -> tuple[bool, list[int] | None]:
+        """Advance shared sequence counters and decide counter observation.
+
+        Only the first observed layer advances sequence lengths. Other layers
+        consume the leader's latest snapshot so boundary detection is shared
+        while digest creation remains layer-local.
+        """
+        self.counters["counter_observe_candidate_count"] += 1
+        if attn_metadata is None:
+            self.counters["counter_observe_missing_attn_metadata"] += 1
+            return False, None
+        if self._counter_block_table(attn_metadata) is None:
+            self.counters["counter_observe_missing_block_table"] += 1
+            return False, None
+        query_len = self._counter_single_request_query_len(attn_metadata)
+        if query_len is None:
+            self.counters["counter_observe_unsupported_num_reqs"] += 1
+            self._counter_seq_lens_initialized = False
+            self._counter_seq_lens_by_row = []
+            return False, None
+        try:
+            if query_len <= 0:
+                self.counters["counter_observe_bad_query_len"] += 1
+                return False, None
+            if self._counter_leader_layer_name is None:
+                self._counter_leader_layer_name = layer_name
+                self.counters["counter_observe_leader_selected"] += 1
+            if layer_name == self._counter_leader_layer_name:
+                if query_len == 1:
+                    if not self._counter_seq_lens_initialized:
+                        self.counters["counter_observe_uninitialized"] += 1
+                        return False, None
+                    self._counter_seq_lens_by_row[0] += 1
+                    self.counters["counter_observe_decode_advanced"] += 1
+                else:
+                    self._counter_seq_lens_by_row = [query_len]
+                    self._counter_seq_lens_initialized = True
+                    self.counters["counter_observe_prefill_initialized"] += 1
+            if not self._counter_seq_lens_initialized:
+                self.counters["counter_observe_uninitialized"] += 1
+                return False, None
+            seq_lens = list(self._counter_seq_lens_by_row)
+            if query_len != 1:
+                self.counters["counter_observe_not_pure_decode"] += 1
+                return False, seq_lens
+            self.counters["counter_observe_accepted"] += 1
+            return True, seq_lens
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            self.counters["counter_observe_bad_query_len"] += 1
+            return False, None
+
+    def observe_kv_write_by_counter(
+        self,
+        layer_name: str,
+        key: Any = None,
+        value: Any = None,
+        kv_cache: Any = None,
+        attn_metadata: Any = None,
+        block_size: int | None = None,
+        seq_lens: list[int] | None = None,
+    ) -> list[int]:
+        """Observe pure-decode KV writes using sequence counters.
+
+        The shared counter is advanced once per step by a leader layer. A block
+        becomes full when the post-update sequence length is block-aligned.
+        """
+        if not self.config.enabled:
+            return []
+        self.counters["counter_observe_used"] += 1
+        should_record = False
+        layer_event_idx = None
+        if self.config.enable_logging:
+            should_record, layer_event_idx = self._should_record_layer_event(
+                layer_name,
+                self._kv_write_counts,
+            )
+        if block_size is None or block_size <= 0:
+            raise ValueError(
+                f"MPR requires a positive block_size for {layer_name}, "
+                f"got {block_size}."
+            )
+        if kv_cache is None:
+            raise ValueError(f"MPR requires kv_cache for digesting {layer_name}.")
+
+        key_cache = self._key_cache_for_digest(
+            layer_name=layer_name,
+            kv_cache=kv_cache,
+            block_size=block_size,
+        )
+        block_table = self._counter_block_table(attn_metadata)
+        if seq_lens is None or block_table is None:
+            self.counters["counter_observe_fallback_required"] += 1
+            return []
+
+        created_block_ids: list[int] = []
+        boundary_request_indices: list[int] = []
+        for req_idx, seq_len in enumerate(seq_lens):
+            if seq_len <= 0 or seq_len % block_size != 0:
+                continue
+            logical_block_idx = seq_len // block_size - 1
+            block_id = self._counter_block_id(
+                block_table=block_table,
+                req_idx=req_idx,
+                logical_block_idx=logical_block_idx,
+            )
+            if block_id is None:
+                continue
+            boundary_request_indices.append(req_idx)
+            self.counters["counter_observe_boundary_requests"] += 1
+            if self._create_digest_for_full_block(
+                layer_name=layer_name,
+                block_id=block_id,
+                block_size=block_size,
+                key_cache=key_cache,
+                kv_cache=kv_cache,
+                layer_event_idx=layer_event_idx,
+            ):
+                created_block_ids.append(block_id)
+                self.counters["counter_observe_digest_created"] += 1
+        if not boundary_request_indices:
+            self.counters["counter_observe_no_boundary"] += 1
+
+        if should_record:
+            self._record(
+                "observe_kv_write",
+                layer_name=layer_name,
+                layer_event_idx=layer_event_idx,
+                observe_backend="counter",
+                key_shape=self._shape_of(key),
+                value_shape=self._shape_of(value),
+                kv_cache_shape=self._shape_of(kv_cache),
+                block_size=block_size,
+                seq_lens=seq_lens,
+                boundary_request_indices=boundary_request_indices,
+                digest_created_block_ids=created_block_ids,
+                num_digest_blocks_for_layer=len(
+                    self._digest_cache.get(layer_name, {})
+                ),
+                total_digest_blocks=self._num_digest_blocks(),
+                digest_kind=self.config.digest_kind,
+            )
+        return created_block_ids
 
     def observe_query(
         self,
@@ -1441,6 +1678,125 @@ class RecoverySidecar:
             return None
         return [int(dim) for dim in shape]
 
+    @staticmethod
+    def _counter_block_table(attn_metadata: Any) -> Any | None:
+        """Return the request block table used by the counter backend."""
+        if attn_metadata is None:
+            return None
+        block_table = getattr(attn_metadata, "block_table_tensor", None)
+        if block_table is None:
+            block_table = getattr(attn_metadata, "block_table", None)
+        return block_table
+
+    @staticmethod
+    def _counter_single_request_query_len(attn_metadata: Any) -> int | None:
+        """Return query length only when metadata represents one request."""
+        num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", None)
+        max_query_len = getattr(attn_metadata, "max_query_len", None)
+        if num_actual_tokens is None or max_query_len is None:
+            return None
+        num_actual_tokens = int(num_actual_tokens)
+        max_query_len = int(max_query_len)
+        if num_actual_tokens != max_query_len:
+            return None
+        return num_actual_tokens
+
+    @staticmethod
+    def _counter_block_id(
+        *,
+        block_table: Any,
+        req_idx: int,
+        logical_block_idx: int,
+    ) -> int | None:
+        """Read one physical block id from a request block table."""
+        try:
+            if getattr(block_table, "ndim", 0) >= 2:
+                value = block_table[req_idx, logical_block_idx]
+            else:
+                value = block_table[logical_block_idx]
+            block_id = int(value.item() if hasattr(value, "item") else value)
+        except (IndexError, RuntimeError, TypeError, ValueError):
+            return None
+        return block_id if block_id >= 0 else None
+
+    def _key_cache_for_digest(
+        self,
+        *,
+        layer_name: str,
+        kv_cache: Any,
+        block_size: int,
+    ) -> Any:
+        if kv_cache is None:
+            raise ValueError(f"MPR requires kv_cache for digesting {layer_name}.")
+        if kv_cache.ndim != 5 or kv_cache.shape[0] != 2:
+            raise ValueError(
+                "MPR digest cache currently expects FlashAttention KV cache "
+                "layout [2, num_blocks, block_size, num_kv_heads, head_dim], "
+                f"got {tuple(kv_cache.shape)} for {layer_name}."
+            )
+        if int(kv_cache.shape[2]) != block_size:
+            raise AssertionError(
+                f"MPR block_size mismatch for {layer_name}: "
+                f"block_size={block_size}, kv_cache.shape[2]={int(kv_cache.shape[2])}."
+            )
+        return kv_cache[0]
+
+    def _create_digest_for_full_block(
+        self,
+        *,
+        layer_name: str,
+        block_id: int,
+        block_size: int,
+        key_cache: Any,
+        kv_cache: Any,
+        layer_event_idx: int | None,
+    ) -> bool:
+        """Create all sidecar state for one full physical KV block."""
+        if block_id < 0 or block_id >= int(key_cache.shape[0]):
+            raise AssertionError(
+                f"MPR observed block id outside KV cache for {layer_name}: "
+                f"block_id={block_id}, num_blocks={int(key_cache.shape[0])}."
+            )
+
+        layer_digests = self._digest_cache.setdefault(layer_name, {})
+        if block_id in layer_digests:
+            return False
+
+        digest = summarize_key_block(
+            key_cache[block_id],
+            digest_kind=self.config.digest_kind,
+        )
+        layer_digests[block_id] = self._to_block_digest(
+            digest,
+            layer_event_idx,
+        )
+        self._append_quest_metadata_digest(
+            layer_name=layer_name,
+            block_id=block_id,
+            digest=digest,
+        )
+        self._maybe_backup_kv_block(
+            layer_name=layer_name,
+            block_id=block_id,
+            kv_block=kv_cache[:, block_id],
+            layer_event_idx=layer_event_idx,
+        )
+        if layer_name in self._layer_indices:
+            self._record(
+                "digest_created",
+                layer_name=layer_name,
+                layer_event_idx=layer_event_idx,
+                physical_block_id=block_id,
+                digest_min_shape=self._shape_of(digest.digest_min),
+                digest_max_shape=self._shape_of(digest.digest_max),
+                valid_token_count=digest.valid_token_count,
+                block_size=digest.block_size,
+                digest_kind=digest.digest_kind,
+                num_digest_blocks_for_layer=len(layer_digests),
+                total_digest_blocks=self._num_digest_blocks(),
+            )
+        return True
+
     def _observe_block_offsets(
         self,
         layer_name: str,
@@ -1467,31 +1823,17 @@ class RecoverySidecar:
         Returns:
             Physical block ids whose digest was created by this observation.
         """
-        if kv_cache is None:
-            raise ValueError(f"MPR requires kv_cache for digesting {layer_name}.")
-        if kv_cache.ndim != 5 or kv_cache.shape[0] != 2:
-            raise ValueError(
-                "MPR digest cache currently expects FlashAttention KV cache "
-                "layout [2, num_blocks, block_size, num_kv_heads, head_dim], "
-                f"got {tuple(kv_cache.shape)} for {layer_name}."
-            )
-        if int(kv_cache.shape[2]) != block_size:
-            raise AssertionError(
-                f"MPR block_size mismatch for {layer_name}: "
-                f"block_size={block_size}, kv_cache.shape[2]={int(kv_cache.shape[2])}."
-            )
-
-        # key_cache: FlashAttention key plane.
-        # Shape: [num_blocks, block_size, num_kv_heads, head_dim].
-        key_cache = kv_cache[0]
+        key_cache = self._key_cache_for_digest(
+            layer_name=layer_name,
+            kv_cache=kv_cache,
+            block_size=block_size,
+        )
 
         # layer_offsets: observed token offsets by physical block id.
         # Structure: dict[physical_block_id, set[block_offset]].
         layer_offsets = self._block_offsets.setdefault(layer_name, {})
+        self._digest_cache.setdefault(layer_name, {})
 
-        # layer_digests: cached digest entries by physical block id.
-        # Each digest_min/digest_max has shape [num_kv_heads, head_dim].
-        layer_digests = self._digest_cache.setdefault(layer_name, {})
         created_block_ids: list[int] = []
 
         # block_id_values/block_offset_values are CPU scalar lists used only for
@@ -1517,43 +1859,18 @@ class RecoverySidecar:
 
             offsets = layer_offsets.setdefault(block_id, set())
             offsets.add(block_offset)
-            if len(offsets) == block_size and block_id not in layer_digests:
-                # key_cache[block_id]: one full key block.
-                # Shape: [block_size, num_kv_heads, head_dim].
-                digest = summarize_key_block(
-                    key_cache[block_id],
-                    digest_kind=self.config.digest_kind,
-                )
-                layer_digests[block_id] = self._to_block_digest(
-                    digest,
-                    layer_event_idx,
-                )
-                self._append_quest_metadata_digest(
+            created = False
+            if len(offsets) == block_size:
+                created = self._create_digest_for_full_block(
                     layer_name=layer_name,
                     block_id=block_id,
-                    digest=digest,
-                )
-                self._maybe_backup_kv_block(
-                    layer_name=layer_name,
-                    block_id=block_id,
-                    kv_block=kv_cache[:, block_id],
+                    block_size=block_size,
+                    key_cache=key_cache,
+                    kv_cache=kv_cache,
                     layer_event_idx=layer_event_idx,
                 )
+            if created:
                 created_block_ids.append(block_id)
-                if layer_name in self._layer_indices:
-                    self._record(
-                        "digest_created",
-                        layer_name=layer_name,
-                        layer_event_idx=layer_event_idx,
-                        physical_block_id=block_id,
-                        digest_min_shape=self._shape_of(digest.digest_min),
-                        digest_max_shape=self._shape_of(digest.digest_max),
-                        valid_token_count=digest.valid_token_count,
-                        block_size=digest.block_size,
-                        digest_kind=digest.digest_kind,
-                        num_digest_blocks_for_layer=len(layer_digests),
-                        total_digest_blocks=self._num_digest_blocks(),
-                    )
 
         return created_block_ids
 
@@ -1846,6 +2163,8 @@ class RecoverySidecar:
     def _record(self, event: str, **fields: Any) -> None:
         """Increment an event counter and append one JSONL debug record."""
         self.counters[event] += 1
+        if not self.config.enable_logging:
+            return
         self._debug_writer.write(
             {
                 "event": event,
@@ -1866,6 +2185,26 @@ def get_mpr_sidecar() -> RecoverySidecar:
             if _GLOBAL_SIDECAR is None:
                 _GLOBAL_SIDECAR = RecoverySidecar()
     return _GLOBAL_SIDECAR
+
+
+def get_mpr_observe_kv_write_timing() -> dict[str, float | int]:
+    if _GLOBAL_SIDECAR is None:
+        return {
+            "count": 0,
+            "pre_observe_block_offsets_total_ms": 0.0,
+            "pre_observe_block_offsets_mean_ms": 0.0,
+            "pre_observe_block_offsets_max_ms": 0.0,
+            "observe_block_offsets_count": 0,
+            "observe_block_offsets_total_ms": 0.0,
+            "observe_block_offsets_mean_ms": 0.0,
+            "observe_block_offsets_max_ms": 0.0,
+        }
+    return _GLOBAL_SIDECAR.observe_kv_write_timing()
+
+
+def reset_mpr_observe_kv_write_timing() -> None:
+    if _GLOBAL_SIDECAR is not None:
+        _GLOBAL_SIDECAR.reset_observe_kv_write_timing()
 
 
 def reset_mpr_sidecar() -> None:
