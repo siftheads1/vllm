@@ -373,8 +373,8 @@ Current scoring implementation:
 
 ```text
 default digest_kind       = raw_minmax
-default scoring_backend  = torch_quest
-available CUDA backend   = quest_cuda
+default scoring_backend  = quest_cuda
+available reference backend = torch_quest
 default score granularity = kv_head
 ```
 

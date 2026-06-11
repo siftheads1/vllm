@@ -289,7 +289,7 @@ if TYPE_CHECKING:
     VLLM_MPR_WINDOW_SIZE: int = 64
     VLLM_MPR_RECENT_TOKENS: int = 64
     VLLM_MPR_SCORE_AGG: str = "max"
-    VLLM_MPR_SCORING_BACKEND: str = "torch_quest"
+    VLLM_MPR_SCORING_BACKEND: str = "quest_cuda"
     VLLM_MPR_DIGEST_KIND: str = "raw_minmax"
     VLLM_MPR_SCORE_GRANULARITY: str = "kv_head"
     VLLM_MPR_CPU_BACKUP: bool = False
@@ -2023,7 +2023,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Digest scoring backend for MPR score-only instrumentation.
     "VLLM_MPR_SCORING_BACKEND": lambda: os.getenv(
         "VLLM_MPR_SCORING_BACKEND",
-        "torch_quest",
+        "quest_cuda",
     ).lower(),
     # Digest construction policy for MPR score-only instrumentation.
     "VLLM_MPR_DIGEST_KIND": lambda: os.getenv(

@@ -943,6 +943,24 @@ scoring_request_ctx_seq_lens_count and scoring_request_ctx_block_table_row_count
 should drop from layer-count scale to step/group-count scale.
 ```
 
+## 2026-06-12: Default Scoring Backend Switched to Quest CUDA
+
+Changed the default `VLLM_MPR_SCORING_BACKEND` from `torch_quest` to
+`quest_cuda` in both `MPRConfig` and the vLLM environment registry. The
+PyTorch scorer remains available by explicitly setting:
+
+```bash
+VLLM_MPR_SCORING_BACKEND=torch_quest
+```
+
+Next runtime profile should confirm:
+
+```text
+mpr_scoring_backend: quest_cuda
+MPR sidecar enabled: ... scoring_backend=quest_cuda ...
+scoring_quest_packed_estimate_count > 0 when the persistent-prefix path matches
+```
+
 ## 2026-06-11: Gate Scoring Debug Work on Logging
 
 Remote scoring-profile results indicated that `scoring_estimate_query_scores`

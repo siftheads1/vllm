@@ -78,7 +78,7 @@ class MPRConfig:
     window_size: int = 64
     recent_tokens: int = 64
     score_agg: str = "max"
-    scoring_backend: str = "torch_quest"
+    scoring_backend: str = "quest_cuda"
     digest_kind: str = "raw_minmax"
     score_granularity: str = "kv_head"
     cpu_backup_enabled: bool = False
@@ -187,7 +187,7 @@ class MPRConfig:
             ),
             scoring_backend=_parse_choice(
                 "VLLM_MPR_SCORING_BACKEND",
-                "torch_quest",
+                "quest_cuda",
                 {"torch_quest", "quest_cuda"},
             ),
             digest_kind=_parse_choice(
