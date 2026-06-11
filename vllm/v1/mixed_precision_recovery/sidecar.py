@@ -74,6 +74,10 @@ _SCORING_PROFILE_TIMING_NAMES = (
     "scoring_window_stack_mean",
     "scoring_block_size",
     "scoring_request_block_context",
+    "scoring_request_ctx_seq_lens",
+    "scoring_request_ctx_block_table_lookup",
+    "scoring_request_ctx_block_table_row",
+    "scoring_request_ctx_candidates",
     "scoring_select_digest_blocks",
     "scoring_quest_packed_prefix",
     "scoring_quest_packed_estimate",
@@ -1770,11 +1774,27 @@ class RecoverySidecar:
         block_size: int | None,
     ) -> RequestBlockContext:
         """Parse the single-request block table and select score candidates."""
+        profile_enabled = self.config.scoring_profile_enabled
+        seq_lens_start = time.perf_counter() if profile_enabled else 0.0
         seq_lens = self._tensor_to_int_list(getattr(attn_metadata, "seq_lens", None))
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_request_ctx_seq_lens",
+                seq_lens_start,
+            )
+
+        block_table_lookup_start = time.perf_counter() if profile_enabled else 0.0
         block_table = getattr(attn_metadata, "block_table", None)
         if block_table is None:
             block_table = getattr(attn_metadata, "block_table_tensor", None)
         block_table_shape = self._shape_of(block_table)
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_request_ctx_block_table_lookup",
+                block_table_lookup_start,
+            )
+
+        block_table_row_start = time.perf_counter() if profile_enabled else 0.0
         block_table_row: list[int] = []
         if block_table is not None and getattr(block_table, "ndim", 0) >= 2:
             row_values = self._tensor_to_int_list(block_table[0])
@@ -1782,7 +1802,13 @@ class RecoverySidecar:
         elif block_table is not None:
             row_values = self._tensor_to_int_list(block_table)
             block_table_row = [] if row_values is None else row_values
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_request_ctx_block_table_row",
+                block_table_row_start,
+            )
 
+        candidates_start = time.perf_counter() if profile_enabled else 0.0
         inferred_num_reqs = len(seq_lens) if seq_lens is not None else None
         num_reqs = getattr(attn_metadata, "num_reqs", None)
         if num_reqs is None:
@@ -1817,6 +1843,11 @@ class RecoverySidecar:
                 for block_id in finalized_block_ids
                 if block_id not in protected_set
             ]
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_request_ctx_candidates",
+                candidates_start,
+            )
 
         return RequestBlockContext(
             num_reqs=num_reqs,

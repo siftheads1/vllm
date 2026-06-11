@@ -895,6 +895,29 @@ py_compile: passed
 git diff --check: passed
 ```
 
+## 2026-06-11: Request Block Context Profiling Breakdown
+
+Added temporary `_request_block_context()` breakdown timers under the existing
+scoring profiling gate:
+
+```text
+VLLM_MPR_SCORING_PROFILE=1
+```
+
+New output fields:
+
+```text
+mpr_scoring_profile_scoring_request_ctx_seq_lens_*
+mpr_scoring_profile_scoring_request_ctx_block_table_lookup_*
+mpr_scoring_profile_scoring_request_ctx_block_table_row_*
+mpr_scoring_profile_scoring_request_ctx_candidates_*
+```
+
+Use these alongside the existing inclusive
+`mpr_scoring_profile_scoring_request_block_context_*` fields to distinguish
+GPU/CPU metadata materialization from Python candidate-list construction before
+applying and later removing the optimization scaffolding.
+
 ## 2026-06-11: Gate Scoring Debug Work on Logging
 
 Remote scoring-profile results indicated that `scoring_estimate_query_scores`
