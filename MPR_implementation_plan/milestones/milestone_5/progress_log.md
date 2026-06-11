@@ -918,6 +918,10 @@ Use these alongside the existing inclusive
 GPU/CPU metadata materialization from Python candidate-list construction before
 applying and later removing the optimization scaffolding.
 
+Follow-up fix: added the same keys to the benchmark stdout printer and the
+step-51 runtime summary whitelist, so they appear both in `*_measured_*.log`
+and `runtime_summary.csv`.
+
 ## 2026-06-11: Gate Scoring Debug Work on Logging
 
 Remote scoring-profile results indicated that `scoring_estimate_query_scores`
