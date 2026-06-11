@@ -135,6 +135,14 @@ class RequestBlockContext:
     has_block_table_context: bool
 
 
+@dataclass
+class QueryWindowState:
+    """Rolling query-window state for one layer."""
+
+    entries: deque[torch.Tensor]
+    running_sum: torch.Tensor | None = None
+
+
 @dataclass(frozen=True)
 class QueryScoreContext:
     """Internal score result plus debug metadata for query-time MPR paths."""
@@ -179,7 +187,7 @@ class RecoverySidecar:
     # Step 1.4 v0 uses layer_name-only query windows for single-request smoke.
     # Serving/multi-request support needs request-scoped keys to avoid mixing
     # decode queries from different requests in the same layer buffer.
-    _query_windows: dict[str, deque[torch.Tensor]] = field(default_factory=dict)
+    _query_windows: dict[str, QueryWindowState] = field(default_factory=dict)
     _cpu_backup_store: CPUBackupStore = field(
         default_factory=SemanticCPUBackupStore
     )
@@ -1291,15 +1299,13 @@ class RecoverySidecar:
                 attn_metadata=attn_metadata,
             )
             return
-        window = self._query_windows.setdefault(
-            layer_name,
-            deque(maxlen=self.config.window_size),
-        )
-        window.append(query_for_window)
         # window_query: average of the observed decode queries so far, up to
         # VLLM_MPR_WINDOW_SIZE. Shape: [num_q_heads, head_dim].
         window_start = time.perf_counter() if profile_enabled else 0.0
-        window_query = torch.stack(tuple(window), dim=0).mean(dim=0)
+        window_query, window_query_len = self._update_query_window(
+            layer_name,
+            query_for_window,
+        )
         if profile_enabled:
             self._record_scoring_profile_timing(
                 "scoring_window_stack_mean",
@@ -1357,7 +1363,7 @@ class RecoverySidecar:
                 query=query,
                 attn_metadata=attn_metadata,
                 window_query=window_query,
-                window_query_len=len(window),
+                window_query_len=window_query_len,
             )
             return
 
@@ -1493,7 +1499,7 @@ class RecoverySidecar:
             layer_event_idx=layer_event_idx,
             query=query,
             window_query=window_query,
-            window_query_len=len(window),
+            window_query_len=window_query_len,
             request_context=request_context,
             physical_block_ids=physical_block_ids,
             score_result=score_result,
@@ -1510,6 +1516,38 @@ class RecoverySidecar:
                 context_start,
             )
         return score_context
+
+    def _update_query_window(
+        self,
+        layer_name: str,
+        query_for_window: torch.Tensor,
+    ) -> tuple[torch.Tensor, int]:
+        """Append one query and return the rolling query average."""
+        state = self._query_windows.setdefault(
+            layer_name,
+            QueryWindowState(deque(maxlen=self.config.window_size)),
+        )
+        running_sum = state.running_sum
+        if running_sum is not None and (
+            running_sum.shape != query_for_window.shape
+            or running_sum.dtype != query_for_window.dtype
+            or running_sum.device != query_for_window.device
+        ):
+            state.entries.clear()
+            state.running_sum = None
+            running_sum = None
+
+        if running_sum is None:
+            state.entries.append(query_for_window)
+            state.running_sum = query_for_window.clone()
+        else:
+            if len(state.entries) == self.config.window_size:
+                state.running_sum.sub_(state.entries[0])
+            state.entries.append(query_for_window)
+            state.running_sum.add_(query_for_window)
+
+        window_query_len = len(state.entries)
+        return state.running_sum / window_query_len, window_query_len
 
     def _record_score_estimated(self, score_context: QueryScoreContext) -> None:
         """Record a score_estimated event from reusable score context."""

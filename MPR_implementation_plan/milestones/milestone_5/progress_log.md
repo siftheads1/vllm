@@ -961,6 +961,26 @@ MPR sidecar enabled: ... scoring_backend=quest_cuda ...
 scoring_quest_packed_estimate_count > 0 when the persistent-prefix path matches
 ```
 
+## 2026-06-12: Rolling Query Window Sum
+
+Replaced the query-window average implementation:
+
+```python
+torch.stack(tuple(window), dim=0).mean(dim=0)
+```
+
+with a per-layer rolling sum. Each scoring call now adds the new query,
+subtracts the evicted query when the fixed-size window is full, and returns
+`running_sum / window_len`.
+
+Expected validation signal:
+
+```text
+scoring_window_stack_mean_total_ms should drop substantially.
+The profiling key name is kept unchanged for before/after comparison even
+though it now measures rolling-window update and mean construction.
+```
+
 ## 2026-06-11: Gate Scoring Debug Work on Logging
 
 Remote scoring-profile results indicated that `scoring_estimate_query_scores`
