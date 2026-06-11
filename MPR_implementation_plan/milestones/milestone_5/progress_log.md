@@ -922,6 +922,27 @@ Follow-up fix: added the same keys to the benchmark stdout printer and the
 step-51 runtime summary whitelist, so they appear both in `*_measured_*.log`
 and `runtime_summary.csv`.
 
+## 2026-06-11: Request Block Context Step Cache
+
+Remote scoring profile showed `_request_block_context()` at roughly 3 ms per
+decode step, dominated by repeated `seq_lens` and `block_table[0]` CPU
+materialization across layers.
+
+Added a conservative per-step cache for `_request_block_context()` results.
+The cache key includes the per-layer event index used as a decode-step stamp,
+block size, recent-token policy, scalar metadata, and tensor identity metadata
+for `seq_lens` and the block table. This targets the common single-KV-group
+case where all layers in a decode step share request/block metadata while still
+missing naturally when KV cache groups or shapes differ.
+
+Expected validation signal:
+
+```text
+scoring_request_block_context_total_ms should drop substantially.
+scoring_request_ctx_seq_lens_count and scoring_request_ctx_block_table_row_count
+should drop from layer-count scale to step/group-count scale.
+```
+
 ## 2026-06-11: Gate Scoring Debug Work on Logging
 
 Remote scoring-profile results indicated that `scoring_estimate_query_scores`

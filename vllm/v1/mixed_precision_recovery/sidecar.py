@@ -216,6 +216,8 @@ class RecoverySidecar:
     _counter_leader_layer_name: str | None = None
     _counter_seq_lens_by_row: list[int] = field(default_factory=list)
     _counter_seq_lens_initialized: bool = False
+    _request_block_context_cache_key: tuple[Any, ...] | None = None
+    _request_block_context_cache_value: RequestBlockContext | None = None
 
     def __post_init__(self) -> None:
         """Initialize optional debug output and emit the init event."""
@@ -1319,6 +1321,7 @@ class RecoverySidecar:
         request_context = self._request_block_context(
             attn_metadata=attn_metadata,
             block_size=block_size,
+            cache_step=layer_event_idx,
         )
         if profile_enabled:
             self._record_scoring_profile_timing(
@@ -1772,8 +1775,24 @@ class RecoverySidecar:
         *,
         attn_metadata: Any,
         block_size: int | None,
+        cache_step: int | None = None,
     ) -> RequestBlockContext:
         """Parse the single-request block table and select score candidates."""
+        cache_key = self._request_block_context_cache_key_for(
+            attn_metadata=attn_metadata,
+            block_size=block_size,
+            cache_step=cache_step,
+        )
+        if (
+            cache_key is not None
+            and cache_key == self._request_block_context_cache_key
+            and self._request_block_context_cache_value is not None
+        ):
+            self.counters["request_block_context_cache_hit"] += 1
+            return self._request_block_context_cache_value
+        if cache_key is not None:
+            self.counters["request_block_context_cache_miss"] += 1
+
         profile_enabled = self.config.scoring_profile_enabled
         seq_lens_start = time.perf_counter() if profile_enabled else 0.0
         seq_lens = self._tensor_to_int_list(getattr(attn_metadata, "seq_lens", None))
@@ -1849,7 +1868,7 @@ class RecoverySidecar:
                 candidates_start,
             )
 
-        return RequestBlockContext(
+        request_context = RequestBlockContext(
             num_reqs=num_reqs,
             max_query_len=getattr(attn_metadata, "max_query_len", None),
             num_actual_tokens=getattr(attn_metadata, "num_actual_tokens", None),
@@ -1864,6 +1883,101 @@ class RecoverySidecar:
             protected_block_ids=protected_block_ids,
             score_candidate_block_ids=score_candidate_block_ids,
             has_block_table_context=has_block_table_context,
+        )
+        if cache_key is not None:
+            self._request_block_context_cache_key = cache_key
+            self._request_block_context_cache_value = request_context
+        return request_context
+
+    def _request_block_context_cache_key_for(
+        self,
+        *,
+        attn_metadata: Any,
+        block_size: int | None,
+        cache_step: int | None,
+    ) -> tuple[Any, ...] | None:
+        """Return a per-step cache key for request/block metadata parsing."""
+        if cache_step is None:
+            return None
+        block_table = getattr(attn_metadata, "block_table", None)
+        if block_table is None:
+            block_table = getattr(attn_metadata, "block_table_tensor", None)
+        seq_lens = getattr(attn_metadata, "seq_lens", None)
+        if block_table is None and seq_lens is None:
+            return None
+        return (
+            int(cache_step),
+            int(block_size) if block_size is not None else None,
+            int(self.config.recent_tokens),
+            self._cache_scalar_identity(
+                getattr(attn_metadata, "max_query_len", None)
+            ),
+            self._cache_scalar_identity(
+                getattr(attn_metadata, "num_actual_tokens", None)
+            ),
+            self._cache_scalar_identity(getattr(attn_metadata, "num_reqs", None)),
+            self._tensor_cache_identity(seq_lens),
+            self._tensor_cache_identity(block_table),
+        )
+
+    @staticmethod
+    def _cache_scalar_identity(value: Any) -> Any:
+        """Return a tuple-safe scalar identity for cache keys."""
+        if value is None:
+            return None
+        if isinstance(value, (bool, int, float, str)):
+            return value
+        item_fn = getattr(value, "item", None)
+        if callable(item_fn):
+            try:
+                item_value = item_fn()
+                if isinstance(item_value, (bool, int, float, str)):
+                    return item_value
+            except (RuntimeError, TypeError, ValueError):
+                pass
+        return repr(value)
+
+    @staticmethod
+    def _tensor_cache_identity(value: Any) -> tuple[Any, ...] | None:
+        """Return tensor identity metadata without materializing device data."""
+        if value is None:
+            return None
+        shape = getattr(value, "shape", None)
+        shape_tuple = (
+            tuple(int(dim) for dim in shape)
+            if shape is not None
+            else None
+        )
+        stride_value = None
+        stride_fn = getattr(value, "stride", None)
+        if callable(stride_fn):
+            try:
+                stride_value = tuple(int(dim) for dim in stride_fn())
+            except (RuntimeError, TypeError, ValueError):
+                stride_value = None
+        storage_offset = None
+        storage_offset_fn = getattr(value, "storage_offset", None)
+        if callable(storage_offset_fn):
+            try:
+                storage_offset = int(storage_offset_fn())
+            except (RuntimeError, TypeError, ValueError):
+                storage_offset = None
+        data_ptr = None
+        data_ptr_fn = getattr(value, "data_ptr", None)
+        if callable(data_ptr_fn):
+            try:
+                data_ptr = int(data_ptr_fn())
+            except (RuntimeError, TypeError, ValueError):
+                data_ptr = None
+        identity = data_ptr if data_ptr is not None else id(value)
+        return (
+            type(value).__name__,
+            identity,
+            shape_tuple,
+            stride_value,
+            storage_offset,
+            str(getattr(value, "device", None)),
+            str(getattr(value, "dtype", None)),
         )
 
     def _block_size_for_layer(self, layer_name: str) -> int | None:
