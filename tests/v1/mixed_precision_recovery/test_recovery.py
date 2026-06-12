@@ -57,6 +57,7 @@ def _make_recovery_sidecar(
         config=MPRConfig(
             enabled=True,
             recent_tokens=0,
+            scoring_backend="torch_quest",
             cpu_backup_enabled=True,
             backup_storage_mode=backup_storage_mode,
             recovery_enabled=recovery_enabled,
@@ -529,7 +530,7 @@ def test_sidecar_recovery_materializes_topk_block():
 
     torch.testing.assert_close(kv_cache[:, 0], torch.zeros_like(kv_cache[:, 0]))
     torch.testing.assert_close(kv_cache[:, 1], backup)
-    assert len(sidecar._query_windows[layer_name]) == 1
+    assert layer_name not in sidecar._query_windows
     assert sidecar.counters["recovery_materialized"] == 1
 
 

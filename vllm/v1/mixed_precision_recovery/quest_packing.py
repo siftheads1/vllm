@@ -59,8 +59,29 @@ class QuestMetadataStore:
     device: torch.device
     metadata_data: torch.Tensor = field(init=False)
     metadata_indices: torch.Tensor = field(init=False)
+    metadata_indptr: torch.Tensor = field(init=False)
     entry_block_ids: list[int] = field(default_factory=list)
     block_id_to_entry: dict[int, int] = field(default_factory=dict)
+    _cached_prefix: PackedQuestDigestCache | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _cached_prefix_num_score_entries: int | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _metadata_indptr_num_pages: int | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _last_zeroed_guard_entry: int | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.metadata_page_size <= 0:
@@ -89,6 +110,12 @@ class QuestMetadataStore:
             dtype=torch.int32,
             device=self.device,
         )
+        self.metadata_indptr = torch.tensor(
+            [0, 1],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._metadata_indptr_num_pages = 1
 
     @property
     def num_entries(self) -> int:
@@ -97,7 +124,19 @@ class QuestMetadataStore:
 
     def can_view_prefix(self, block_ids: list[int]) -> bool:
         """Return whether ``block_ids`` matches the store's entry prefix."""
-        return self.entry_block_ids[:len(block_ids)] == block_ids
+        block_count = len(block_ids)
+        if block_count > self.num_entries:
+            return False
+        if block_count == 0:
+            return True
+        if self.entry_block_ids[0] != block_ids[0]:
+            return False
+        if self.entry_block_ids[block_count - 1] != block_ids[-1]:
+            return False
+        return all(
+            self.entry_block_ids[idx] == block_id
+            for idx, block_id in enumerate(block_ids[1:-1], start=1)
+        )
 
     def append_digest(
         self,
@@ -139,6 +178,7 @@ class QuestMetadataStore:
         self.entry_block_ids.append(block_id)
         self.block_id_to_entry[block_id] = entry_idx
         self._zero_entry(entry_idx + 1)
+        self._invalidate_prefix_cache()
 
     def view_prefix(self, num_score_entries: int) -> PackedQuestDigestCache:
         """Return a Quest packed-cache view over the first score entries.
@@ -156,25 +196,30 @@ class QuestMetadataStore:
                 "Quest metadata store prefix view exceeds stored entries: "
                 f"{num_score_entries} > {self.num_entries}."
             )
+        if (
+            self._cached_prefix is not None
+            and self._cached_prefix_num_score_entries == num_score_entries
+        ):
+            return self._cached_prefix
 
         num_packed_entries = num_score_entries + 1
         self._ensure_entry_capacity(num_packed_entries)
-        self._zero_entry(num_score_entries)
+        if (
+            num_score_entries == self.num_entries
+            and self._last_zeroed_guard_entry != num_score_entries
+        ):
+            self._zero_entry(num_score_entries)
         num_metadata_pages = (
             num_packed_entries + self.metadata_page_size - 1
         ) // self.metadata_page_size
         metadata_last_page_len = (
             (num_packed_entries - 1) % self.metadata_page_size
         ) + 1
-        metadata_indptr = torch.tensor(
-            [0, num_metadata_pages],
-            dtype=torch.int32,
-            device=self.device,
-        )
-        return PackedQuestDigestCache(
+        self._set_metadata_indptr_num_pages(num_metadata_pages)
+        packed = PackedQuestDigestCache(
             metadata_data=self.metadata_data[:num_metadata_pages],
             metadata_indices=self.metadata_indices[:num_metadata_pages],
-            metadata_indptr=metadata_indptr,
+            metadata_indptr=self.metadata_indptr,
             metadata_last_page_len=metadata_last_page_len,
             metadata_last_page_idx=num_metadata_pages - 1,
             entry_block_ids=list(self.entry_block_ids[:num_score_entries]),
@@ -182,6 +227,9 @@ class QuestMetadataStore:
             num_packed_entries=num_packed_entries,
             metadata_page_size=self.metadata_page_size,
         )
+        self._cached_prefix = packed
+        self._cached_prefix_num_score_entries = num_score_entries
+        return packed
 
     def _ensure_entry_capacity(self, required_entries: int) -> None:
         required_pages = (
@@ -210,12 +258,25 @@ class QuestMetadataStore:
             dtype=torch.int32,
             device=self.device,
         )
+        self._invalidate_prefix_cache()
 
     def _zero_entry(self, entry_idx: int) -> None:
         self._ensure_entry_capacity(entry_idx + 1)
         page_idx = entry_idx // self.metadata_page_size
         page_offset = entry_idx % self.metadata_page_size
         self.metadata_data[page_idx, :, page_offset].zero_()
+        self._last_zeroed_guard_entry = entry_idx
+
+    def _set_metadata_indptr_num_pages(self, num_metadata_pages: int) -> None:
+        if self._metadata_indptr_num_pages == num_metadata_pages:
+            return
+        self.metadata_indptr[0] = 0
+        self.metadata_indptr[1] = num_metadata_pages
+        self._metadata_indptr_num_pages = num_metadata_pages
+
+    def _invalidate_prefix_cache(self) -> None:
+        self._cached_prefix = None
+        self._cached_prefix_num_score_entries = None
 
 
 def pack_quest_metadata_cache(

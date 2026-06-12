@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -18,6 +19,46 @@ from vllm.v1.mixed_precision_recovery.quest_packing import (
 
 QUEST_CUDA_SUPPORTED_GROUP_SIZES = frozenset({1, 4, 8})
 QUEST_NHD_LAYOUT = 0
+PACKED_ESTIMATE_PROFILE_TIMING_NAMES = (
+    "quest_packed_estimate_output_alloc",
+    "quest_packed_estimate_query_prepare",
+    "quest_packed_estimate_custom_op",
+    "quest_packed_estimate_transpose",
+    "quest_packed_estimate_aggregate",
+    "quest_packed_estimate_result_build",
+)
+_PACKED_ESTIMATE_PROFILE_TIMING: dict[str, dict[str, float | int]] = {
+    name: {"count": 0, "total_ms": 0.0, "max_ms": 0.0}
+    for name in PACKED_ESTIMATE_PROFILE_TIMING_NAMES
+}
+
+
+def _record_packed_estimate_profile_timing(name: str, start: float) -> None:
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    timing = _PACKED_ESTIMATE_PROFILE_TIMING[name]
+    timing["count"] = int(timing["count"]) + 1
+    timing["total_ms"] = float(timing["total_ms"]) + elapsed_ms
+    timing["max_ms"] = max(float(timing["max_ms"]), elapsed_ms)
+
+
+def get_packed_estimate_profile_timing() -> dict[str, float | int]:
+    result: dict[str, float | int] = {}
+    for name in PACKED_ESTIMATE_PROFILE_TIMING_NAMES:
+        timing = _PACKED_ESTIMATE_PROFILE_TIMING[name]
+        count = int(timing["count"])
+        total_ms = float(timing["total_ms"])
+        result[f"{name}_count"] = count
+        result[f"{name}_total_ms"] = total_ms
+        result[f"{name}_mean_ms"] = total_ms / count if count else 0.0
+        result[f"{name}_max_ms"] = float(timing["max_ms"])
+    return result
+
+
+def reset_packed_estimate_profile_timing() -> None:
+    for timing in _PACKED_ESTIMATE_PROFILE_TIMING.values():
+        timing["count"] = 0
+        timing["total_ms"] = 0.0
+        timing["max_ms"] = 0.0
 
 
 @dataclass(frozen=True)
@@ -222,6 +263,44 @@ def aggregate_query_head_scores(
     return block_scores, per_kv_head_scores
 
 
+def aggregate_packed_query_head_scores(
+    packed_query_head_scores: torch.Tensor,
+    *,
+    num_kv_heads: int,
+    score_agg: str,
+) -> torch.Tensor:
+    """Aggregate packed Quest output directly to block scores.
+
+    This optimized helper consumes the CUDA Quest output layout
+    ``[num_q_heads, num_blocks]`` and returns only ``block_scores``. It avoids
+    materializing the reference/debug layout ``[num_blocks, num_q_heads]`` and
+    the intermediate per-KV-head scores. It is equivalent to
+    ``aggregate_query_head_scores(output.T.contiguous(), ...)`` for the block
+    score result because all KV-head groups have the same GQA group size.
+    """
+    if packed_query_head_scores.ndim != 2:
+        raise ValueError(
+            "MPR packed scoring aggregation expects scores shaped "
+            "[num_q_heads, num_blocks], got "
+            f"{tuple(packed_query_head_scores.shape)}."
+        )
+    if score_agg not in {"max", "mean"}:
+        raise ValueError(
+            "MPR scoring score_agg must be 'max' or 'mean', "
+            f"got {score_agg!r}."
+        )
+    num_q_heads = int(packed_query_head_scores.shape[0])
+    if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
+        raise AssertionError(
+            "MPR scoring requires num_q_heads to be a positive multiple of "
+            f"num_kv_heads, got num_q_heads={num_q_heads}, "
+            f"num_kv_heads={num_kv_heads}."
+        )
+    if score_agg == "max":
+        return packed_query_head_scores.max(dim=0).values
+    return packed_query_head_scores.mean(dim=0)
+
+
 class TorchQuestScorer:
     """PyTorch reference scorer using Quest/ArkVale cuboid score semantics."""
 
@@ -278,8 +357,16 @@ class QuestCudaScorer:
         packed: PackedQuestDigestCache,
         num_kv_heads: int,
         score_agg: str,
+        profile_enabled: bool = False,
     ) -> DigestScoreResult:
-        """Estimate scores from an already packed Quest metadata cache."""
+        """Reference packed Quest scorer with full head-score materialization.
+
+        This original path preserves the debug-friendly result shape: it keeps
+        per-query-head scores, transposes them to ``[num_blocks, num_q_heads]``,
+        and builds per-KV-head scores before returning block scores. The
+        optimized sidecar path should use ``estimate_packed_optimized`` when it
+        only needs block-level scores.
+        """
         if query_window.ndim != 2:
             raise ValueError(
                 "quest_cuda packed scoring expects query_window shaped "
@@ -352,13 +439,29 @@ class QuestCudaScorer:
                 "mpr_estimate_attn_score custom op wrapper is unavailable."
             )
 
+        output_start = time.perf_counter() if profile_enabled else 0.0
         output = torch.empty(
             (num_q_heads, packed.num_score_entries),
             dtype=query_window.dtype,
             device=query_window.device,
         )
+        if profile_enabled:
+            _record_packed_estimate_profile_timing(
+                "quest_packed_estimate_output_alloc",
+                output_start,
+            )
+
+        query_prepare_start = time.perf_counter() if profile_enabled else 0.0
+        query_input = query_window.unsqueeze(0).contiguous()
+        if profile_enabled:
+            _record_packed_estimate_profile_timing(
+                "quest_packed_estimate_query_prepare",
+                query_prepare_start,
+            )
+
+        custom_op_start = time.perf_counter() if profile_enabled else 0.0
         ops.mpr_estimate_attn_score(
-            query_window.unsqueeze(0).contiguous(),
+            query_input,
             output,
             packed.metadata_data,
             packed.metadata_indices,
@@ -367,13 +470,34 @@ class QuestCudaScorer:
             packed.metadata_last_page_idx,
             QUEST_NHD_LAYOUT,
         )
+        if profile_enabled:
+            _record_packed_estimate_profile_timing(
+                "quest_packed_estimate_custom_op",
+                custom_op_start,
+            )
+
+        transpose_start = time.perf_counter() if profile_enabled else 0.0
         per_query_head_scores = output.transpose(0, 1).contiguous()
+        if profile_enabled:
+            _record_packed_estimate_profile_timing(
+                "quest_packed_estimate_transpose",
+                transpose_start,
+            )
+
+        aggregate_start = time.perf_counter() if profile_enabled else 0.0
         block_scores, per_kv_head_scores = aggregate_query_head_scores(
             per_query_head_scores,
             num_kv_heads=num_kv_heads,
             score_agg=score_agg,
         )
-        return DigestScoreResult(
+        if profile_enabled:
+            _record_packed_estimate_profile_timing(
+                "quest_packed_estimate_aggregate",
+                aggregate_start,
+            )
+
+        result_start = time.perf_counter() if profile_enabled else 0.0
+        result = DigestScoreResult(
             block_scores=block_scores,
             per_query_head_scores=per_query_head_scores,
             per_kv_head_scores=per_kv_head_scores,
@@ -383,6 +507,192 @@ class QuestCudaScorer:
             num_kv_heads=num_kv_heads,
             group_size=group_size,
         )
+        if profile_enabled:
+            _record_packed_estimate_profile_timing(
+                "quest_packed_estimate_result_build",
+                result_start,
+            )
+        return result
+
+    def estimate_packed_optimized(
+        self,
+        *,
+        query_window: torch.Tensor,
+        packed: PackedQuestDigestCache,
+        num_kv_heads: int,
+        score_agg: str,
+        profile_enabled: bool = False,
+        materialize_head_scores: bool = False,
+    ) -> DigestScoreResult:
+        """Optimized packed Quest scorer for the block-score hot path.
+
+        When ``materialize_head_scores`` is false, this path keeps the custom
+        op's native ``[num_q_heads, num_blocks]`` output layout and computes
+        ``block_scores`` directly from it. That avoids the reference path's
+        transpose/contiguous copy and per-KV-head intermediate tensor. The
+        returned head-score tensors are empty placeholders in this mode and must
+        not be used for debug head top-k output.
+
+        Set ``materialize_head_scores=True`` to fall back to ``estimate_packed``
+        for logging/debug paths that need ``per_query_head_scores`` or
+        ``per_kv_head_scores``.
+        """
+        if materialize_head_scores:
+            return self.estimate_packed(
+                query_window=query_window,
+                packed=packed,
+                num_kv_heads=num_kv_heads,
+                score_agg=score_agg,
+                profile_enabled=profile_enabled,
+            )
+        if query_window.ndim != 2:
+            raise ValueError(
+                "quest_cuda packed scoring expects query_window shaped "
+                f"[num_q_heads, head_dim], got {tuple(query_window.shape)}."
+            )
+        if score_agg not in {"max", "mean"}:
+            raise ValueError(
+                "MPR scoring score_agg must be 'max' or 'mean', "
+                f"got {score_agg!r}."
+            )
+        num_blocks = packed.num_score_entries
+        num_q_heads = int(query_window.shape[0])
+        if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
+            raise AssertionError(
+                "MPR scoring requires num_q_heads to be a positive multiple of "
+                f"num_kv_heads, got num_q_heads={num_q_heads}, "
+                f"num_kv_heads={num_kv_heads}."
+            )
+        group_size = num_q_heads // num_kv_heads
+        if group_size not in QUEST_CUDA_SUPPORTED_GROUP_SIZES:
+            supported = sorted(QUEST_CUDA_SUPPORTED_GROUP_SIZES)
+            raise RuntimeError(
+                "quest_cuda scoring is unavailable for GQA group_size="
+                f"{group_size}; supported group sizes are {supported}."
+            )
+        if num_blocks <= 0:
+            block_scores = torch.empty(
+                (0,),
+                dtype=query_window.dtype,
+                device=query_window.device,
+            )
+            per_query_head_scores = torch.empty(
+                (0, num_q_heads),
+                dtype=query_window.dtype,
+                device=query_window.device,
+            )
+            per_kv_head_scores = torch.empty(
+                (0, num_kv_heads),
+                dtype=query_window.dtype,
+                device=query_window.device,
+            )
+            return DigestScoreResult(
+                block_scores=block_scores,
+                per_query_head_scores=per_query_head_scores,
+                per_kv_head_scores=per_kv_head_scores,
+                score_agg=score_agg,
+                scoring_backend=self.name,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                group_size=group_size,
+            )
+        if not query_window.is_cuda:
+            raise RuntimeError("quest_cuda scoring requires CUDA query tensors.")
+        if packed.metadata_data.dtype != query_window.dtype:
+            raise RuntimeError(
+                "quest_cuda packed metadata dtype must match query dtype, got "
+                f"{packed.metadata_data.dtype} and {query_window.dtype}."
+            )
+        if packed.metadata_data.device != query_window.device:
+            raise RuntimeError(
+                "quest_cuda packed metadata device must match query device, got "
+                f"{packed.metadata_data.device} and {query_window.device}."
+            )
+
+        try:
+            from vllm import _custom_ops as ops
+        except Exception as exc:
+            raise RuntimeError(
+                "quest_cuda scoring could not import vLLM custom ops."
+            ) from exc
+
+        if not hasattr(ops, "mpr_estimate_attn_score"):
+            raise RuntimeError(
+                "quest_cuda scoring backend is selected, but the "
+                "mpr_estimate_attn_score custom op wrapper is unavailable."
+            )
+
+        output_start = time.perf_counter() if profile_enabled else 0.0
+        output = torch.empty(
+            (num_q_heads, packed.num_score_entries),
+            dtype=query_window.dtype,
+            device=query_window.device,
+        )
+        if profile_enabled:
+            _record_packed_estimate_profile_timing(
+                "quest_packed_estimate_output_alloc",
+                output_start,
+            )
+
+        query_prepare_start = time.perf_counter() if profile_enabled else 0.0
+        query_input = query_window.unsqueeze(0).contiguous()
+        if profile_enabled:
+            _record_packed_estimate_profile_timing(
+                "quest_packed_estimate_query_prepare",
+                query_prepare_start,
+            )
+
+        custom_op_start = time.perf_counter() if profile_enabled else 0.0
+        ops.mpr_estimate_attn_score(
+            query_input,
+            output,
+            packed.metadata_data,
+            packed.metadata_indices,
+            packed.metadata_indptr,
+            packed.metadata_last_page_len,
+            packed.metadata_last_page_idx,
+            QUEST_NHD_LAYOUT,
+        )
+        if profile_enabled:
+            _record_packed_estimate_profile_timing(
+                "quest_packed_estimate_custom_op",
+                custom_op_start,
+            )
+
+        aggregate_start = time.perf_counter() if profile_enabled else 0.0
+        block_scores = aggregate_packed_query_head_scores(
+            output,
+            num_kv_heads=num_kv_heads,
+            score_agg=score_agg,
+        )
+        if profile_enabled:
+            _record_packed_estimate_profile_timing(
+                "quest_packed_estimate_aggregate",
+                aggregate_start,
+            )
+
+        result_start = time.perf_counter() if profile_enabled else 0.0
+        empty_head_scores = torch.empty(
+            (num_blocks, 0),
+            dtype=query_window.dtype,
+            device=query_window.device,
+        )
+        result = DigestScoreResult(
+            block_scores=block_scores,
+            per_query_head_scores=empty_head_scores,
+            per_kv_head_scores=empty_head_scores,
+            score_agg=score_agg,
+            scoring_backend=self.name,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            group_size=group_size,
+        )
+        if profile_enabled:
+            _record_packed_estimate_profile_timing(
+                "quest_packed_estimate_result_build",
+                result_start,
+            )
+        return result
 
     def estimate(
         self,

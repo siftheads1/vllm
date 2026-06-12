@@ -27,6 +27,7 @@ from vllm.v1.mixed_precision_recovery.scoring import (
     QUEST_NHD_LAYOUT,
     QuestCudaScorer,
     TorchQuestScorer,
+    aggregate_packed_query_head_scores,
     aggregate_query_head_scores,
     estimate_digest_score_result,
     estimate_digest_scores,
@@ -674,6 +675,31 @@ def test_query_head_aggregation_uses_conservative_gqa_union_for_max():
     torch.testing.assert_close(mean_block_scores, torch.tensor([4.0, 5.25]))
 
 
+def test_packed_query_head_aggregation_matches_reference_block_scores():
+    per_query_head_scores = torch.tensor(
+        [
+            [1.0, 10.0, 2.0, 3.0],
+            [4.0, 1.0, 9.0, 7.0],
+            [3.0, 8.0, 5.0, 6.0],
+        ]
+    )
+    packed_scores = per_query_head_scores.transpose(0, 1).contiguous()
+
+    for score_agg in ("max", "mean"):
+        reference_block_scores, _ = aggregate_query_head_scores(
+            per_query_head_scores,
+            num_kv_heads=2,
+            score_agg=score_agg,
+        )
+        optimized_block_scores = aggregate_packed_query_head_scores(
+            packed_scores,
+            num_kv_heads=2,
+            score_agg=score_agg,
+        )
+
+        torch.testing.assert_close(optimized_block_scores, reference_block_scores)
+
+
 def test_query_head_scores_are_available_before_block_aggregation():
     query_window = torch.tensor(
         [
@@ -703,6 +729,7 @@ def test_sidecar_head_score_debug_fields_for_kv_head_granularity():
             enabled=True,
             topk=1,
             score_granularity="kv_head",
+            scoring_backend="torch_quest",
         )
     )
     query_window = torch.tensor(
@@ -971,6 +998,82 @@ def test_quest_metadata_store_prefix_view_matches_compact_packer():
     torch.testing.assert_close(packed.metadata_indptr, compact.metadata_indptr)
 
 
+def test_quest_metadata_store_reuses_cached_prefix_view():
+    store = QuestMetadataStore(
+        metadata_page_size=2,
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    for block_id in [10, 4]:
+        store.append_digest(
+            block_id=block_id,
+            digest_min=torch.full((1, 2), -float(block_id)),
+            digest_max=torch.full((1, 2), float(block_id)),
+        )
+
+    first = store.view_prefix(2)
+    second = store.view_prefix(2)
+
+    assert second is first
+    assert second.metadata_indptr.data_ptr() == first.metadata_indptr.data_ptr()
+    assert second.metadata_indptr.tolist() == [0, 2]
+
+    store.append_digest(
+        block_id=7,
+        digest_min=torch.full((1, 2), -7.0),
+        digest_max=torch.full((1, 2), 7.0),
+    )
+    after_append = store.view_prefix(3)
+
+    assert after_append is not first
+    assert after_append.metadata_indptr.data_ptr() == first.metadata_indptr.data_ptr()
+    assert after_append.metadata_indptr.tolist() == [0, 2]
+    torch.testing.assert_close(
+        after_append.metadata_data[1, :, 1],
+        torch.zeros_like(after_append.metadata_data[1, :, 1]),
+    )
+
+
+def test_quest_metadata_store_keeps_real_entry_when_viewing_short_prefix():
+    store = QuestMetadataStore(
+        metadata_page_size=2,
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    for block_id in [10, 4]:
+        store.append_digest(
+            block_id=block_id,
+            digest_min=torch.full((1, 2), -float(block_id)),
+            digest_max=torch.full((1, 2), float(block_id)),
+        )
+
+    packed = store.view_prefix(1)
+
+    assert packed.entry_block_ids == [10]
+    torch.testing.assert_close(
+        packed.metadata_data[0, :, 1],
+        torch.tensor([[[4.0, 4.0]], [[-4.0, -4.0]]]),
+    )
+
+    full_prefix = store.view_prefix(2)
+    torch.testing.assert_close(
+        full_prefix.metadata_data[0, 0, 1],
+        torch.full((1, 2), 4.0),
+    )
+    torch.testing.assert_close(
+        full_prefix.metadata_data[0, 1, 1],
+        torch.full((1, 2), -4.0),
+    )
+    torch.testing.assert_close(
+        full_prefix.metadata_data[1, :, 0],
+        torch.zeros_like(full_prefix.metadata_data[1, :, 0]),
+    )
+
+
 def test_sidecar_quest_packed_prefix_fast_path_requires_prefix():
     layer_name = "model.layers.0.self_attn.attn"
     sidecar = RecoverySidecar(
@@ -1122,9 +1225,15 @@ def test_estimate_digest_scores_rejects_invalid_head_grouping():
         estimate_digest_scores(query_window, digest_min, digest_max, "max")
 
 
-def test_sidecar_query_window_uses_available_then_recent_queries():
+def test_sidecar_query_scoring_uses_current_query_without_window_state():
     sidecar = RecoverySidecar(
-        config=MPRConfig(enabled=True, window_size=2, topk=1, score_agg="mean")
+        config=MPRConfig(
+            enabled=True,
+            window_size=2,
+            topk=1,
+            score_agg="mean",
+            scoring_backend="torch_quest",
+        )
     )
     layer_name = "model.layers.0.self_attn.attn"
     sidecar._digest_cache[layer_name] = {
@@ -1139,17 +1248,153 @@ def test_sidecar_query_window_uses_available_then_recent_queries():
     metadata = SimpleNamespace(max_query_len=1, num_actual_tokens=1)
 
     sidecar.observe_query(layer_name, torch.tensor([[[1.0, 3.0]]]), metadata)
-    assert len(sidecar._query_windows[layer_name]) == 1
-
     sidecar.observe_query(layer_name, torch.tensor([[[5.0, 7.0]]]), metadata)
-    assert len(sidecar._query_windows[layer_name]) == 2
-
     sidecar.observe_query(layer_name, torch.tensor([[[9.0, 11.0]]]), metadata)
-    window_values = list(sidecar._query_windows[layer_name])
-    assert len(window_values) == 2
-    torch.testing.assert_close(window_values[0], torch.tensor([[5.0, 7.0]]))
-    torch.testing.assert_close(window_values[1], torch.tensor([[9.0, 11.0]]))
+
+    assert layer_name not in sidecar._query_windows
     assert sidecar.counters["score_estimated"] == 3
+
+
+def test_sidecar_optimized_scoring_uses_block_score_only_packed_path():
+    class FakeOptimizedBackend:
+        def __init__(self):
+            self.materialize_head_scores: list[bool] = []
+
+        def estimate_packed_optimized(self, **kwargs):
+            self.materialize_head_scores.append(kwargs["materialize_head_scores"])
+            return SimpleNamespace(
+                block_scores=torch.tensor([1.0, 2.0]),
+                per_query_head_scores=torch.empty(2, 0),
+                per_kv_head_scores=torch.empty(2, 0),
+                score_agg=kwargs["score_agg"],
+                scoring_backend="fake_quest_cuda",
+                num_q_heads=1,
+                num_kv_heads=1,
+                group_size=1,
+            )
+
+        def estimate(self, **kwargs):
+            raise AssertionError("optimized packed path should be used")
+
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = RecoverySidecar(
+        config=MPRConfig(enabled=True, scoring_backend="quest_cuda")
+    )
+    sidecar._scoring_backend = FakeOptimizedBackend()
+    sidecar._digest_cache[layer_name] = {
+        block_id: BlockDigest(
+            digest_min=torch.full((1, 2), -float(block_id)),
+            digest_max=torch.full((1, 2), float(block_id)),
+            valid_token_count=2,
+            block_size=2,
+            layer_event_idx=0,
+        )
+        for block_id in [3, 4]
+    }
+    store = QuestMetadataStore(
+        metadata_page_size=2,
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    for block_id in [3, 4]:
+        digest = sidecar._digest_cache[layer_name][block_id]
+        store.append_digest(
+            block_id=block_id,
+            digest_min=digest.digest_min,
+            digest_max=digest.digest_max,
+        )
+    sidecar._quest_metadata_stores[layer_name] = store
+
+    score_context = sidecar._estimate_query_scores_optimized(
+        layer_name=layer_name,
+        query=torch.ones(1, 1, 2),
+        attn_metadata=SimpleNamespace(max_query_len=1, num_actual_tokens=1),
+        should_record=False,
+        layer_event_idx=0,
+        block_size_override=2,
+    )
+
+    assert score_context is not None
+    assert sidecar._scoring_backend.materialize_head_scores == [False]
+    torch.testing.assert_close(
+        score_context.score_result.block_scores,
+        torch.tensor([1.0, 2.0]),
+    )
+
+
+def test_sidecar_optimized_scoring_materializes_heads_for_head_debug():
+    class FakeOptimizedBackend:
+        def __init__(self):
+            self.materialize_head_scores: list[bool] = []
+
+        def estimate_packed_optimized(self, **kwargs):
+            self.materialize_head_scores.append(kwargs["materialize_head_scores"])
+            return SimpleNamespace(
+                block_scores=torch.tensor([1.0, 2.0]),
+                per_query_head_scores=torch.tensor([[1.0], [2.0]]),
+                per_kv_head_scores=torch.tensor([[1.0], [2.0]]),
+                score_agg=kwargs["score_agg"],
+                scoring_backend="fake_quest_cuda",
+                num_q_heads=1,
+                num_kv_heads=1,
+                group_size=1,
+            )
+
+        def estimate(self, **kwargs):
+            raise AssertionError("optimized packed path should be used")
+
+    layer_name = "model.layers.0.self_attn.attn"
+    sidecar = RecoverySidecar(
+        config=MPRConfig(
+            enabled=True,
+            enable_logging=True,
+            scoring_backend="quest_cuda",
+            score_granularity="kv_head",
+            topk=1,
+        )
+    )
+    sidecar._scoring_backend = FakeOptimizedBackend()
+    sidecar._digest_cache[layer_name] = {
+        block_id: BlockDigest(
+            digest_min=torch.full((1, 2), -float(block_id)),
+            digest_max=torch.full((1, 2), float(block_id)),
+            valid_token_count=2,
+            block_size=2,
+            layer_event_idx=0,
+        )
+        for block_id in [3, 4]
+    }
+    store = QuestMetadataStore(
+        metadata_page_size=2,
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    for block_id in [3, 4]:
+        digest = sidecar._digest_cache[layer_name][block_id]
+        store.append_digest(
+            block_id=block_id,
+            digest_min=digest.digest_min,
+            digest_max=digest.digest_max,
+        )
+    sidecar._quest_metadata_stores[layer_name] = store
+
+    score_context = sidecar._estimate_query_scores_optimized(
+        layer_name=layer_name,
+        query=torch.ones(1, 1, 2),
+        attn_metadata=SimpleNamespace(max_query_len=1, num_actual_tokens=1),
+        should_record=True,
+        layer_event_idx=0,
+        block_size_override=2,
+    )
+
+    assert score_context is not None
+    assert sidecar._scoring_backend.materialize_head_scores == [True]
+    assert score_context.head_debug["num_score_heads"] == 1
+    assert score_context.head_debug["topk_block_ids_by_head"] == [[4]]
 
 
 def test_sidecar_query_scoring_skips_non_single_request_decode():

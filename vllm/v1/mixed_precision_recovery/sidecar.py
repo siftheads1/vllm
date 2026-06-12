@@ -49,7 +49,10 @@ from vllm.v1.mixed_precision_recovery.recovery_payload import (
 from vllm.v1.mixed_precision_recovery.scoring import (
     DigestScoreResult,
     DigestScoringBackend,
+    PACKED_ESTIMATE_PROFILE_TIMING_NAMES,
     get_digest_scoring_backend,
+    get_packed_estimate_profile_timing,
+    reset_packed_estimate_profile_timing,
 )
 
 logger = init_logger(__name__)
@@ -88,6 +91,7 @@ _SCORING_PROFILE_TIMING_NAMES = (
     "scoring_head_topk_debug",
     "scoring_block_debug_fields",
     "scoring_context_build",
+    *PACKED_ESTIMATE_PROFILE_TIMING_NAMES,
 )
 
 
@@ -325,6 +329,7 @@ class RecoverySidecar:
         timing = self._scoring_profile_timing
         for key in timing:
             timing[key] = 0.0
+        reset_packed_estimate_profile_timing()
 
     def scoring_profile_timing(self) -> dict[str, float | int]:
         timing = self._scoring_profile_timing
@@ -336,6 +341,7 @@ class RecoverySidecar:
             result[f"{name}_total_ms"] = total_ms
             result[f"{name}_mean_ms"] = total_ms / count if count > 0 else 0.0
             result[f"{name}_max_ms"] = timing.get(f"{name}_max_ms", 0.0)
+        result.update(get_packed_estimate_profile_timing())
         return result
 
     def _record_scoring_profile_timing(
@@ -852,7 +858,7 @@ class RecoverySidecar:
             return
         profile_enabled = self.config.scoring_profile_enabled
         estimate_start = time.perf_counter() if profile_enabled else 0.0
-        score_context = self._estimate_query_scores(
+        score_context = self._estimate_query_scores_optimized(
             layer_name=layer_name,
             query=query,
             attn_metadata=attn_metadata,
@@ -968,7 +974,7 @@ class RecoverySidecar:
 
         profile_enabled = self.config.scoring_profile_enabled
         estimate_start = time.perf_counter() if profile_enabled else 0.0
-        score_context = self._estimate_query_scores(
+        score_context = self._estimate_query_scores_optimized(
             layer_name=layer_name,
             query=query,
             attn_metadata=attn_metadata,
@@ -1198,7 +1204,14 @@ class RecoverySidecar:
         layer_event_idx: int | None = None,
         block_size_override: int | None = None,
     ) -> QueryScoreContext | None:
-        """Estimate query-time digest scores and return reusable context."""
+        """Reference query scoring path retained for parity/debug comparison.
+
+        This original implementation keeps the conservative behavior that was
+        used during MPR bring-up: it clones the decode query and calls the
+        full-head scoring backend path so ``DigestScoreResult`` always carries
+        per-query-head and per-KV-head scores. The production hot path is wired
+        to ``_estimate_query_scores_optimized`` below.
+        """
         profile_enabled = self.config.scoring_profile_enabled
         if should_record is None:
             should_record_start = time.perf_counter() if profile_enabled else 0.0
@@ -1301,16 +1314,21 @@ class RecoverySidecar:
             return
         # window_query: average of the observed decode queries so far, up to
         # VLLM_MPR_WINDOW_SIZE. Shape: [num_q_heads, head_dim].
-        window_start = time.perf_counter() if profile_enabled else 0.0
-        window_query, window_query_len = self._update_query_window(
-            layer_name,
-            query_for_window,
-        )
-        if profile_enabled:
-            self._record_scoring_profile_timing(
-                "scoring_window_stack_mean",
-                window_start,
-            )
+        # window_start = time.perf_counter() if profile_enabled else 0.0
+        # window_query, window_query_len = self._update_query_window(
+        #     layer_name,
+        #     query_for_window,
+        # )
+        # if profile_enabled:
+        #     self._record_scoring_profile_timing(
+        #         "scoring_window_stack_mean",
+        #         window_start,
+        #     )
+
+        # Experimental current-query scoring path: bypass the rolling query
+        # window and score only the active decode step's query.
+        window_query = query_for_window
+        window_query_len = 1
 
         block_size_start = time.perf_counter() if profile_enabled else 0.0
         block_size = (
@@ -1398,6 +1416,7 @@ class RecoverySidecar:
                     packed=packed,
                     num_kv_heads=int(packed.metadata_data.shape[3]),
                     score_agg=self.config.score_agg,
+                    profile_enabled=profile_enabled,
                 )
                 if profile_enabled:
                     self._record_scoring_profile_timing(
@@ -1441,6 +1460,340 @@ class RecoverySidecar:
         scores = score_result.block_scores
         topk = min(self.config.topk, int(scores.numel()))
         debug_record_enabled = self.config.enable_logging and bool(should_record)
+        score_packing_debug: dict[str, Any] = {}
+        topk_block_ids: list[int] = []
+        topk_score_values: list[float] = []
+        head_debug: dict[str, Any] = {}
+        score_block_debug: dict[str, Any] = {}
+        if debug_record_enabled:
+            score_packing_debug_start = (
+                time.perf_counter() if profile_enabled else 0.0
+            )
+            score_packing_debug = self._score_packing_debug_fields(
+                quest_packed_fast_path=quest_packed_fast_path,
+                quest_packed_fallback_reason=quest_packed_fallback_reason,
+            )
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_score_packing_debug",
+                    score_packing_debug_start,
+                )
+            block_topk_start = time.perf_counter() if profile_enabled else 0.0
+            topk_block_ids, topk_score_values = self._topk_block_scores(
+                scores=scores,
+                physical_block_ids=physical_block_ids,
+                topk=topk,
+            )
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_block_topk",
+                    block_topk_start,
+                )
+            head_topk_start = time.perf_counter() if profile_enabled else 0.0
+            head_debug = self._head_score_debug_fields(
+                score_result=score_result,
+                physical_block_ids=physical_block_ids,
+                topk=topk,
+            )
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_head_topk_debug",
+                    head_topk_start,
+                )
+            block_debug_start = time.perf_counter() if profile_enabled else 0.0
+            score_block_debug = self._score_block_debug_fields(
+                request_context=request_context,
+                observed_digest_block_ids=physical_block_ids,
+            )
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_block_debug_fields",
+                    block_debug_start,
+                )
+
+        context_start = time.perf_counter() if profile_enabled else 0.0
+        score_context = QueryScoreContext(
+            layer_name=layer_name,
+            should_record=should_record,
+            layer_event_idx=layer_event_idx,
+            query=query,
+            window_query=window_query,
+            window_query_len=window_query_len,
+            request_context=request_context,
+            physical_block_ids=physical_block_ids,
+            score_result=score_result,
+            topk=topk,
+            topk_block_ids=topk_block_ids,
+            topk_scores=topk_score_values,
+            score_packing_debug=score_packing_debug,
+            head_debug=head_debug,
+            score_block_debug=score_block_debug,
+        )
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_context_build",
+                context_start,
+            )
+        return score_context
+
+    def _estimate_query_scores_optimized(
+        self,
+        *,
+        layer_name: str,
+        query: Any = None,
+        attn_metadata: Any = None,
+        should_record: bool | None = None,
+        layer_event_idx: int | None = None,
+        block_size_override: int | None = None,
+    ) -> QueryScoreContext | None:
+        """Optimized query scoring path for the current MPR hot path.
+
+        This method intentionally sits next to ``_estimate_query_scores`` instead
+        of replacing it. It preserves the same skip semantics and context shape,
+        but avoids two hot-path costs when debug head-score materialization is
+        not needed:
+
+        * use a detached query view instead of cloning the single decode row;
+        * call ``QuestCudaScorer.estimate_packed_optimized`` so block scores are
+          reduced from the Quest CUDA output layout without transposing the full
+          query-head score matrix.
+
+        If logging is enabled and ``score_granularity`` requests head-level
+        debug fields, the packed scorer is asked to materialize full head scores
+        and falls back to the reference packed path.
+        """
+        profile_enabled = self.config.scoring_profile_enabled
+        if should_record is None:
+            should_record_start = time.perf_counter() if profile_enabled else 0.0
+            should_record, layer_event_idx = self._should_record_layer_event(
+                layer_name,
+                self._score_counts,
+            )
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_should_record",
+                    should_record_start,
+                )
+        if query is None:
+            self._record_score_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "missing_query",
+                query=query,
+                attn_metadata=attn_metadata,
+            )
+            return
+        if attn_metadata is None:
+            self._record_score_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "missing_attn_metadata",
+                query=query,
+                attn_metadata=attn_metadata,
+            )
+            return
+
+        max_query_len = getattr(attn_metadata, "max_query_len", None)
+        if max_query_len != 1:
+            self._record_score_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "non_decode_query",
+                query=query,
+                attn_metadata=attn_metadata,
+            )
+            return
+
+        num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", None)
+        if num_actual_tokens != 1:
+            self._record_score_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "non_single_request_decode",
+                query=query,
+                attn_metadata=attn_metadata,
+            )
+            return
+        if query.ndim != 3:
+            raise ValueError(
+                "MPR Step 1.4 expects query shaped "
+                f"[num_tokens, num_q_heads, head_dim], got {tuple(query.shape)} "
+                f"for {layer_name}."
+            )
+        if int(query.shape[0]) < 1:
+            self._record_score_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "empty_query",
+                query=query,
+                attn_metadata=attn_metadata,
+            )
+            return
+
+        query_clone_start = time.perf_counter() if profile_enabled else 0.0
+        query_for_window = query[0].detach()
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_query_clone",
+                query_clone_start,
+            )
+        if not torch.is_floating_point(query_for_window):
+            self._record_score_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                "non_floating_query",
+                query=query,
+                attn_metadata=attn_metadata,
+            )
+            return
+
+        window_query = query_for_window
+        window_query_len = 1
+
+        block_size_start = time.perf_counter() if profile_enabled else 0.0
+        block_size = (
+            block_size_override
+            if block_size_override is not None
+            else self._block_size_for_layer(layer_name)
+        )
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_block_size",
+                block_size_start,
+            )
+        request_context_start = time.perf_counter() if profile_enabled else 0.0
+        request_context = self._request_block_context(
+            attn_metadata=attn_metadata,
+            block_size=block_size,
+            cache_step=layer_event_idx,
+        )
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_request_block_context",
+                request_context_start,
+            )
+        candidate_block_ids = (
+            request_context.score_candidate_block_ids
+            if request_context.has_block_table_context
+            else None
+        )
+        select_digest_start = time.perf_counter() if profile_enabled else 0.0
+        physical_block_ids = self._select_layer_digest_block_ids(
+            layer_name,
+            candidate_block_ids=candidate_block_ids,
+        )
+        if profile_enabled:
+            self._record_scoring_profile_timing(
+                "scoring_select_digest_blocks",
+                select_digest_start,
+            )
+        if not physical_block_ids:
+            skip_reason = (
+                "no_score_candidate_blocks"
+                if request_context.has_block_table_context
+                else "no_digest_blocks"
+            )
+            self._record_score_skip(
+                should_record,
+                layer_name,
+                layer_event_idx,
+                skip_reason,
+                query=query,
+                attn_metadata=attn_metadata,
+                window_query=window_query,
+                window_query_len=window_query_len,
+            )
+            return
+
+        debug_record_enabled = self.config.enable_logging and bool(should_record)
+        materialize_head_scores = debug_record_enabled and (
+            self.config.score_granularity != "block"
+        )
+        score_result = None
+        quest_packed_fast_path = False
+        quest_packed_fallback_reason = "backend_not_quest_cuda"
+        estimate_packed_optimized = getattr(
+            self._scoring_backend,
+            "estimate_packed_optimized",
+            None,
+        )
+        if self.config.scoring_backend == "quest_cuda" and callable(
+            estimate_packed_optimized
+        ):
+            packed_prefix_start = time.perf_counter() if profile_enabled else 0.0
+            packed, quest_packed_fallback_reason = (
+                self._try_get_quest_packed_prefix(
+                    layer_name=layer_name,
+                    physical_block_ids=physical_block_ids,
+                    block_size=block_size,
+                    device=window_query.device,
+                    dtype=window_query.dtype,
+                )
+            )
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_quest_packed_prefix",
+                    packed_prefix_start,
+                )
+            if packed is not None:
+                packed_estimate_start = (
+                    time.perf_counter() if profile_enabled else 0.0
+                )
+                score_result = estimate_packed_optimized(
+                    query_window=window_query,
+                    packed=packed,
+                    num_kv_heads=int(packed.metadata_data.shape[3]),
+                    score_agg=self.config.score_agg,
+                    profile_enabled=profile_enabled,
+                    materialize_head_scores=materialize_head_scores,
+                )
+                if profile_enabled:
+                    self._record_scoring_profile_timing(
+                        "scoring_quest_packed_estimate",
+                        packed_estimate_start,
+                    )
+                quest_packed_fast_path = True
+                quest_packed_fallback_reason = None
+
+        if score_result is None:
+            pack_start = time.perf_counter() if profile_enabled else 0.0
+            physical_block_ids, digest_min, digest_max = self._pack_layer_digests(
+                layer_name,
+                device=window_query.device,
+                dtype=window_query.dtype,
+                candidate_block_ids=candidate_block_ids,
+            )
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_pack_layer_digests",
+                    pack_start,
+                )
+            estimate_start = time.perf_counter() if profile_enabled else 0.0
+            score_result = self._scoring_backend.estimate(
+                query_window=window_query,
+                digest_min=digest_min,
+                digest_max=digest_max,
+                score_agg=self.config.score_agg,
+                metadata_page_size=block_size,
+            )
+            if profile_enabled:
+                self._record_scoring_profile_timing(
+                    "scoring_backend_estimate",
+                    estimate_start,
+                )
+            if self.config.scoring_backend != "quest_cuda":
+                quest_packed_fallback_reason = "backend_not_quest_cuda"
+            elif quest_packed_fallback_reason is None:
+                quest_packed_fallback_reason = "fallback_after_fast_path_miss"
+
+        scores = score_result.block_scores
+        topk = min(self.config.topk, int(scores.numel()))
         score_packing_debug: dict[str, Any] = {}
         topk_block_ids: list[int] = []
         topk_score_values: list[float] = []
@@ -2717,6 +3070,7 @@ def get_mpr_scoring_profile_timing() -> dict[str, float | int]:
 
 
 def reset_mpr_scoring_profile_timing() -> None:
+    reset_packed_estimate_profile_timing()
     if _GLOBAL_SIDECAR is not None:
         _GLOBAL_SIDECAR.reset_scoring_profile_timing()
 

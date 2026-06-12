@@ -895,6 +895,141 @@ py_compile: passed
 git diff --check: passed
 ```
 
+## 2026-06-12: Scoring Hot-Path Optimization
+
+Goal:
+
+```text
+Reduce scoring_only decode overhead after profiling showed the scoring path was
+dominated by query cloning, request/block context handling, and Quest packed
+estimate postprocessing rather than the custom op alone.
+```
+
+Changes:
+
+```text
+Keep the original scoring implementations as reference/debug paths:
+  RecoverySidecar._estimate_query_scores
+  QuestCudaScorer.estimate_packed
+
+Add optimized hot-path methods:
+  RecoverySidecar._estimate_query_scores_optimized
+  QuestCudaScorer.estimate_packed_optimized
+
+Wire observe_query and recovery scoring to the optimized sidecar path.
+```
+
+Optimization details:
+
+```text
+Use the current decode query directly with query[0].detach(), avoiding the
+previous query[0].detach().clone() cost.
+
+For Quest CUDA packed scoring, compute block_scores directly from the kernel's
+native [num_q_heads, num_blocks] output layout using
+aggregate_packed_query_head_scores().
+
+Avoid the reference transpose().contiguous() and per-KV-head materialization
+when logging/head-level debug fields are not required.
+
+When VLLM_MPR_ENABLE_LOGGING=1 and score_granularity requires head-level debug
+fields, estimate_packed_optimized falls back to the original full-head
+materialization path.
+```
+
+Additional profiling:
+
+```text
+Packed estimate internal timings were added under the existing
+VLLM_MPR_SCORING_PROFILE=1 flag:
+
+quest_packed_estimate_output_alloc
+quest_packed_estimate_query_prepare
+quest_packed_estimate_custom_op
+quest_packed_estimate_transpose
+quest_packed_estimate_aggregate
+quest_packed_estimate_result_build
+```
+
+Benchmark comparison:
+
+```text
+Before: results/mpr_m5_step51_20260612_202707/runtime_summary.csv
+After:  results/mpr_m5_step51_20260612_210227/runtime_summary.csv
+
+baseline decode mean:
+  17.275 ms -> 17.278 ms
+
+scoring_only decode mean:
+  22.275 ms -> 21.007 ms
+
+baseline-relative scoring_only overhead:
+  4.999 ms/decode -> 3.729 ms/decode
+  improvement: -1.270 ms/decode, 25.4% overhead reduction
+
+scoring_only throughput:
+  44.60 tok/s -> 47.27 tok/s
+  improvement: +6.0%
+```
+
+Hot-path attribution:
+
+```text
+scoring_estimate_query_scores:
+  4.303 ms/decode -> 3.113 ms/decode
+
+scoring_query_clone:
+  0.647 ms/decode -> 0.119 ms/decode
+
+scoring_quest_packed_estimate:
+  2.276 ms/decode -> 1.676 ms/decode
+
+quest_packed_estimate_transpose:
+  0.441 ms/decode -> 0.000 ms/decode
+
+quest_packed_estimate_aggregate:
+  0.795 ms/decode -> 0.551 ms/decode
+```
+
+Remaining visible costs:
+
+```text
+quest_packed_estimate_aggregate: about 0.55 ms/decode
+scoring_request_block_context:   about 0.50 ms/decode
+quest_packed_estimate_custom_op: about 0.40 ms/decode
+quest_packed_estimate_output_alloc/result_build are still visible and may be
+worth revisiting if more scoring-only overhead reduction is needed.
+
+Both before/after scoring_only summaries still recommended outlier reruns, so
+tail-latency conclusions should be checked with more measured runs.
+```
+
+Validation:
+
+```bash
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m py_compile \
+  vllm/v1/mixed_precision_recovery/scoring.py \
+  vllm/v1/mixed_precision_recovery/sidecar.py \
+  scripts/mpr_benchmark_step_latency.py
+
+bash -n scripts/mpr_run_m5_step51_latency.sh
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_scoring.py -q
+
+/home/han/anaconda3/envs/20260528_vllm/bin/python -m pytest \
+  tests/v1/mixed_precision_recovery/test_recovery.py -q
+```
+
+Result:
+
+```text
+py_compile: passed
+bash -n: passed
+test_scoring.py: 53 passed, 2 skipped
+test_recovery.py: 34 passed
+```
+
 ## 2026-06-11: Request Block Context Profiling Breakdown
 
 Added temporary `_request_block_context()` breakdown timers under the existing
