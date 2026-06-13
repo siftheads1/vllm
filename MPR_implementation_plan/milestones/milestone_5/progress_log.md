@@ -1229,3 +1229,59 @@ Result:
 py_compile: passed
 git diff --check: passed
 ```
+
+## 2026-06-14: Boundary Digest Detail Profiling
+
+Boundary-profile results from `mpr_enable_only` showed that the counter backend
+was not falling back to the slot path, but boundary decode steps still carried a
+visible digest-creation spike.
+
+Interpretation decision:
+
+```text
+Do not treat mpr_enable_only as a reason to skip digest creation.
+The mode is a measurement split for overhead attribution, while the production
+MPR path is expected to have digest creation and Quest metadata available.
+The next action is therefore finer attribution of boundary-triggered digest
+work, not policy/semantic pruning.
+```
+
+Added finer-grained timing under the existing disabled-by-default gate:
+
+```text
+VLLM_MPR_BOUNDARY_PROFILE=1
+```
+
+New digest breakdown fields:
+
+```text
+mpr_boundary_profile_counter_digest_validate_*
+mpr_boundary_profile_counter_digest_amax_*
+mpr_boundary_profile_counter_digest_amin_*
+mpr_boundary_profile_counter_digest_raw_minmax_result_*
+mpr_boundary_profile_counter_digest_arkvale_centers_*
+mpr_boundary_profile_counter_digest_arkvale_dists_*
+mpr_boundary_profile_counter_digest_arkvale_result_*
+```
+
+New Quest metadata append breakdown fields:
+
+```text
+mpr_boundary_profile_counter_quest_store_get_or_create_*
+mpr_boundary_profile_counter_quest_append_shape_check_*
+mpr_boundary_profile_counter_quest_append_ensure_capacity_*
+mpr_boundary_profile_counter_quest_append_copy_max_*
+mpr_boundary_profile_counter_quest_append_copy_min_*
+mpr_boundary_profile_counter_quest_append_python_index_*
+mpr_boundary_profile_counter_quest_append_zero_guard_*
+mpr_boundary_profile_counter_quest_append_invalidate_prefix_*
+```
+
+Expected validation signal:
+
+```text
+The next boundary-profile runtime summary should split the previous
+counter_summarize_key_block and counter_append_quest_metadata totals into
+specific tensor reductions, tensor copies, capacity growth, guard-zeroing, and
+Python bookkeeping costs.
+```

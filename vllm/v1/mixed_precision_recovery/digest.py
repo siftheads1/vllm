@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -53,6 +55,7 @@ def _validate_key_block(key_block: torch.Tensor) -> tuple[torch.Tensor, int]:
 def summarize_key_block(
     key_block: torch.Tensor,
     digest_kind: str = ARKVALE_DIGEST_KIND,
+    profile_callback: Callable[[str, float], None] | None = None,
 ) -> KeyBlockDigest:
     """Summarize one full KV-cache key block.
 
@@ -74,29 +77,51 @@ def summarize_key_block(
             f"got {digest_kind!r}."
         )
 
+    validate_start = time.perf_counter() if profile_callback is not None else 0.0
     key_block, block_size = _validate_key_block(key_block)
+    if profile_callback is not None:
+        profile_callback("counter_digest_validate", validate_start)
 
+    amax_start = time.perf_counter() if profile_callback is not None else 0.0
     raw_max = key_block.amax(dim=0)
+    if profile_callback is not None:
+        profile_callback("counter_digest_amax", amax_start)
+
+    amin_start = time.perf_counter() if profile_callback is not None else 0.0
     raw_min = key_block.amin(dim=0)
+    if profile_callback is not None:
+        profile_callback("counter_digest_amin", amin_start)
 
     if digest_kind == RAW_MINMAX_DIGEST_KIND:
-        return KeyBlockDigest(
+        result_start = time.perf_counter() if profile_callback is not None else 0.0
+        result = KeyBlockDigest(
             digest_min=raw_min,
             digest_max=raw_max,
             valid_token_count=block_size,
             block_size=block_size,
             digest_kind=digest_kind,
         )
+        if profile_callback is not None:
+            profile_callback("counter_digest_raw_minmax_result", result_start)
+        return result
 
+    centers_start = time.perf_counter() if profile_callback is not None else 0.0
     # centers: midpoint of the raw bounding box.
     # Shape: [num_kv_heads, head_dim].
     centers = (raw_max + raw_min) / 2
+    if profile_callback is not None:
+        profile_callback("counter_digest_arkvale_centers", centers_start)
 
+    dists_start = time.perf_counter() if profile_callback is not None else 0.0
     # dists: mean absolute distance from center over the block token axis.
     # centers.unsqueeze(0) broadcasts to [block_size, num_kv_heads, head_dim].
     # Shape: [num_kv_heads, head_dim].
     dists = (centers.unsqueeze(0) - key_block).abs().mean(dim=0)
-    return KeyBlockDigest(
+    if profile_callback is not None:
+        profile_callback("counter_digest_arkvale_dists", dists_start)
+
+    result_start = time.perf_counter() if profile_callback is not None else 0.0
+    result = KeyBlockDigest(
         # digest_min/digest_max: ArkVale-style tightened bounds.
         # Shape: [num_kv_heads, head_dim].
         digest_min=centers - dists,
@@ -105,3 +130,6 @@ def summarize_key_block(
         block_size=block_size,
         digest_kind=digest_kind,
     )
+    if profile_callback is not None:
+        profile_callback("counter_digest_arkvale_result", result_start)
+    return result

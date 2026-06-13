@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import torch
@@ -144,8 +146,12 @@ class QuestMetadataStore:
         block_id: int,
         digest_min: torch.Tensor,
         digest_max: torch.Tensor,
+        profile_callback: Callable[[str, float], None] | None = None,
     ) -> None:
         """Append one block digest and keep one zero guard entry after it."""
+        shape_check_start = (
+            time.perf_counter() if profile_callback is not None else 0.0
+        )
         if block_id in self.block_id_to_entry:
             raise ValueError(
                 f"Quest metadata store already has block_id={block_id}."
@@ -161,24 +167,66 @@ class QuestMetadataStore:
                 "Quest metadata store digest_max shape mismatch: "
                 f"expected {expected_shape}, got {tuple(digest_max.shape)}."
             )
+        if profile_callback is not None:
+            profile_callback(
+                "counter_quest_append_shape_check",
+                shape_check_start,
+            )
 
         entry_idx = self.num_entries
         # Keep capacity for the newly appended entry plus Quest's dummy guard
         # entry. The guard exists because the current Quest estimate kernel
         # always excludes the final logical metadata entry from scoring.
+        ensure_start = time.perf_counter() if profile_callback is not None else 0.0
         self._ensure_entry_capacity(entry_idx + 2)
+        if profile_callback is not None:
+            profile_callback(
+                "counter_quest_append_ensure_capacity",
+                ensure_start,
+            )
         page_idx = entry_idx // self.metadata_page_size
         page_offset = entry_idx % self.metadata_page_size
+        copy_max_start = (
+            time.perf_counter() if profile_callback is not None else 0.0
+        )
         self.metadata_data[page_idx, 0, page_offset].copy_(
             digest_max.to(device=self.device, dtype=self.dtype)
+        )
+        if profile_callback is not None:
+            profile_callback("counter_quest_append_copy_max", copy_max_start)
+        copy_min_start = (
+            time.perf_counter() if profile_callback is not None else 0.0
         )
         self.metadata_data[page_idx, 1, page_offset].copy_(
             digest_min.to(device=self.device, dtype=self.dtype)
         )
+        if profile_callback is not None:
+            profile_callback("counter_quest_append_copy_min", copy_min_start)
+        python_index_start = (
+            time.perf_counter() if profile_callback is not None else 0.0
+        )
         self.entry_block_ids.append(block_id)
         self.block_id_to_entry[block_id] = entry_idx
+        if profile_callback is not None:
+            profile_callback(
+                "counter_quest_append_python_index",
+                python_index_start,
+            )
+        zero_guard_start = (
+            time.perf_counter() if profile_callback is not None else 0.0
+        )
         self._zero_entry(entry_idx + 1)
+        if profile_callback is not None:
+            profile_callback("counter_quest_append_zero_guard", zero_guard_start)
+        invalidate_start = (
+            time.perf_counter() if profile_callback is not None else 0.0
+        )
         self._invalidate_prefix_cache()
+        if profile_callback is not None:
+            profile_callback(
+                "counter_quest_append_invalidate_prefix",
+                invalidate_start,
+            )
 
     def view_prefix(self, num_score_entries: int) -> PackedQuestDigestCache:
         """Return a Quest packed-cache view over the first score entries.

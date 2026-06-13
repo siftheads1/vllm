@@ -64,8 +64,23 @@ _BOUNDARY_PROFILE_TIMING_NAMES = (
     "counter_block_lookup",
     "counter_create_digest",
     "counter_summarize_key_block",
+    "counter_digest_validate",
+    "counter_digest_amax",
+    "counter_digest_amin",
+    "counter_digest_raw_minmax_result",
+    "counter_digest_arkvale_centers",
+    "counter_digest_arkvale_dists",
+    "counter_digest_arkvale_result",
     "counter_to_block_digest",
     "counter_append_quest_metadata",
+    "counter_quest_store_get_or_create",
+    "counter_quest_append_shape_check",
+    "counter_quest_append_ensure_capacity",
+    "counter_quest_append_copy_max",
+    "counter_quest_append_copy_min",
+    "counter_quest_append_python_index",
+    "counter_quest_append_zero_guard",
+    "counter_quest_append_invalidate_prefix",
     "counter_backup",
 )
 
@@ -2586,6 +2601,11 @@ class RecoverySidecar:
         digest = summarize_key_block(
             key_cache[block_id],
             digest_kind=self.config.digest_kind,
+            profile_callback=(
+                self._record_boundary_profile_timing
+                if profile_enabled
+                else None
+            ),
         )
         if profile_enabled:
             self._record_boundary_profile_timing(
@@ -2787,6 +2807,8 @@ class RecoverySidecar:
         """Append a newly created digest to the layer's Quest metadata store."""
         if self.config.scoring_backend != "quest_cuda":
             return
+        profile_enabled = self.config.boundary_profile_enabled
+        store_start = time.perf_counter() if profile_enabled else 0.0
         store = self._quest_metadata_stores.get(layer_name)
         num_kv_heads = int(digest.digest_min.shape[0])
         head_dim = int(digest.digest_min.shape[1])
@@ -2810,11 +2832,21 @@ class RecoverySidecar:
                 "MPR Quest metadata store shape/dtype/device mismatch for "
                 f"{layer_name}."
             )
+        if profile_enabled:
+            self._record_boundary_profile_timing(
+                "counter_quest_store_get_or_create",
+                store_start,
+            )
 
         store.append_digest(
             block_id=block_id,
             digest_min=digest.digest_min,
             digest_max=digest.digest_max,
+            profile_callback=(
+                self._record_boundary_profile_timing
+                if profile_enabled
+                else None
+            ),
         )
 
     def _select_layer_digest_block_ids(
